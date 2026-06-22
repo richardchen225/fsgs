@@ -1,0 +1,21 @@
+defaults:
+  - base_dataset
+  - view_sampler: bounded
+
+name: dl3dv
+# Previous OpenBayes path:
+# roots: [/openbayes/input/input0/dl3dv, /openbayes/input/input0/dl3dv/train_index.json]
+roots: [datasets/dl3dv]
+
+input_image_shape: [256, 256]
+original_image_shape: [270, 480]
+cameras_are_circular: false
+
+baseline_min: 1e-3
+baseline_max: 1e2
+max_fov: 100.0
+avg_pose: false
+
+rescale_to_1cube: true
+make_baseline_1: false
+intr_augment: true

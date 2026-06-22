@@ -1,0 +1,92 @@
+# @package _global_
+
+defaults:
+  - /dataset@_group_.dl3dv: dl3dv
+  - override /model/encoder: anysplat
+  - override /model/encoder/backbone: croco
+  - override /loss: [mse, lpips, ssim, depth] 
+
+wandb:
+  name: dl3dv
+  tags: [dl3dv, 448x448]
+  
+model:
+  encoder:
+    mode: ${mode}
+    moge_weights_path: weights/model.pt
+    zipmap_weights_path: weights/pre_zipmap.pt
+    
+dataset:
+  dl3dv:
+    mode: ${mode}
+    # Previous OpenBayes roots:
+    # roots: [/openbayes/input/input0/dl3dv]
+    roots: [datasets/dl3dv]
+    ctx_list: [1, 5, 10, 15, 20, 2, 3, 7, 12, 17, 18]
+    tgt_list: [2, 3, 7, 12, 17, 18]
+    input_image_shape: [252, 518]
+    view_sampler:
+      num_target_views: 9
+      min_distance_between_context_views: 32
+      max_distance_between_context_views: 256
+      min_gap_multiplier: 3
+      max_gap_multiplier: 5
+    avg_pose: false
+    intr_augment: true
+    normalize_by_pts3d: false
+    rescale_to_1cube: false
+
+optimizer:
+  lr: 5e-5
+  pretrained_lr: 1e-5
+  scratch_lr: 5e-5
+  warm_up_steps: 1000
+  backbone_lr_multiplier: 0.1
+
+data_loader:
+  train:
+    batch_size: 2
+  val:
+    batch_size: 2
+    
+trainer:
+  max_steps: 40000
+  val_check_interval: 100
+  num_nodes: 1
+  devices: 4
+  accumulate_grad_batches: 1
+  precision: 16-mixed
+
+checkpointing:
+  load: null
+  train_pretrained_weights: weights/pre_wm.safetensors
+  every_n_train_steps: 500
+  save_weights_only: true
+  save_top_k: 10
+  
+train:
+  pose_loss_alpha: 1.0
+  pose_loss_delta: 1.0
+  cxt_depth_weight: 1.0
+  depth_refine_aux_weight: 0.5
+  weight_pose: 10.0
+  weight_depth: 1.0
+  weight_normal: 0.1
+
+hydra:
+  run:
+    dir: output/exp_${wandb.name}/${now:%Y-%m-%d_%H-%M-%S}
+    
+loss:
+  mse:
+    conf: false
+  lpips:
+    conf: false
+  ssim:
+    conf: false
+  depth:
+    weight: 1.0
+    sigma_image: null
+    use_second_derivative: false
+    dav3_weights_path: weights/pre_dav3.safetensors
+ 

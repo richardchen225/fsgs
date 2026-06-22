@@ -1,0 +1,127 @@
+# @package _global_
+
+defaults:
+  - /dataset@_group_.dl3dv: dl3dv
+  - /dataset@_group_.re10k: re10k
+  # - /dataset@_group_.co3d: co3d
+  # - /dataset@_group_.blendedmvspp: blendedmvspp
+  - override /model/encoder: anysplat
+  - override /model/encoder/backbone: croco
+  - override /loss: [mse, lpips, ssim, depth] # ablate: opacity loss
+
+wandb:
+  name: multidataset-16gpu
+  tags: [multidataset, 448x448]
+  
+model:
+  encoder:
+    mode: ${mode}
+    voxel_size: 0.002
+    conf_threshold: 0.05
+    # Model weights paths are configured in config/model/encoder/anysplat.yaml
+    # or overridden from the command line.
+    # Previous OpenBayes examples:
+    # streamvggt_weights_path: "/openbayes/home/AnySplat/pre_svggt.safetensors"
+    # vggt_weights_path: "/openbayes/home/AnySplat/pre_vggt.safetensors"
+    # camera_dec_weights_path: "/openbayes/home/AnySplat/pre_dav3.safetensors"
+    
+dataset:
+#   co3d:
+#     input_image_shape: [224, 448]
+#     view_sampler:
+
+#       num_target_views: 1
+#       min_distance_between_context_views: 32
+#       max_distance_between_context_views: 256
+#       max_img_per_gpu: 6
+
+#     avg_pose: false
+#     intr_augment: true
+#     normalize_by_pts3d: false
+#     rescale_to_1cube: false
+  dl3dv:
+    mode: ${mode}
+    ctx_list: [1, 5, 10, 15, 20, 2, 3, 7, 12, 17, 18]
+    tgt_list: [2, 3, 7, 12, 17, 18]
+    input_image_shape: [252, 518]
+    view_sampler:
+
+      num_target_views: 9
+      min_distance_between_context_views: 32
+      max_distance_between_context_views: 256
+
+      min_gap_multiplier: 3
+      max_gap_multiplier: 5
+
+    avg_pose: false
+    intr_augment: true
+    normalize_by_pts3d: false
+    rescale_to_1cube: true
+
+  re10k:
+    mode: ${mode}
+    ctx_list: [1, 5, 10, 15, 20, 2, 3, 7, 12, 17, 18]
+    tgt_list: [2, 3, 7, 12, 17, 18]
+    input_image_shape: [252, 518]
+    view_sampler:
+
+      num_target_views: 9
+      min_distance_between_context_views: 16
+      max_distance_between_context_views: 128
+
+      min_gap_multiplier: 3
+      max_gap_multiplier: 5
+      max_img_per_gpu: 10
+    avg_pose: false
+    intr_augment: true
+    normalize_by_pts3d: false
+    rescale_to_1cube: true
+
+optimizer:
+  lr: 1e-4
+  warm_up_steps: 0
+  backbone_lr_multiplier: 0.1
+
+data_loader:
+  train:
+    batch_size: 1 # not used here
+    
+trainer:
+  max_steps: 10000
+  val_check_interval: 100
+  num_nodes: 1
+  accumulate_grad_batches: 1
+  precision: 16-mixed
+
+checkpointing:
+  load: null 
+  every_n_train_steps: 500
+  save_weights_only: true
+  save_top_k: 10
+  
+train:
+  pose_loss_alpha: 1.0
+  pose_loss_delta: 1.0
+  cxt_depth_weight: 1.0
+  weight_pose: 10.0
+  weight_depth: 1.0
+  weight_normal: 0.1
+
+hydra:
+  run:
+    # Previous OpenBayes path:
+    # dir: /openbayes/input/input0/output/exp_${wandb.name}/${now:%Y-%m-%d_%H-%M-%S}
+    dir: output/exp_${wandb.name}/${now:%Y-%m-%d_%H-%M-%S}
+    
+loss:
+  mse:
+    conf: false
+  lpips:
+    conf: false
+  ssim:
+    conf: false
+  depth:
+    weight: 1.0
+    sigma_image: null
+    use_second_derivative: false
+    dav3_weights_path: weights/pre_dav3.safetensors
