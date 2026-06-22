@@ -1,0 +1,3 @@
+mse:
+  weight_ctx: 1.0
+  weight_novel: 1.5

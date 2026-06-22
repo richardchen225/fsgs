@@ -1,0 +1,21 @@
+defaults:
+  - base_dataset
+  - view_sampler: bounded
+
+name: re10k
+# Previous OpenBayes path:
+# roots: [/openbayes/input/input0/RealEstate10K, /openbayes/input/input0/RealEstate10K/train_re10k.json]
+roots: [datasets/RealEstate10K, datasets/RealEstate10K/train_re10k.json]
+
+input_image_shape: [256, 256]
+original_image_shape: [270, 480]
+cameras_are_circular: false
+
+baseline_min: 1e-3
+baseline_max: 1e2
+max_fov: 100.0
+avg_pose: false
+
+rescale_to_1cube: true
+make_baseline_1: false
+intr_augment: true

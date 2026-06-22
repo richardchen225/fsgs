@@ -1,0 +1,69 @@
+# Python 3.10, CUDA 13.0.
+# Install PyTorch packages from the CUDA 13.0 wheel index:
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu130
+# Some CUDA/C++ extensions below may still require a Linux CUDA toolkit with nvcc.
+
+torch==2.11.0+cu130
+torchvision==0.26.0+cu130
+torchaudio==2.11.0+cu130
+
+# PyTorch Geometric CUDA extension for torch 2.11.0 + cu130.
+--find-links https://data.pyg.org/whl/torch-2.11.0+cu130.html
+torch-scatter==2.1.2
+
+# Core training/config/runtime dependencies.
+hydra-core==1.3.2
+omegaconf==2.3.0
+lightning==2.3.3
+wandb==0.17.5
+dacite==1.8.1
+jaxtyping==0.2.33
+beartype==0.18.5
+safetensors==0.4.3
+huggingface-hub==0.24.5
+transformers==4.44.0
+einops==0.8.0
+tqdm==4.66.5
+tabulate==0.9.0
+
+# Numeric, image, video, visualization, and metrics.
+numpy==1.26.4
+scipy==1.11.4
+pillow==10.4.0
+opencv-python==4.10.0.84
+scikit-image==0.24.0
+matplotlib==3.8.4
+imageio==2.34.2
+imageio-ffmpeg==0.5.1
+scikit-video==1.1.11
+lpips==0.1.4
+plyfile==1.1
+colorspacious==1.1.2
+trimesh==4.4.4
+pillow-heif==0.18.0
+
+# Geometry / reconstruction helpers.
+pycolmap==3.10.0
+lightglue @ git+https://github.com/cvg/LightGlue.git@eb42fee2d71449efb0aa5c10549752b5d75384d8
+evo==1.28.0
+
+# Model/runtime extras used by vendored components.
+xformers==0.0.35
+addict==2.4.0
+e3nn==0.5.1
+click==8.1.7
+
+# Depth Anything / optional service UI dependencies under src/loss/dav3.
+fastapi==0.112.0
+uvicorn==0.30.5
+gradio==4.41.0
+typer==0.12.3
+pydantic==2.8.2
+requests==2.32.3
+
+# Gaussian splatting backends.
+gsplat==1.3.0
+
+# MoGe is imported as moge.model.v2. Its setup.py also pulls utils3d and pipeline
+# from GitHub.
+moge @ git+https://github.com/microsoft/MoGe.git

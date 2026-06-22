@@ -1,0 +1,5 @@
+depth:
+  weight: 1.0
+  sigma_image: null
+  use_second_derivative: false
+  dav3_weights_path: weights/pre_dav3.safetensors
