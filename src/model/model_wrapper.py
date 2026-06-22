@@ -193,6 +193,16 @@ class ModelWrapper(LightningModule):
         batch: BatchedExample = self.data_shim(batch)
         b, v, c, h, w = batch["context"]["image"].shape
         context_image = (batch["context"]["image"] + 1) / 2
+        if (
+            self.global_rank == 0
+            and self.train_cfg.print_log_every_n_steps > 0
+            and self.global_step % self.train_cfg.print_log_every_n_steps == 0
+        ):
+            print(
+                f"training step {self.global_step}; "
+                f"scene = {batch['scene']}; "
+                f"context = {batch['context']['index'].tolist()}"
+            )
 
         # Run the model
 #         if self.global_step < 50:
@@ -459,8 +469,9 @@ class ModelWrapper(LightningModule):
                 align_corners=False,
             ).squeeze(0)
 
+            safe_scene = str(scenes[i]).replace("/", "_").replace("\\", "_")
             self.logger.log_image(
-                f"comparison/{i}",
+                f"comparison/step_{self.global_step}/batch_{batch_idx}_{i}_{safe_scene}",
                 [prep_image(add_border(comparison))],
                 step=self.global_step,
                 caption=[scenes[i]],

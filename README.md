@@ -196,13 +196,25 @@ data_loader:
 bash train.sh
 ```
 
+### 断点续训
+
+默认训练会保存完整 Lightning checkpoint，包括模型权重、优化器、学习率调度器、AMP scaler 和训练步数等状态。想从上一次训练继续跑，把 `checkpointing.load` 设置为上一次实验目录里的 `.ckpt` 路径即可，例如：
+
+```bash
+python -m src.main +experiment=dl3dv \
+  checkpointing.load=/path/to/output/exp_dl3dv/2026-06-22_12-00-00/checkpoints/epoch_0-step_500.ckpt
+```
+
+续训时 `checkpointing.load` 不能是 `null`；从头训练或只加载预训练权重时才保持 `checkpointing.load: null`。`train_pretrained_weights` 用于初始化训练权重，不等同于断点续训。
+
+注意：只有使用 `save_weights_only: false` 保存出来的新 checkpoint 才能完整恢复优化器和训练状态；旧的 weights-only checkpoint 只能恢复模型权重。
+
 
 ## 6. 常见检查
 
 - 找不到数据：确认下载目录下有 `train_index.json`，并且数组里的相对路径能拼到真实目录。
 - 下载无权限：先在 `DL3DV/DL3DV-ALL-480P` 页面申请访问，再执行 `huggingface-cli login`。
-- 想从 checkpoint 推理或续训：显式设置 `checkpointing.load=/path/to/checkpoint.ckpt`。
+- 想断点续训：显式设置 `checkpointing.load=/path/to/checkpoint.ckpt`，通常指向上一次实验 `checkpoints/` 目录下最新或最好的完整 checkpoint。
 - 想换数据目录：同步改 `config/dataset/dl3dv.yaml` 和 `config/experiment/dl3dv.yaml` 里的 `roots`，或在命令行覆盖 `dataset.dl3dv.roots`。
-
 
 

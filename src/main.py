@@ -110,7 +110,10 @@ def train(cfg_dict: DictConfig):
     model = get_model(cfg.model.encoder, cfg.model.decoder)
 
     if cfg.mode == 'train':
-        if cfg.checkpointing.train_pretrained_weights is None:
+        if cfg.checkpointing.load is not None:
+            print(f"Resuming full training state from {cfg.checkpointing.load}")
+            ckpt = None
+        elif cfg.checkpointing.train_pretrained_weights is None:
             print("No train pretrained weights configured; training from initialized weights.")
             ckpt = None
         else:
@@ -182,12 +185,11 @@ def train(cfg_dict: DictConfig):
     )
     
     if cfg.mode == "train":
-        if cfg.checkpointing.load is not None:
-            print(f"Resuming from checkpoint weights: {cfg.checkpointing.load}")
-            resume_ckpt = torch.load(cfg.checkpointing.load, map_location='cpu')
-            resume_ckpt = {key.replace('model.', '', 1): value for key, value in resume_ckpt['state_dict'].items()}
-            model.load_state_dict(resume_ckpt, strict=False)
-        trainer.fit(model_wrapper, datamodule=data_module)
+        trainer.fit(
+            model_wrapper,
+            datamodule=data_module,
+            ckpt_path=cfg.checkpointing.load,
+        )
     else:
         trainer.test(
             model_wrapper,

@@ -126,7 +126,8 @@ class DatasetDL3DV(Dataset):
                         frames_length = len(transforms_data['frames'])
                         images_8_files_count = len(os.listdir(images_8_path))
                         if frames_length == images_8_files_count:
-                            data_list.append(scene_path)
+                            scene_id = item.strip("/\\").replace("/", "_").replace("\\", "_")
+                            data_list.append((scene_path, scene_id))
             return data_list
 
         self.data_list = filter_data_list(data_index, self.data_root)
@@ -137,8 +138,8 @@ class DatasetDL3DV(Dataset):
         if cfg.mode == "train":
             with ThreadPoolExecutor(max_workers=64) as executor:
                 futures = [
-                    executor.submit(self.load_jsons, scene_path)
-                    for scene_path in self.data_list
+                    executor.submit(self.load_jsons, scene_info)
+                    for scene_info in self.data_list
                 ]
                 for future in tqdm(as_completed(futures), total=len(futures)):
                     scene_frames, scene_id = future.result()
@@ -146,14 +147,23 @@ class DatasetDL3DV(Dataset):
                     self.scene_ids[index] = scene_id
                     index += 1
         else:
-            futures = [self.load_jsons(scene_path) for scene_path in self.data_list]
+            futures = [self.load_jsons(scene_info) for scene_info in self.data_list]
             for future in tqdm(futures, total=len(futures)):
                 scene_frames, scene_id = future
                 self.scenes[scene_id] = scene_frames
                 self.scene_ids[index] = scene_id
                 index += 1
 
-        print(f"DL3DV: {self.stage}: loaded {len(self.scene_ids)} scenes")
+        unique_scene_count = len(set(self.scene_ids.values()))
+        print(
+            f"DL3DV: {self.stage}: loaded {len(self.scene_ids)} scenes "
+            f"({unique_scene_count} unique scene ids)"
+        )
+        if unique_scene_count != len(self.scene_ids):
+            print(
+                f"WARNING: DL3DV {self.stage} has duplicated scene ids; "
+                "check train_index.json/test_index.json."
+            )
 
     def convert_intrinsics(self, meta_data):
         store_h, store_w = meta_data["h"], meta_data["w"]
@@ -177,13 +187,18 @@ class DatasetDL3DV(Dataset):
         opencv_c2w = np.array(pose) @ blender2opencv
         return opencv_c2w.tolist()
 
-    def load_jsons(self, scene_path):
+    def load_jsons(self, scene_info):
+        if isinstance(scene_info, tuple):
+            scene_path, scene_id = scene_info
+        else:
+            scene_path = scene_info
+            scene_id = os.path.relpath(scene_path, self.data_root)
+            scene_id = scene_id.replace(os.sep, "_").replace("/", "_").replace("\\", "_")
         json_path = os.path.join(scene_path, "transforms.json")
         with open(json_path, "r") as f:
             data = json.load(f)
 
         scene_frames = []
-        scene_id = scene_path.split("/")[-2].split(".")[0]
         for i, frame in enumerate(data["frames"]):
             frame_tmp = {}
             frame_tmp["file_path"] = os.path.join(scene_path, frame["file_path"])

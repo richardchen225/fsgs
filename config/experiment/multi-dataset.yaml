@@ -96,7 +96,7 @@ trainer:
 checkpointing:
   load: null 
   every_n_train_steps: 500
-  save_weights_only: true
+  save_weights_only: false
   save_top_k: 10
   
 train:
