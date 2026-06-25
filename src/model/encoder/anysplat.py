@@ -105,7 +105,7 @@ class EncoderAnySplatCfg:
     gs_refine_enabled: bool = True
     gs_refine_iters: int = 4
     gs_refine_render_scale: float = 0.25
-    gs_refine_hidden_dim: int = 64
+    gs_refine_hidden_dim: int = 128
     gs_refine_step_opacity: float = 0.25
     gs_refine_step_scale: float = 0.10
     gs_refine_step_sh: float = 0.05
@@ -794,6 +794,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         global_step: int = 0,
         name: str = None,
         target_view_count: Optional[int] = None,
+        return_refine_data: bool = False,
     ) -> Gaussians:
 
         device = image.device
@@ -955,13 +956,6 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         gaussians = {key_mapping.get(k, k): v for k, v in splats.items()}
         gaussians = Gaussians(**gaussians)
 
-        if self.cfg.mode != "train":
-            intrinsic = intrinsic.clone()
-            intrinsic = torch.stack(
-                [intrinsic[:, :, 0] / w, intrinsic[:, :, 1] / h, intrinsic[:, :, 2]], dim=2
-            )
-            return gaussians, pred_all_extrinsic[:, ctx_img_num:], intrinsic, depth_map, ctx_img_num
-    
         infos = {}
         if self.cfg.gs_refine_enabled:
             infos["gs_refine"] = {
@@ -993,16 +987,36 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         intrinsic = torch.stack(
             [intrinsic[:, :, 0] / w, intrinsic[:, :, 1] / h, intrinsic[:, :, 2]], dim=2
         )
+        pred_context_pose = dict(
+            extrinsic=torch.cat(
+                [extrinsic_padding], dim=2
+            ),
+            intrinsic=intrinsic,
+        )
+
+        if self.cfg.mode != "train":
+            if return_refine_data:
+                return (
+                    EncoderOutput(
+                        gaussians=gaussians,
+                        pred_pose_enc_list=pred_pose_enc_list,
+                        pred_context_pose=pred_context_pose,
+                        depth_dict=depth_dict,
+                        infos=infos,
+                        distill_infos=distill_infos,
+                    ),
+                    pred_all_extrinsic,
+                    intrinsic,
+                    depth_map,
+                    ctx_img_num,
+                )
+            return gaussians, pred_all_extrinsic[:, ctx_img_num:], intrinsic, depth_map, ctx_img_num
+
         return (
             EncoderOutput(
                 gaussians=gaussians,
                 pred_pose_enc_list=pred_pose_enc_list,
-                pred_context_pose=dict(
-                    extrinsic=torch.cat(
-                        [extrinsic_padding], dim=2
-                    ),
-                    intrinsic=intrinsic,
-                ),
+                pred_context_pose=pred_context_pose,
                 depth_dict=depth_dict,
                 infos=infos,
                 distill_infos=distill_infos,

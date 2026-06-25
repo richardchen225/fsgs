@@ -60,6 +60,7 @@ train:
   print_log_every_n_steps: 10
   distiller: ''
   distill_max_steps: 1000000
+  max_val_comparisons: 999999
   random_context_views: false
 
 seed: 111123

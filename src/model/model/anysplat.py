@@ -31,7 +31,7 @@ class GaussianResidualRefiner(nn.Module):
         self,
         feature_dim: int,
         sh_dim: int,
-        hidden_dim: int = 64,
+        hidden_dim: int = 128,
     ) -> None:
         super().__init__()
         evidence_dim = 9
@@ -41,7 +41,9 @@ class GaussianResidualRefiner(nn.Module):
             nn.SiLU(inplace=True),
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
             nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_dim, 1 + 3 + sh_dim + 1, kernel_size=1),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_dim, 3 + 4 + 1 + 3 + sh_dim + 1, kernel_size=1),
         )
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
@@ -57,7 +59,7 @@ class GaussianResidualRefiner(nn.Module):
         opacity: torch.Tensor,
         scale_norm: torch.Tensor,
         view_gate: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         b, s, c, h, w = features.shape
         x = torch.cat(
             [
@@ -76,13 +78,21 @@ class GaussianResidualRefiner(nn.Module):
         delta = self.net(x)
         delta = rearrange(delta, "(b s) c h w -> b s c h w", b=b, s=s)
 
-        delta_opacity = delta[:, :, 0:1]
-        delta_scale = delta[:, :, 1:4]
-        delta_sh = delta[:, :, 4 : 4 + self.sh_dim]
-        learned_gate = torch.sigmoid(delta[:, :, 4 + self.sh_dim : 5 + self.sh_dim])
+        delta_mean = delta[:, :, 0:3]
+        delta_quat = delta[:, :, 3:7]
+        delta_opacity = delta[:, :, 7:8]
+        delta_scale = delta[:, :, 8:11]
+        delta_sh = delta[:, :, 11 : 11 + self.sh_dim]
+        learned_gate = torch.sigmoid(delta[:, :, 11 + self.sh_dim : 12 + self.sh_dim])
         gate = learned_gate * view_gate
 
-        return gate * delta_opacity.tanh(), gate * delta_scale.tanh(), gate * delta_sh.tanh()
+        return (
+            gate * delta_mean.tanh(),
+            gate * delta_quat.tanh(),
+            gate * delta_opacity.tanh(),
+            gate * delta_scale.tanh(),
+            gate * delta_sh.tanh(),
+        )
 
 
 class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
@@ -184,13 +194,15 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     def _build_gaussians_from_refine_state(
         self,
         refine_info: dict,
+        means_raw: torch.Tensor,
+        quats_raw: torch.Tensor,
         scales_raw: torch.Tensor,
         opacities_raw: torch.Tensor,
         res_sh_raw: torch.Tensor,
     ) -> Gaussians:
-        b, s, n, _ = scales_raw.shape
-        means = refine_info["means"].reshape(b, s * n, 3)
-        rotations = act_gs.reg_dense_rotation(refine_info["quats"]).reshape(b, s * n, 4)
+        b, s, n, _ = means_raw.shape
+        means = means_raw.reshape(b, s * n, 3)
+        rotations = act_gs.reg_dense_rotation(quats_raw).reshape(b, s * n, 4)
         scales = act_gs.reg_dense_scales(scales_raw).clamp_max(0.1).reshape(b, s * n, 3)
         opacities = act_gs.reg_dense_opacities(opacities_raw).reshape(b, s * n)
         harmonics = (refine_info["base_sh"] + res_sh_raw).reshape(b, s * n, -1).unsqueeze(-2)
@@ -261,6 +273,8 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             render_views = min(render_views, int(cfg.gs_refine_max_render_views))
         render_views = max(1, render_views)
 
+        means_raw = refine_info["means"]
+        quats_raw = refine_info["quats"]
         scales_raw = refine_info["scales_raw"]
         opacities_raw = refine_info["opacities_raw"]
         res_sh_raw = refine_info["res_sh_raw"]
@@ -307,6 +321,8 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             with render_context:
                 current_gaussians = self._build_gaussians_from_refine_state(
                     refine_info,
+                    means_raw,
+                    quats_raw,
                     scales_raw,
                     opacities_raw,
                     res_sh_raw,
@@ -366,7 +382,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             scale_norm = act_gs.reg_dense_scales(scale_source).clamp_max(0.1).norm(dim=-1, keepdim=True)
             scale_norm = rearrange(scale_norm, "b s (h w) c -> b s c h w", h=h, w=w)
 
-            delta_opacity, delta_scale, delta_sh = self.gs_residual_refiner(
+            delta_mean, delta_quat, delta_opacity, delta_scale, delta_sh = self.gs_residual_refiner(
                 evidence_features.float(),
                 rgb_residual.float(),
                 depth_residual.float(),
@@ -378,10 +394,16 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 view_gate.float(),
             )
 
+            delta_mean = rearrange(delta_mean, "b s c h w -> b s (h w) c")
+            delta_quat = rearrange(delta_quat, "b s c h w -> b s (h w) c")
             delta_opacity = rearrange(delta_opacity, "b s c h w -> b s (h w) c")
             delta_scale = rearrange(delta_scale, "b s c h w -> b s (h w) c")
             delta_sh = rearrange(delta_sh, "b s c h w -> b s (h w) c")
 
+            mean_step_source = depth.detach() if cfg.gs_refine_detach_evidence else depth
+            mean_step = rearrange(mean_step_source.float(), "b s h w c -> b s (h w) c")
+            means_raw = means_raw + mean_step.to(means_raw.dtype) * delta_mean.to(means_raw.dtype)
+            quats_raw = quats_raw + delta_quat.to(quats_raw.dtype)
             opacities_raw = opacities_raw + cfg.gs_refine_step_opacity * delta_opacity.to(opacities_raw.dtype)
             scales_raw = scales_raw + cfg.gs_refine_step_scale * delta_scale.to(scales_raw.dtype)
             res_sh_raw = res_sh_raw + cfg.gs_refine_step_sh * delta_sh.to(res_sh_raw.dtype)
@@ -402,13 +424,19 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 scale_source,
                 opacity,
                 scale_norm,
+                delta_mean,
+                delta_quat,
                 delta_opacity,
                 delta_scale,
                 delta_sh,
+                mean_step_source,
+                mean_step,
             )
 
         refined_gaussians = self._build_gaussians_from_refine_state(
             refine_info,
+            means_raw,
+            quats_raw,
             scales_raw,
             opacities_raw,
             res_sh_raw,

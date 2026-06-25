@@ -94,6 +94,7 @@ class TrainCfg:
     print_log_every_n_steps: int
     distiller: str
     distill_max_steps: int
+    max_val_comparisons: int = 16
     pose_loss_alpha: float = 1.0
     pose_loss_delta: float = 1.0
     cxt_depth_weight: float = 0.01
@@ -150,6 +151,8 @@ class ModelWrapper(LightningModule):
         self.benchmarker = Benchmarker()
         self._skip_optimizer_step = False
         self._bad_grad_name = None
+        self._val_comparison_images: list[np.ndarray] = []
+        self._val_comparison_captions: list[str] = []
     def on_train_epoch_start(self) -> None:
         # our custom dataset and sampler has to have epoch set by calling set_epoch
         print(f"Train epoch start on rank {self.trainer.global_rank}")
@@ -160,11 +163,24 @@ class ModelWrapper(LightningModule):
 
     def on_validation_epoch_start(self) -> None:
         print(f"Validation epoch start on rank {self.trainer.global_rank}")
+        self._val_comparison_images = []
+        self._val_comparison_captions = []
         # our custom dataset and sampler has to have epoch set by calling set_epoch
         if hasattr(self.trainer.datamodule.val_loader.dataset, "set_epoch"):
             self.trainer.datamodule.val_loader.dataset.set_epoch(self.current_epoch)
         if hasattr(self.trainer.datamodule.val_loader.sampler, "set_epoch"):
             self.trainer.datamodule.val_loader.sampler.set_epoch(self.current_epoch)
+
+    def on_validation_epoch_end(self) -> None:
+        if self.global_rank != 0 or len(self._val_comparison_images) == 0:
+            return
+
+        self.logger.log_image(
+            "comparison",
+            self._val_comparison_images,
+            step=self.global_step,
+            caption=self._val_comparison_captions,
+        )
 
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
@@ -444,6 +460,9 @@ class ModelWrapper(LightningModule):
         depth_dict = encoder_output.depth_dict
         scenes = batch["scene"]
         for i in range(len(scenes)):
+            if len(self._val_comparison_images) >= self.train_cfg.max_val_comparisons:
+                break
+
             context_img = inverse_normalize(batch["context"]["image"][i])
             context = [context_img[j] for j in range(context_img.shape[0])]
 
@@ -469,12 +488,9 @@ class ModelWrapper(LightningModule):
                 align_corners=False,
             ).squeeze(0)
 
-            safe_scene = str(scenes[i]).replace("/", "_").replace("\\", "_")
-            self.logger.log_image(
-                f"comparison/step_{self.global_step}/batch_{batch_idx}_{i}_{safe_scene}",
-                [prep_image(add_border(comparison))],
-                step=self.global_step,
-                caption=[scenes[i]],
+            self._val_comparison_images.append(prep_image(add_border(comparison)))
+            self._val_comparison_captions.append(
+                f"step={self.global_step}, batch={batch_idx}, index={i}, scene={scenes[i]}"
             )
 
     def test_step(self, batch, batch_idx):
@@ -490,7 +506,7 @@ class ModelWrapper(LightningModule):
         with torch.no_grad():
             with self.benchmarker.time("encoder"):
                 (
-                    gaussians,
+                    encoder_output,
                     pred_all_extrinsic,
                     intrinsic, 
                     depth_map, 
@@ -505,7 +521,17 @@ class ModelWrapper(LightningModule):
                     # decoder = self.model.decoder, 
                     name = batch['scene'],
                     target_view_count=target_view_count,
+                    return_refine_data=True,
                     # global_rank = self.global_rank
+                )
+                gaussians = self.model._refine_gaussians(
+                    encoder_output,
+                    (batch["context"]["image"] + 1) / 2,
+                    pred_all_extrinsic,
+                    encoder_output.pred_context_pose,
+                    ctx_img_num,
+                    0.01,
+                    100.0,
                 )
         # if self.global_rank == 0:
         # export_ply(gaussians.means[0], gaussians.scales[0], gaussians.rotations[0], gaussians.harmonics[0].permute(0,2,1), single_opacities, Path(f"gaussians_{[x[:20] for x in batch['scene']]}.ply"))
@@ -610,7 +636,7 @@ class ModelWrapper(LightningModule):
         # )
         from .utils import make_sampling_heatmap_overlay_tensors
         num_context_view = ctx_img_num
-        pred_all_target_extrinsic = pred_all_extrinsic
+        pred_all_target_extrinsic = pred_all_extrinsic[:, ctx_img_num:]
                 
         with self.benchmarker.time("decoder", num_calls=v):
             output = self.model.decoder.forward(

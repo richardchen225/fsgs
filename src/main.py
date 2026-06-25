@@ -166,8 +166,54 @@ def train(cfg_dict: DictConfig):
         else:
             ckpt = torch.load(test_checkpoint, map_location='cpu')
         ckpt = {key.replace('model.', ''): value for key, value in ckpt['state_dict'].items()}
-        ckpt = {key: value for key, value in ckpt.items() if 'gaussian_param_head' in key or 'gs_head' in key or 'cam_dec' in key or 'depth_refiner' in key}
-        model.load_state_dict(ckpt, strict=False)
+        ckpt = {key: value for key, value in ckpt.items() if 'gaussian_param_head' in key or 'gs_head' in key or 'cam_dec' in key or 'depth_refiner' in key or 'gs_residual_refiner' in key}
+
+        model_state = model.state_dict()
+        compatible_ckpt = {}
+        skipped_keys = []
+        for key, value in ckpt.items():
+            if key not in model_state:
+                skipped_keys.append(key)
+                continue
+            if value.shape == model_state[key].shape:
+                compatible_ckpt[key] = value
+                continue
+
+            # Older GS refiners predicted opacity/scale/SH/gate only. The current
+            # head prepends mean/quat residuals, so copy old channels into the
+            # matching tail and keep new geometry channels zero-initialized.
+            remap_key = {
+                "gs_residual_refiner.net.4.weight": "gs_residual_refiner.net.6.weight",
+                "gs_residual_refiner.net.4.bias": "gs_residual_refiner.net.6.bias",
+            }.get(key)
+            if remap_key in model_state:
+                target = model_state[remap_key]
+                if (
+                    value.shape[0] + 7 == target.shape[0]
+                    and value.shape[1:] == target.shape[1:]
+                ):
+                    expanded = target.clone()
+                    expanded.zero_()
+                    expanded[7:] = value
+                    compatible_ckpt[remap_key] = expanded
+                    continue
+
+            if (
+                key in ("gs_residual_refiner.net.6.weight", "gs_residual_refiner.net.6.bias")
+                and value.shape[0] + 7 == model_state[key].shape[0]
+                and value.shape[1:] == model_state[key].shape[1:]
+            ):
+                expanded = model_state[key].clone()
+                expanded.zero_()
+                expanded[7:] = value
+                compatible_ckpt[key] = expanded
+                continue
+
+            skipped_keys.append(key)
+
+        if skipped_keys:
+            print(f"Skipped {len(skipped_keys)} incompatible checkpoint keys.")
+        model.load_state_dict(compatible_ckpt, strict=False)
     
     model_wrapper = ModelWrapper(
         cfg.optimizer,
