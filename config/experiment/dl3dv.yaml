@@ -50,11 +50,7 @@ data_loader:
     batch_size: 2
     
 trainer:
-<<<<<<< HEAD
   max_steps: 20000
-=======
-  max_steps: 40000
->>>>>>> da90c75679e327a4526b307f69d9003e41070fab
   val_check_interval: 100
   num_nodes: 1
   devices: 4
