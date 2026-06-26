@@ -183,8 +183,8 @@ def train(cfg_dict: DictConfig):
             # head prepends mean/quat residuals, so copy old channels into the
             # matching tail and keep new geometry channels zero-initialized.
             remap_key = {
-                "gs_residual_refiner.net.4.weight": "gs_residual_refiner.net.6.weight",
-                "gs_residual_refiner.net.4.bias": "gs_residual_refiner.net.6.bias",
+                "gs_residual_refiner.net.6.weight": "gs_residual_refiner.net.4.weight",
+                "gs_residual_refiner.net.6.bias": "gs_residual_refiner.net.4.bias",
             }.get(key)
             if remap_key in model_state:
                 target = model_state[remap_key]
@@ -199,7 +199,7 @@ def train(cfg_dict: DictConfig):
                     continue
 
             if (
-                key in ("gs_residual_refiner.net.6.weight", "gs_residual_refiner.net.6.bias")
+                key in ("gs_residual_refiner.net.4.weight", "gs_residual_refiner.net.4.bias")
                 and value.shape[0] + 7 == model_state[key].shape[0]
                 and value.shape[1:] == model_state[key].shape[1:]
             ):

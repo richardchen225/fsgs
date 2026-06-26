@@ -105,7 +105,7 @@ class EncoderAnySplatCfg:
     gs_refine_enabled: bool = True
     gs_refine_iters: int = 4
     gs_refine_render_scale: float = 0.25
-    gs_refine_hidden_dim: int = 128
+    gs_refine_hidden_dim: int = 64
     gs_refine_step_opacity: float = 0.25
     gs_refine_step_scale: float = 0.10
     gs_refine_step_sh: float = 0.05

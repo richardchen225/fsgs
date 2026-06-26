@@ -31,15 +31,13 @@ class GaussianResidualRefiner(nn.Module):
         self,
         feature_dim: int,
         sh_dim: int,
-        hidden_dim: int = 128,
+        hidden_dim: int = 64,
     ) -> None:
         super().__init__()
         evidence_dim = 9
         self.sh_dim = sh_dim
         self.net = nn.Sequential(
             nn.Conv2d(feature_dim + evidence_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
             nn.SiLU(inplace=True),
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
             nn.SiLU(inplace=True),
