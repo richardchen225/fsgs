@@ -500,7 +500,7 @@ class ModelWrapper(LightningModule):
         if batch_idx % 100 == 0:
             print(f"Test step {batch_idx:0>6}.")
         
-        target_image = (batch["target"]["image"] + 1) / 2
+        target_image = batch["target"]["image"]
         target_view_count = target_image.shape[1]
         
         with torch.no_grad():
@@ -637,15 +637,17 @@ class ModelWrapper(LightningModule):
         from .utils import make_sampling_heatmap_overlay_tensors
         num_context_view = ctx_img_num
         pred_all_target_extrinsic = pred_all_extrinsic[:, ctx_img_num:]
+        render_view_count = pred_all_target_extrinsic.shape[1]
+        render_device = gaussians.means.device
                 
         with self.benchmarker.time("decoder", num_calls=v):
             output = self.model.decoder.forward(
                 gaussians,
                 pred_all_target_extrinsic,
-                intrinsic[:,0:1,:,:].repeat(1,pred_all_target_extrinsic.shape[1],1,1).float(),
+                intrinsic[:,0:1,:,:].repeat(1, render_view_count, 1, 1).float(),
                 # intrinsic.float(),
-                torch.ones(1, v, device='cuda') * 0.01,
-                torch.ones(1, v, device='cuda') * 100,
+                torch.ones(1, render_view_count, device=render_device) * 0.01,
+                torch.ones(1, render_view_count, device=render_device) * 100,
                 (h, w),
             )
 
@@ -657,7 +659,7 @@ class ModelWrapper(LightningModule):
         with torch.no_grad():
             if self.test_cfg.compute_scores:
                 rgb_pred = output.color[0]
-                rgb_gt = batch["target"]["image"][0]
+                rgb_gt = target_image[0]
                 psnr = compute_psnr(rgb_gt, rgb_pred).mean().item()
                 all_metrics = {
                     f"lpips_ours": compute_lpips(rgb_gt, rgb_pred).mean().item(),

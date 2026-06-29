@@ -26,25 +26,96 @@ from src.model.encoder.anysplat import (
 )
 
 
+def _group_count(channels: int, max_groups: int = 8) -> int:
+    groups = min(max_groups, channels)
+    while channels % groups != 0:
+        groups -= 1
+    return groups
+
+
+class ConvGRUCell(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.gates = nn.Conv2d(
+            input_dim + hidden_dim,
+            hidden_dim * 2,
+            kernel_size=3,
+            padding=1,
+        )
+        self.candidate = nn.Conv2d(
+            input_dim + hidden_dim,
+            hidden_dim,
+            kernel_size=3,
+            padding=1,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        hidden: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if hidden is None:
+            hidden = x.new_zeros(
+                x.shape[0],
+                self.hidden_dim,
+                x.shape[-2],
+                x.shape[-1],
+            )
+
+        gate_input = torch.cat([x, hidden], dim=1)
+        reset_gate, update_gate = self.gates(gate_input).chunk(2, dim=1)
+        reset_gate = torch.sigmoid(reset_gate)
+        update_gate = torch.sigmoid(update_gate)
+
+        candidate_input = torch.cat([x, reset_gate * hidden], dim=1)
+        candidate = torch.tanh(self.candidate(candidate_input))
+        return (1.0 - update_gate) * hidden + update_gate * candidate
+
+
 class GaussianResidualRefiner(nn.Module):
     def __init__(
         self,
         feature_dim: int,
         sh_dim: int,
         hidden_dim: int = 64,
+        num_iters: int = 4,
     ) -> None:
         super().__init__()
         evidence_dim = 9
         self.sh_dim = sh_dim
-        self.net = nn.Sequential(
+        self.num_iters = max(1, int(num_iters))
+        norm_groups = _group_count(hidden_dim)
+
+        self.evidence_encoder = nn.Sequential(
             nn.Conv2d(feature_dim + evidence_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(norm_groups, hidden_dim),
             nn.SiLU(inplace=True),
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(norm_groups, hidden_dim),
             nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_dim, 3 + 4 + 1 + 3 + sh_dim + 1, kernel_size=1),
         )
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
+        self.iter_embed = nn.Parameter(torch.zeros(self.num_iters, hidden_dim, 1, 1))
+        self.update_block = ConvGRUCell(hidden_dim, hidden_dim)
+
+        self.geometry_head = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_dim, 3 + 4 + 1, kernel_size=1),
+        )
+        self.density_head = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_dim, 1 + 3 + 1, kernel_size=1),
+        )
+        self.appearance_head = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_dim, sh_dim + 1, kernel_size=1),
+        )
+        for head in (self.geometry_head, self.density_head, self.appearance_head):
+            nn.init.zeros_(head[-1].weight)
+            nn.init.zeros_(head[-1].bias)
 
     def forward(
         self,
@@ -57,7 +128,16 @@ class GaussianResidualRefiner(nn.Module):
         opacity: torch.Tensor,
         scale_norm: torch.Tensor,
         view_gate: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_state: Optional[torch.Tensor] = None,
+        iter_idx: int = 0,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         b, s, c, h, w = features.shape
         x = torch.cat(
             [
@@ -73,23 +153,37 @@ class GaussianResidualRefiner(nn.Module):
             dim=2,
         )
         x = rearrange(x, "b s c h w -> (b s) c h w")
-        delta = self.net(x)
-        delta = rearrange(delta, "(b s) c h w -> b s c h w", b=b, s=s)
+        evidence = self.evidence_encoder(x)
+        iter_embed = self.iter_embed[min(max(int(iter_idx), 0), self.num_iters - 1)]
+        evidence = evidence + iter_embed
+        hidden_state = self.update_block(evidence, hidden_state)
 
-        delta_mean = delta[:, :, 0:3]
-        delta_quat = delta[:, :, 3:7]
-        delta_opacity = delta[:, :, 7:8]
-        delta_scale = delta[:, :, 8:11]
-        delta_sh = delta[:, :, 11 : 11 + self.sh_dim]
-        learned_gate = torch.sigmoid(delta[:, :, 11 + self.sh_dim : 12 + self.sh_dim])
-        gate = learned_gate * view_gate
+        geometry = self.geometry_head(hidden_state)
+        density = self.density_head(hidden_state)
+        appearance = self.appearance_head(hidden_state)
+
+        geometry = rearrange(geometry, "(b s) c h w -> b s c h w", b=b, s=s)
+        density = rearrange(density, "(b s) c h w -> b s c h w", b=b, s=s)
+        appearance = rearrange(appearance, "(b s) c h w -> b s c h w", b=b, s=s)
+
+        delta_mean = geometry[:, :, 0:3]
+        delta_quat = geometry[:, :, 3:7]
+        geometry_gate = torch.sigmoid(geometry[:, :, 7:8]) * view_gate
+
+        delta_opacity = density[:, :, 0:1]
+        delta_scale = density[:, :, 1:4]
+        density_gate = torch.sigmoid(density[:, :, 4:5]) * view_gate
+
+        delta_sh = appearance[:, :, : self.sh_dim]
+        appearance_gate = torch.sigmoid(appearance[:, :, self.sh_dim : self.sh_dim + 1]) * view_gate
 
         return (
-            gate * delta_mean.tanh(),
-            gate * delta_quat.tanh(),
-            gate * delta_opacity.tanh(),
-            gate * delta_scale.tanh(),
-            gate * delta_sh.tanh(),
+            geometry_gate * delta_mean.tanh(),
+            geometry_gate * delta_quat.tanh(),
+            density_gate * delta_opacity.tanh(),
+            density_gate * delta_scale.tanh(),
+            appearance_gate * delta_sh.tanh(),
+            hidden_state,
         )
 
 
@@ -187,6 +281,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             feature_dim=feature_dim,
             sh_dim=sh_dim,
             hidden_dim=cfg.gs_refine_hidden_dim,
+            num_iters=cfg.gs_refine_iters,
         )
 
     def _build_gaussians_from_refine_state(
@@ -313,8 +408,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         far_tensor = torch.ones(b, render_views, device=device) * far
         view_gate = torch.zeros((b, s, 1, h, w), device=device, dtype=features.dtype)
         view_gate[:, :render_views] = 1.0
+        refiner_hidden = None
 
-        for _ in range(max(0, int(cfg.gs_refine_iters))):
+        for refine_iter in range(max(0, int(cfg.gs_refine_iters))):
             render_context = torch.no_grad() if cfg.gs_refine_detach_evidence else nullcontext()
             with render_context:
                 current_gaussians = self._build_gaussians_from_refine_state(
@@ -380,7 +476,14 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             scale_norm = act_gs.reg_dense_scales(scale_source).clamp_max(0.1).norm(dim=-1, keepdim=True)
             scale_norm = rearrange(scale_norm, "b s (h w) c -> b s c h w", h=h, w=w)
 
-            delta_mean, delta_quat, delta_opacity, delta_scale, delta_sh = self.gs_residual_refiner(
+            (
+                delta_mean,
+                delta_quat,
+                delta_opacity,
+                delta_scale,
+                delta_sh,
+                refiner_hidden,
+            ) = self.gs_residual_refiner(
                 evidence_features.float(),
                 rgb_residual.float(),
                 depth_residual.float(),
@@ -390,6 +493,8 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 opacity.float(),
                 scale_norm.float(),
                 view_gate.float(),
+                refiner_hidden,
+                refine_iter,
             )
 
             delta_mean = rearrange(delta_mean, "b s c h w -> b s (h w) c")

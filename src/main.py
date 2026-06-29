@@ -165,13 +165,23 @@ def train(cfg_dict: DictConfig):
             ckpt = load_file(test_checkpoint)
         else:
             ckpt = torch.load(test_checkpoint, map_location='cpu')
-        ckpt = {key.replace('model.', ''): value for key, value in ckpt['state_dict'].items()}
+        ckpt = ckpt.get("state_dict", ckpt)
+        ckpt = {key.replace('model.', ''): value for key, value in ckpt.items()}
         ckpt = {key: value for key, value in ckpt.items() if 'gaussian_param_head' in key or 'gs_head' in key or 'cam_dec' in key or 'depth_refiner' in key or 'gs_residual_refiner' in key}
 
         model_state = model.state_dict()
         compatible_ckpt = {}
         skipped_keys = []
         for key, value in ckpt.items():
+            remap_key = {
+                "gs_residual_refiner.net.0.weight": "gs_residual_refiner.evidence_encoder.0.weight",
+                "gs_residual_refiner.net.0.bias": "gs_residual_refiner.evidence_encoder.0.bias",
+                "gs_residual_refiner.net.2.weight": "gs_residual_refiner.evidence_encoder.3.weight",
+                "gs_residual_refiner.net.2.bias": "gs_residual_refiner.evidence_encoder.3.bias",
+            }.get(key)
+            if key not in model_state and remap_key in model_state:
+                key = remap_key
+
             if key not in model_state:
                 skipped_keys.append(key)
                 continue
