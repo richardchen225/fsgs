@@ -15,6 +15,7 @@ model:
     mode: ${mode}
     moge_weights_path: weights/model.pt
     zipmap_weights_path: weights/pre_zipmap.pt
+    gs_refine_detach_evidence: false
     
 dataset:
   dl3dv:
