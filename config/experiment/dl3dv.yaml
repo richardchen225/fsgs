@@ -16,6 +16,8 @@ model:
     moge_weights_path: weights/model.pt
     zipmap_weights_path: weights/pre_zipmap.pt
     gs_refine_detach_evidence: false
+    gs_refine_render_scale: 0.5
+    depth_refine_downsample_factor: 2
     
 dataset:
   dl3dv:

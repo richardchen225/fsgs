@@ -111,6 +111,7 @@ class EncoderAnySplatCfg:
     gs_refine_step_sh: float = 0.05
     gs_refine_detach_evidence: bool = True
     gs_refine_max_render_views: Optional[int] = None
+    gs_refine_geometry_neighbors: int = 2
 
 class CameraDec(nn.Module):
     def __init__(self, dim_in=2048):
