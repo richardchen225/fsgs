@@ -86,6 +86,7 @@ class GaussianResidualRefiner(nn.Module):
         self.sh_dim = sh_dim
         self.num_iters = max(1, int(num_iters))
         norm_groups = _group_count(hidden_dim)
+        error_context_dim = 5 + 8
 
         self.evidence_encoder = nn.Sequential(
             nn.Conv2d(feature_dim + evidence_dim, hidden_dim, kernel_size=3, padding=1),
@@ -95,8 +96,14 @@ class GaussianResidualRefiner(nn.Module):
             nn.GroupNorm(norm_groups, hidden_dim),
             nn.SiLU(inplace=True),
         )
-        self.context_encoder = nn.Sequential(
-            nn.Conv2d(feature_dim + evidence_dim, hidden_dim, kernel_size=1),
+        self.error_feature_encoder = nn.Sequential(
+            nn.Conv2d(3, 8, kernel_size=3, padding=1),
+            nn.GroupNorm(_group_count(8), 8),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(8, 8, kernel_size=3, padding=1),
+        )
+        self.error_context_encoder = nn.Sequential(
+            nn.Conv2d(error_context_dim, hidden_dim, kernel_size=1),
             nn.GroupNorm(norm_groups, hidden_dim),
             nn.SiLU(inplace=True),
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
@@ -126,6 +133,17 @@ class GaussianResidualRefiner(nn.Module):
             nn.init.zeros_(head[-1].weight)
             nn.init.zeros_(head[-1].bias)
 
+    def encode_feature_error(
+        self,
+        render_color: torch.Tensor,
+        target_color: torch.Tensor,
+    ) -> torch.Tensor:
+        b, s, c, h, w = render_color.shape
+        render_color = rearrange(render_color.detach().float(), "b s c h w -> (b s) c h w")
+        target_color = rearrange(target_color.detach().float(), "b s c h w -> (b s) c h w")
+        feature_error = self.error_feature_encoder(render_color) - self.error_feature_encoder(target_color)
+        return rearrange(feature_error, "(b s) c h w -> b s c h w", b=b, s=s)
+
     def forward(
         self,
         features: torch.Tensor,
@@ -137,7 +155,7 @@ class GaussianResidualRefiner(nn.Module):
         opacity: torch.Tensor,
         scale_norm: torch.Tensor,
         view_gate: torch.Tensor,
-        projected_context: Optional[torch.Tensor] = None,
+        causal_error_context: Optional[torch.Tensor] = None,
         hidden_state: Optional[torch.Tensor] = None,
         iter_idx: int = 0,
     ) -> tuple[
@@ -162,16 +180,15 @@ class GaussianResidualRefiner(nn.Module):
             ],
             dim=2,
         )
-        counts = torch.arange(1, s + 1, device=x.device, dtype=x.dtype)
-        causal_context = torch.cumsum(x, dim=1) / counts.view(1, s, 1, 1, 1)
-        if projected_context is not None:
-            causal_context = 0.5 * (causal_context + projected_context.to(causal_context.dtype))
-
         x = rearrange(x, "b s c h w -> (b s) c h w")
-        causal_context = rearrange(causal_context, "b s c h w -> (b s) c h w")
         evidence = self.evidence_encoder(x)
-        context_evidence = self.context_encoder(causal_context)
-        evidence = evidence + torch.sigmoid(self.context_gate).to(evidence.dtype) * context_evidence
+        if causal_error_context is not None:
+            causal_error_context = rearrange(
+                causal_error_context.to(evidence.dtype),
+                "b s c h w -> (b s) c h w",
+            )
+            context_evidence = self.error_context_encoder(causal_error_context)
+            evidence = evidence + torch.sigmoid(self.context_gate).to(evidence.dtype) * context_evidence
         iter_embed = self.iter_embed[min(max(int(iter_idx), 0), self.num_iters - 1)]
         evidence = evidence + iter_embed
         hidden_state = self.update_block(evidence, hidden_state)
@@ -356,19 +373,20 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         return alpha.unsqueeze(2)
 
     @staticmethod
-    def _causal_projected_context(
-        evidence: torch.Tensor,
+    def _causal_projected_error_context(
+        error_evidence: torch.Tensor,
         means_raw: torch.Tensor,
         extrinsics_c2w: torch.Tensor,
         intrinsics: torch.Tensor,
         max_neighbors: int,
     ) -> torch.Tensor:
-        b, s, c, h, w = evidence.shape
+        b, s, c, h, w = error_evidence.shape
         max_neighbors = max(0, int(max_neighbors))
         if s <= 1 or max_neighbors <= 0:
-            return evidence
+            return error_evidence
 
-        evidence = evidence.float()
+        input_dtype = error_evidence.dtype
+        error_evidence = error_evidence.float()
         means = means_raw.reshape(b, s, h, w, 3).float()
         c2w = extrinsics_c2w[:, :s].float()
         w2c = torch.linalg.inv(c2w)
@@ -376,8 +394,8 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         k_pix[..., 0, :] *= float(w)
         k_pix[..., 1, :] *= float(h)
 
-        context = evidence.clone()
-        ones = torch.ones((b, h, w, 1), device=evidence.device, dtype=torch.float32)
+        context = error_evidence.clone()
+        ones = torch.ones((b, h, w, 1), device=error_evidence.device, dtype=torch.float32)
 
         for view_idx in range(s):
             first_neighbor = max(0, view_idx - max_neighbors)
@@ -385,8 +403,8 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 continue
 
             cur_points_h = torch.cat([means[:, view_idx], ones], dim=-1)
-            accum = evidence.new_zeros((b, c, h, w))
-            count = evidence.new_zeros((b, 1, h, w))
+            accum = error_evidence.new_zeros((b, c, h, w))
+            count = error_evidence.new_zeros((b, 1, h, w))
 
             for neighbor_idx in range(first_neighbor, view_idx):
                 prev_points = torch.einsum("bij,bhwj->bhwi", w2c[:, neighbor_idx], cur_points_h)[..., :3]
@@ -414,7 +432,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 grid_y = 2.0 * (y_pix + 0.5) / float(h) - 1.0
                 grid = torch.stack([grid_x, grid_y], dim=-1)
                 sampled = F.grid_sample(
-                    evidence[:, neighbor_idx],
+                    error_evidence[:, neighbor_idx],
                     grid,
                     mode="bilinear",
                     padding_mode="zeros",
@@ -425,9 +443,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
 
             has_context = count > 0
             projected = accum / count.clamp_min(1.0)
-            context[:, view_idx] = torch.where(has_context, projected, evidence[:, view_idx])
+            context[:, view_idx] = torch.where(has_context, projected, error_evidence[:, view_idx])
 
-        return context.to(evidence.dtype)
+        return context.to(input_dtype)
 
     def _refine_gaussians(
         self,
@@ -561,6 +579,16 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             alpha = F.interpolate(alpha, size=(h, w), mode="bilinear", align_corners=False)
             alpha = rearrange(alpha, "(b s) c h w -> b s c h w", b=b, s=s)
 
+            feature_error_low = self.gs_residual_refiner.encode_feature_error(
+                render_color,
+                target_low[:, :render_views],
+            )
+            feature_error_low_all = torch.zeros((b, s, 8, low_h, low_w), device=device, dtype=feature_error_low.dtype)
+            feature_error_low_all[:, :render_views] = feature_error_low.to(feature_error_low_all.dtype)
+            feature_error = rearrange(feature_error_low_all, "b s c h w -> (b s) c h w")
+            feature_error = F.interpolate(feature_error, size=(h, w), mode="bilinear", align_corners=False)
+            feature_error = rearrange(feature_error, "(b s) c h w -> b s c h w", b=b, s=s)
+
             opacity_source = opacities_raw.detach() if cfg.gs_refine_detach_evidence else opacities_raw
             scale_source = scales_raw.detach() if cfg.gs_refine_detach_evidence else scales_raw
             opacity = act_gs.reg_dense_opacities(opacity_source)
@@ -568,26 +596,21 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             scale_norm = act_gs.reg_dense_scales(scale_source).clamp_max(0.1).norm(dim=-1, keepdim=True)
             scale_norm = rearrange(scale_norm, "b s (h w) c -> b s c h w", h=h, w=w)
 
-            with torch.no_grad():
-                projected_context = self._causal_projected_context(
-                    torch.cat(
-                        [
-                            evidence_features.float(),
-                            rgb_residual.float(),
-                            depth_residual.float(),
-                            alpha.float(),
-                            depth_conf.float(),
-                            depth_uncertainty.float(),
-                            opacity.float(),
-                            scale_norm.float(),
-                        ],
-                        dim=2,
-                    ).detach(),
-                    means_raw.detach(),
-                    pred_all_extrinsic[:, :s].detach(),
-                    pred_context_pose["intrinsic"][:, 0:1, ...].repeat(1, s, 1, 1).detach(),
-                    cfg.gs_refine_geometry_neighbors,
-                )
+            causal_error_context = self._causal_projected_error_context(
+                torch.cat(
+                    [
+                        rgb_residual.detach().float(),
+                        depth_residual.detach().float(),
+                        alpha.detach().float(),
+                        feature_error.float(),
+                    ],
+                    dim=2,
+                ),
+                means_raw.detach(),
+                pred_all_extrinsic[:, :s].detach(),
+                pred_context_pose["intrinsic"][:, 0:1, ...].repeat(1, s, 1, 1).detach(),
+                cfg.gs_refine_geometry_neighbors,
+            )
 
             (
                 delta_mean,
@@ -606,7 +629,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 opacity.float(),
                 scale_norm.float(),
                 view_gate.float(),
-                projected_context,
+                causal_error_context,
                 refiner_hidden,
                 refine_iter,
             )
@@ -637,6 +660,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 rgb_residual,
                 depth_residual,
                 alpha,
+                feature_error_low,
+                feature_error_low_all,
+                feature_error,
                 opacity_source,
                 scale_source,
                 opacity,
@@ -646,7 +672,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 delta_opacity,
                 delta_scale,
                 delta_sh,
-                projected_context,
+                causal_error_context,
                 mean_step_source,
                 mean_step,
             )
