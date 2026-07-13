@@ -408,6 +408,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         ctx_img_num: int,
         near: float,
         far: float,
+        global_step: int = 0,
     ) -> Gaussians:
         if self.gs_residual_refiner is None:
             return encoder_output.gaussians
@@ -610,9 +611,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             )
 
         if self.training:
-            # One randomly sampled transition trains the streaming update rule
-            # without backpropagating through a full sequential rollout.
-            refine_view_idx = int(torch.randint(1, s, (), device=device).item())
+            # Cycle through history lengths deterministically so every DDP rank
+            # executes the same graph while all causal transitions are covered.
+            refine_view_idx = 1 + int(global_step) % (s - 1)
             (
                 current_means,
                 current_quats,
@@ -629,7 +630,20 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 opacities_raw,
                 res_sh_raw,
             )
-            refined_gaussians = self._concat_gaussians(old_gaussians, current_gaussians)
+            # The old-only evidence render stays detached, but the same history
+            # remains differentiable in the final map so the base GS predictor
+            # continues receiving the normal rendering supervision.
+            trainable_old_gaussians = self._build_gaussians_from_raw_state(
+                base_sh_raw[:, :refine_view_idx],
+                means_raw[:, :refine_view_idx],
+                quats_raw[:, :refine_view_idx],
+                scales_raw[:, :refine_view_idx],
+                opacities_raw[:, :refine_view_idx],
+                res_sh_raw[:, :refine_view_idx],
+            )
+            refined_gaussians = self._concat_gaussians(
+                trainable_old_gaussians, current_gaussians
+            )
         else:
             # Validation/test simulate streaming: each refined current frame is
             # appended to the map and becomes history for the next frame.
@@ -723,6 +737,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             ctx_img_num,
             near,
             far,
+            global_step,
         )
         encoder_output.gaussians = gaussians
 

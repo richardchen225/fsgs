@@ -527,6 +527,7 @@ class ModelWrapper(LightningModule):
                     ctx_img_num,
                     0.01,
                     100.0,
+                    self.global_step,
                 )
                 if (
                     encoder_output.infos is not None
