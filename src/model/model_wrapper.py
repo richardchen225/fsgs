@@ -376,15 +376,23 @@ class ModelWrapper(LightningModule):
         
         return total_loss
 
-    # def on_after_backward(self):
-    #     for name, p in self.named_parameters():
-    #         if p.grad is None:
-    #             continue
-    #         grad = p.grad.detach()
-    #         if torch.isnan(grad).any() or torch.isinf(grad).any():
-    #             print(f"[NaN-Guard]: {name}")
-    #             p.grad = torch.zeros_like(p.grad)
-    #             continue
+    def on_after_backward(self):
+        # Keep DDP's strict unused-parameter check enabled. If a future graph
+        # change disconnects a trainable branch, print exact names before DDP
+        # raises on the next forward pass.
+        if self.global_step > 1:
+            return
+        unused = [
+            name
+            for name, param in self.named_parameters()
+            if param.requires_grad and param.grad is None
+        ]
+        if unused:
+            print(
+                f"[DDP unused parameters][rank={self.global_rank}]\n"
+                + "\n".join(unused)
+            )
+
     def on_before_optimizer_step(self, optimizer):
         # 这个 hook 里检查的是“真正要 step 的梯度”
         self._skip_optimizer_step = False
@@ -527,7 +535,6 @@ class ModelWrapper(LightningModule):
                     ctx_img_num,
                     0.01,
                     100.0,
-                    self.global_step,
                 )
                 if (
                     encoder_output.infos is not None
