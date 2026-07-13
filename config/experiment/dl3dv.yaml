@@ -71,7 +71,6 @@ train:
   pose_loss_alpha: 1.0
   pose_loss_delta: 1.0
   cxt_depth_weight: 1.0
-  depth_refine_aux_weight: 0.5
   weight_pose: 10.0
   weight_depth: 1.0
   weight_normal: 0.1

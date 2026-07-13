@@ -1,5 +1,4 @@
 import os
-from contextlib import nullcontext
 from copy import deepcopy
 import time
 from typing import Optional
@@ -328,18 +327,46 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         opacities_raw: torch.Tensor,
         res_sh_raw: torch.Tensor,
     ) -> Gaussians:
+        return self._build_gaussians_from_raw_state(
+            refine_info["base_sh"],
+            means_raw,
+            quats_raw,
+            scales_raw,
+            opacities_raw,
+            res_sh_raw,
+        )
+
+    @staticmethod
+    def _build_gaussians_from_raw_state(
+        base_sh_raw: torch.Tensor,
+        means_raw: torch.Tensor,
+        quats_raw: torch.Tensor,
+        scales_raw: torch.Tensor,
+        opacities_raw: torch.Tensor,
+        res_sh_raw: torch.Tensor,
+    ) -> Gaussians:
         b, s, n, _ = means_raw.shape
         means = means_raw.reshape(b, s * n, 3)
         rotations = act_gs.reg_dense_rotation(quats_raw).reshape(b, s * n, 4)
         scales = act_gs.reg_dense_scales(scales_raw).clamp_max(0.1).reshape(b, s * n, 3)
         opacities = act_gs.reg_dense_opacities(opacities_raw).reshape(b, s * n)
-        harmonics = (refine_info["base_sh"] + res_sh_raw).reshape(b, s * n, -1).unsqueeze(-2)
+        harmonics = (base_sh_raw + res_sh_raw).reshape(b, s * n, -1).unsqueeze(-2)
         return Gaussians(
             means=means,
             harmonics=harmonics,
             opacities=opacities,
             scales=scales,
             rotations=rotations,
+        )
+
+    @staticmethod
+    def _concat_gaussians(first: Gaussians, second: Gaussians) -> Gaussians:
+        return Gaussians(
+            means=torch.cat([first.means, second.means], dim=1),
+            harmonics=torch.cat([first.harmonics, second.harmonics], dim=1),
+            opacities=torch.cat([first.opacities, second.opacities], dim=1),
+            scales=torch.cat([first.scales, second.scales], dim=1),
+            rotations=torch.cat([first.rotations, second.rotations], dim=1),
         )
 
     @staticmethod
@@ -372,81 +399,6 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             alpha = alpha.reshape(b, views, h, w)
         return alpha.unsqueeze(2)
 
-    @staticmethod
-    def _causal_projected_error_context(
-        error_evidence: torch.Tensor,
-        means_raw: torch.Tensor,
-        extrinsics_c2w: torch.Tensor,
-        intrinsics: torch.Tensor,
-        max_neighbors: int,
-    ) -> torch.Tensor:
-        b, s, c, h, w = error_evidence.shape
-        max_neighbors = max(0, int(max_neighbors))
-        if s <= 1 or max_neighbors <= 0:
-            return error_evidence
-
-        input_dtype = error_evidence.dtype
-        error_evidence = error_evidence.float()
-        means = means_raw.reshape(b, s, h, w, 3).float()
-        c2w = extrinsics_c2w[:, :s].float()
-        w2c = torch.linalg.inv(c2w)
-        k_pix = intrinsics[:, :s].float().clone()
-        k_pix[..., 0, :] *= float(w)
-        k_pix[..., 1, :] *= float(h)
-
-        context = error_evidence.clone()
-        ones = torch.ones((b, h, w, 1), device=error_evidence.device, dtype=torch.float32)
-
-        for view_idx in range(s):
-            first_neighbor = max(0, view_idx - max_neighbors)
-            if first_neighbor == view_idx:
-                continue
-
-            cur_points_h = torch.cat([means[:, view_idx], ones], dim=-1)
-            accum = error_evidence.new_zeros((b, c, h, w))
-            count = error_evidence.new_zeros((b, 1, h, w))
-
-            for neighbor_idx in range(first_neighbor, view_idx):
-                prev_points = torch.einsum("bij,bhwj->bhwi", w2c[:, neighbor_idx], cur_points_h)[..., :3]
-                z_prev = prev_points[..., 2]
-                valid_z = z_prev > 1e-4
-                z_safe = z_prev.clamp_min(1e-4)
-
-                prev_k = k_pix[:, neighbor_idx]
-                fx = prev_k[:, 0, 0].view(b, 1, 1).clamp_min(1e-6)
-                fy = prev_k[:, 1, 1].view(b, 1, 1).clamp_min(1e-6)
-                cx = prev_k[:, 0, 2].view(b, 1, 1)
-                cy = prev_k[:, 1, 2].view(b, 1, 1)
-
-                x_pix = fx * (prev_points[..., 0] / z_safe) + cx
-                y_pix = fy * (prev_points[..., 1] / z_safe) + cy
-                valid_xy = (
-                    (x_pix >= 0)
-                    & (x_pix <= w - 1)
-                    & (y_pix >= 0)
-                    & (y_pix <= h - 1)
-                )
-                valid = (valid_z & valid_xy).float().unsqueeze(1)
-
-                grid_x = 2.0 * (x_pix + 0.5) / float(w) - 1.0
-                grid_y = 2.0 * (y_pix + 0.5) / float(h) - 1.0
-                grid = torch.stack([grid_x, grid_y], dim=-1)
-                sampled = F.grid_sample(
-                    error_evidence[:, neighbor_idx],
-                    grid,
-                    mode="bilinear",
-                    padding_mode="zeros",
-                    align_corners=False,
-                )
-                accum = accum + sampled * valid
-                count = count + valid
-
-            has_context = count > 0
-            projected = accum / count.clamp_min(1.0)
-            context[:, view_idx] = torch.where(has_context, projected, error_evidence[:, view_idx])
-
-        return context.to(input_dtype)
-
     def _refine_gaussians(
         self,
         encoder_output,
@@ -466,21 +418,21 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         cfg = self.encoder.cfg
         features = refine_info["features"]
         b, s, _, h, w = features.shape
+        if s <= 1:
+            return encoder_output.gaussians
+
         device = features.device
         evidence_features = features.detach() if cfg.gs_refine_detach_evidence else features
         render_scale = float(max(0.0, min(1.0, cfg.gs_refine_render_scale)))
         low_h = max(8, int(round(h * render_scale)))
         low_w = max(8, int(round(w * render_scale)))
-        render_views = ctx_img_num
-        if cfg.gs_refine_max_render_views is not None:
-            render_views = min(render_views, int(cfg.gs_refine_max_render_views))
-        render_views = max(1, render_views)
 
         means_raw = refine_info["means"]
         quats_raw = refine_info["quats"]
         scales_raw = refine_info["scales_raw"]
         opacities_raw = refine_info["opacities_raw"]
         res_sh_raw = refine_info["res_sh_raw"]
+        base_sh_raw = refine_info["base_sh"]
 
         depth = refine_info["depth"]
         if cfg.gs_refine_detach_evidence:
@@ -512,183 +464,221 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         target_low = F.interpolate(target_low.float(), size=(low_h, low_w), mode="bilinear", align_corners=False)
         target_low = rearrange(target_low, "(b s) c h w -> b s c h w", b=b, s=s)
 
-        render_intrinsics = pred_context_pose["intrinsic"][:, 0:1, ...].repeat(1, render_views, 1, 1).detach()
-        render_extrinsics = pred_all_extrinsic[:, :render_views].detach()
-        near_tensor = torch.ones(b, render_views, device=device) * near
-        far_tensor = torch.ones(b, render_views, device=device) * far
-        view_gate = torch.zeros((b, s, 1, h, w), device=device, dtype=features.dtype)
-        view_gate[:, :render_views] = 1.0
-        refiner_hidden = None
+        render_intrinsics = pred_context_pose["intrinsic"][:, 0:1].detach()
+        near_tensor = torch.full((b, 1), near, device=device)
+        far_tensor = torch.full((b, 1), far, device=device)
 
-        for refine_iter in range(max(0, int(cfg.gs_refine_iters))):
-            render_context = torch.no_grad() if cfg.gs_refine_detach_evidence else nullcontext()
-            with render_context:
-                current_gaussians = self._build_gaussians_from_refine_state(
-                    refine_info,
-                    means_raw,
-                    quats_raw,
-                    scales_raw,
-                    opacities_raw,
-                    res_sh_raw,
+        def refine_current_view(
+            view_idx: int,
+            means_state: torch.Tensor,
+            quats_state: torch.Tensor,
+            scales_state: torch.Tensor,
+            opacities_state: torch.Tensor,
+            sh_state: torch.Tensor,
+        ):
+            # The historical map is a fixed pseudo-state. Gradients only train
+            # how the current frame consumes that state and updates its own GS.
+            with torch.no_grad():
+                old_gaussians = self._build_gaussians_from_raw_state(
+                    base_sh_raw[:, :view_idx].detach(),
+                    means_state[:, :view_idx].detach(),
+                    quats_state[:, :view_idx].detach(),
+                    scales_state[:, :view_idx].detach(),
+                    opacities_state[:, :view_idx].detach(),
+                    sh_state[:, :view_idx].detach(),
                 )
-                low_output = self.decoder.forward(
-                    current_gaussians,
-                    render_extrinsics,
+                old_output = self.decoder.forward(
+                    old_gaussians,
+                    pred_all_extrinsic[:, view_idx : view_idx + 1].detach(),
                     render_intrinsics,
                     near_tensor,
                     far_tensor,
                     (low_h, low_w),
                     "depth",
                 )
-            render_color = low_output.color.detach() if cfg.gs_refine_detach_evidence else low_output.color
-            render_depth = self._normalize_render_depth(
-                low_output.depth.detach() if cfg.gs_refine_detach_evidence else low_output.depth,
-                b,
-                render_views,
-                low_h,
-                low_w,
-            )
-            render_alpha = self._normalize_render_alpha(
-                low_output.alpha.detach() if cfg.gs_refine_detach_evidence else low_output.alpha,
-                b,
-                render_views,
-                low_h,
-                low_w,
-            )
+                render_color = old_output.color.detach()
+                render_depth = self._normalize_render_depth(
+                    old_output.depth.detach(), b, 1, low_h, low_w
+                )
+                render_alpha = self._normalize_render_alpha(
+                    old_output.alpha.detach(), b, 1, low_h, low_w
+                )
 
-            rgb_residual_low = torch.zeros((b, s, 3, low_h, low_w), device=device, dtype=features.dtype)
-            depth_residual_low = torch.zeros((b, s, 1, low_h, low_w), device=device, dtype=features.dtype)
-            alpha_low = torch.zeros((b, s, 1, low_h, low_w), device=device, dtype=features.dtype)
+            current_target_low = target_low[:, view_idx : view_idx + 1]
+            rgb_residual_low = (render_color - current_target_low).to(features.dtype)
+            current_depth_low = depth_low[:, view_idx : view_idx + 1].clamp_min(1e-4)
+            depth_residual_low = ((render_depth - current_depth_low) / current_depth_low).clamp(-1.0, 1.0)
+            depth_residual_low = depth_residual_low.to(features.dtype)
+            alpha_low = render_alpha.to(features.dtype)
 
-            rgb_residual_low[:, :render_views] = (render_color - target_low[:, :render_views]).to(features.dtype)
-            depth_target = depth_low[:, :render_views].clamp_min(1e-4)
-            depth_residual_low[:, :render_views] = (
-                (render_depth - depth_target) / depth_target
-            ).clamp(-1.0, 1.0).to(features.dtype)
-            alpha_low[:, :render_views] = render_alpha.to(features.dtype)
+            def upsample_error(error: torch.Tensor) -> torch.Tensor:
+                error = rearrange(error, "b s c h w -> (b s) c h w")
+                error = F.interpolate(error, size=(h, w), mode="bilinear", align_corners=False)
+                return rearrange(error, "(b s) c h w -> b s c h w", b=b, s=1)
 
-            rgb_residual = rearrange(rgb_residual_low, "b s c h w -> (b s) c h w")
-            rgb_residual = F.interpolate(rgb_residual, size=(h, w), mode="bilinear", align_corners=False)
-            rgb_residual = rearrange(rgb_residual, "(b s) c h w -> b s c h w", b=b, s=s)
-
-            depth_residual = rearrange(depth_residual_low, "b s c h w -> (b s) c h w")
-            depth_residual = F.interpolate(depth_residual, size=(h, w), mode="bilinear", align_corners=False)
-            depth_residual = rearrange(depth_residual, "(b s) c h w -> b s c h w", b=b, s=s)
-
-            alpha = rearrange(alpha_low, "b s c h w -> (b s) c h w")
-            alpha = F.interpolate(alpha, size=(h, w), mode="bilinear", align_corners=False)
-            alpha = rearrange(alpha, "(b s) c h w -> b s c h w", b=b, s=s)
-
-            feature_error_low = self.gs_residual_refiner.encode_feature_error(
+            rgb_residual = upsample_error(rgb_residual_low)
+            depth_residual = upsample_error(depth_residual_low)
+            alpha = upsample_error(alpha_low)
+            feature_error = self.gs_residual_refiner.encode_feature_error(
                 render_color,
-                target_low[:, :render_views],
+                current_target_low,
             )
-            feature_error_low_all = torch.zeros((b, s, 8, low_h, low_w), device=device, dtype=feature_error_low.dtype)
-            feature_error_low_all[:, :render_views] = feature_error_low.to(feature_error_low_all.dtype)
-            feature_error = rearrange(feature_error_low_all, "b s c h w -> (b s) c h w")
-            feature_error = F.interpolate(feature_error, size=(h, w), mode="bilinear", align_corners=False)
-            feature_error = rearrange(feature_error, "(b s) c h w -> b s c h w", b=b, s=s)
-
-            opacity_source = opacities_raw.detach() if cfg.gs_refine_detach_evidence else opacities_raw
-            scale_source = scales_raw.detach() if cfg.gs_refine_detach_evidence else scales_raw
-            opacity = act_gs.reg_dense_opacities(opacity_source)
-            opacity = rearrange(opacity, "b s (h w) c -> b s c h w", h=h, w=w)
-            scale_norm = act_gs.reg_dense_scales(scale_source).clamp_max(0.1).norm(dim=-1, keepdim=True)
-            scale_norm = rearrange(scale_norm, "b s (h w) c -> b s c h w", h=h, w=w)
-
-            causal_error_context = self._causal_projected_error_context(
-                torch.cat(
-                    [
-                        rgb_residual.detach().float(),
-                        depth_residual.detach().float(),
-                        alpha.detach().float(),
-                        feature_error.float(),
-                    ],
-                    dim=2,
-                ),
-                means_raw.detach(),
-                pred_all_extrinsic[:, :s].detach(),
-                pred_context_pose["intrinsic"][:, 0:1, ...].repeat(1, s, 1, 1).detach(),
-                cfg.gs_refine_geometry_neighbors,
+            feature_error = upsample_error(feature_error)
+            error_context = torch.cat(
+                [
+                    rgb_residual.detach().float(),
+                    depth_residual.detach().float(),
+                    alpha.detach().float(),
+                    feature_error.float(),
+                ],
+                dim=2,
             )
 
-            (
-                delta_mean,
-                delta_quat,
-                delta_opacity,
-                delta_scale,
-                delta_sh,
-                refiner_hidden,
-            ) = self.gs_residual_refiner(
-                evidence_features.float(),
-                rgb_residual.float(),
-                depth_residual.float(),
-                alpha.float(),
-                depth_conf.float(),
-                depth_uncertainty.float(),
-                opacity.float(),
-                scale_norm.float(),
-                view_gate.float(),
-                causal_error_context,
-                refiner_hidden,
-                refine_iter,
-            )
-
-            delta_mean = rearrange(delta_mean, "b s c h w -> b s (h w) c")
-            delta_quat = rearrange(delta_quat, "b s c h w -> b s (h w) c")
-            delta_opacity = rearrange(delta_opacity, "b s c h w -> b s (h w) c")
-            delta_scale = rearrange(delta_scale, "b s c h w -> b s (h w) c")
-            delta_sh = rearrange(delta_sh, "b s c h w -> b s (h w) c")
-
-            mean_step_source = depth.detach() if cfg.gs_refine_detach_evidence else depth
+            current_means = means_state[:, view_idx : view_idx + 1]
+            current_quats = quats_state[:, view_idx : view_idx + 1]
+            current_scales = scales_state[:, view_idx : view_idx + 1]
+            current_opacities = opacities_state[:, view_idx : view_idx + 1]
+            current_sh = sh_state[:, view_idx : view_idx + 1]
+            current_features = evidence_features[:, view_idx : view_idx + 1]
+            current_depth_conf = depth_conf[:, view_idx : view_idx + 1]
+            current_depth_uncertainty = depth_uncertainty[:, view_idx : view_idx + 1]
+            mean_step_source = depth[:, view_idx : view_idx + 1]
+            if cfg.gs_refine_detach_evidence:
+                mean_step_source = mean_step_source.detach()
             mean_step = rearrange(mean_step_source.float(), "b s h w c -> b s (h w) c")
-            means_raw = means_raw + mean_step.to(means_raw.dtype) * delta_mean.to(means_raw.dtype)
-            quats_raw = quats_raw + delta_quat.to(quats_raw.dtype)
-            opacities_raw = opacities_raw + cfg.gs_refine_step_opacity * delta_opacity.to(opacities_raw.dtype)
-            scales_raw = scales_raw + cfg.gs_refine_step_scale * delta_scale.to(scales_raw.dtype)
-            res_sh_raw = res_sh_raw + cfg.gs_refine_step_sh * delta_sh.to(res_sh_raw.dtype)
+            view_gate = torch.ones((b, 1, 1, h, w), device=device, dtype=features.dtype)
+            refiner_hidden = None
 
-            del (
+            for refine_iter in range(max(0, int(cfg.gs_refine_iters))):
+                opacity_source = current_opacities.detach() if cfg.gs_refine_detach_evidence else current_opacities
+                scale_source = current_scales.detach() if cfg.gs_refine_detach_evidence else current_scales
+                opacity = act_gs.reg_dense_opacities(opacity_source)
+                opacity = rearrange(opacity, "b s (h w) c -> b s c h w", h=h, w=w)
+                scale_norm = act_gs.reg_dense_scales(scale_source).clamp_max(0.1).norm(dim=-1, keepdim=True)
+                scale_norm = rearrange(scale_norm, "b s (h w) c -> b s c h w", h=h, w=w)
+
+                (
+                    delta_mean,
+                    delta_quat,
+                    delta_opacity,
+                    delta_scale,
+                    delta_sh,
+                    refiner_hidden,
+                ) = self.gs_residual_refiner(
+                    current_features.float(),
+                    rgb_residual.float(),
+                    depth_residual.float(),
+                    alpha.float(),
+                    current_depth_conf.float(),
+                    current_depth_uncertainty.float(),
+                    opacity.float(),
+                    scale_norm.float(),
+                    view_gate.float(),
+                    error_context,
+                    refiner_hidden,
+                    refine_iter,
+                )
+
+                delta_mean = rearrange(delta_mean, "b s c h w -> b s (h w) c")
+                delta_quat = rearrange(delta_quat, "b s c h w -> b s (h w) c")
+                delta_opacity = rearrange(delta_opacity, "b s c h w -> b s (h w) c")
+                delta_scale = rearrange(delta_scale, "b s c h w -> b s (h w) c")
+                delta_sh = rearrange(delta_sh, "b s c h w -> b s (h w) c")
+
+                current_means = current_means + mean_step.to(current_means.dtype) * delta_mean.to(current_means.dtype)
+                current_quats = current_quats + delta_quat.to(current_quats.dtype)
+                current_opacities = current_opacities + cfg.gs_refine_step_opacity * delta_opacity.to(current_opacities.dtype)
+                current_scales = current_scales + cfg.gs_refine_step_scale * delta_scale.to(current_scales.dtype)
+                current_sh = current_sh + cfg.gs_refine_step_sh * delta_sh.to(current_sh.dtype)
+
+            current_gaussians = self._build_gaussians_from_raw_state(
+                base_sh_raw[:, view_idx : view_idx + 1],
+                current_means,
+                current_quats,
+                current_scales,
+                current_opacities,
+                current_sh,
+            )
+            return (
+                current_means,
+                current_quats,
+                current_scales,
+                current_opacities,
+                current_sh,
+                old_gaussians,
                 current_gaussians,
-                low_output,
-                render_color,
-                render_depth,
-                render_alpha,
-                rgb_residual_low,
-                depth_residual_low,
-                alpha_low,
-                rgb_residual,
-                depth_residual,
-                alpha,
-                feature_error_low,
-                feature_error_low_all,
-                feature_error,
-                opacity_source,
-                scale_source,
-                opacity,
-                scale_norm,
-                delta_mean,
-                delta_quat,
-                delta_opacity,
-                delta_scale,
-                delta_sh,
-                causal_error_context,
-                mean_step_source,
-                mean_step,
             )
 
-        refined_gaussians = self._build_gaussians_from_refine_state(
-            refine_info,
-            means_raw,
-            quats_raw,
-            scales_raw,
-            opacities_raw,
-            res_sh_raw,
-        )
+        if self.training:
+            # One randomly sampled transition trains the streaming update rule
+            # without backpropagating through a full sequential rollout.
+            refine_view_idx = int(torch.randint(1, s, (), device=device).item())
+            (
+                current_means,
+                current_quats,
+                current_scales,
+                current_opacities,
+                current_sh,
+                old_gaussians,
+                current_gaussians,
+            ) = refine_current_view(
+                refine_view_idx,
+                means_raw,
+                quats_raw,
+                scales_raw,
+                opacities_raw,
+                res_sh_raw,
+            )
+            refined_gaussians = self._concat_gaussians(old_gaussians, current_gaussians)
+        else:
+            # Validation/test simulate streaming: each refined current frame is
+            # appended to the map and becomes history for the next frame.
+            for refine_view_idx in range(1, s):
+                (
+                    current_means,
+                    current_quats,
+                    current_scales,
+                    current_opacities,
+                    current_sh,
+                    _,
+                    _,
+                ) = refine_current_view(
+                    refine_view_idx,
+                    means_raw,
+                    quats_raw,
+                    scales_raw,
+                    opacities_raw,
+                    res_sh_raw,
+                )
+
+                def replace_view(state: torch.Tensor, current: torch.Tensor) -> torch.Tensor:
+                    return torch.cat(
+                        [state[:, :refine_view_idx], current, state[:, refine_view_idx + 1 :]],
+                        dim=1,
+                    )
+
+                means_raw = replace_view(means_raw, current_means)
+                quats_raw = replace_view(quats_raw, current_quats)
+                scales_raw = replace_view(scales_raw, current_scales)
+                opacities_raw = replace_view(opacities_raw, current_opacities)
+                res_sh_raw = replace_view(res_sh_raw, current_sh)
+
+            refined_gaussians = self._build_gaussians_from_refine_state(
+                refine_info,
+                means_raw,
+                quats_raw,
+                scales_raw,
+                opacities_raw,
+                res_sh_raw,
+            )
+
         if encoder_output.infos is not None:
             encoder_output.infos.pop("gs_refine", None)
             encoder_output.infos["gs_refine_steps"] = torch.tensor(
                 int(cfg.gs_refine_iters), device=device
+            )
+            encoder_output.infos["gs_refine_history_views"] = torch.tensor(
+                refine_view_idx, device=device
             )
         return refined_gaussians
 

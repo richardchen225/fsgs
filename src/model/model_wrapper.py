@@ -98,7 +98,6 @@ class TrainCfg:
     pose_loss_alpha: float = 1.0
     pose_loss_delta: float = 1.0
     cxt_depth_weight: float = 0.01
-    depth_refine_aux_weight: float = 0.5
     weight_pose: float = 1.0
     weight_depth: float = 1.0
     weight_normal: float = 1.0
@@ -251,6 +250,14 @@ class ModelWrapper(LightningModule):
         )
         
         distill_infos = encoder_output.distill_infos
+        if (
+            encoder_output.infos is not None
+            and "gs_refine_history_views" in encoder_output.infos
+        ):
+            self.log(
+                "train/gs_refine_history_views",
+                encoder_output.infos["gs_refine_history_views"].float(),
+            )
         
         target_gt = (batch["context"]["image"] + 1) / 2
         num_context_views = target_gt.shape[1]
@@ -270,23 +277,11 @@ class ModelWrapper(LightningModule):
         with torch.amp.autocast("cuda", enabled=False):
             depth_loss_idx = list(get_cfg()["loss"].keys()).index("depth")
             depth_loss_module = self.losses[depth_loss_idx]
-            if (
-                depth_dict is not None
-                and "depth_refine_iters" in depth_dict
-                and hasattr(depth_loss_module, "ctx_depth_sequence_loss")
-            ):
-                loss_depth_ctx = depth_loss_module.ctx_depth_sequence_loss(
-                    depth_dict["depth_refine_iters"],
-                    batch,
-                    cxt_depth_weight=self.train_cfg.cxt_depth_weight,
-                    aux_weight=self.train_cfg.devices,
-                )
-            else:
-                loss_depth_ctx = depth_loss_module.ctx_depth_loss(
-                    depth_dict["depth"],
-                    batch,
-                    cxt_depth_weight=self.train_cfg.cxt_depth_weight,
-                )
+            loss_depth_ctx = depth_loss_module.ctx_depth_loss(
+                depth_dict["depth"],
+                batch,
+                cxt_depth_weight=self.train_cfg.cxt_depth_weight,
+            )
 
             self.log(
                 "loss/loss_depth_ctx",
@@ -533,6 +528,18 @@ class ModelWrapper(LightningModule):
                     0.01,
                     100.0,
                 )
+                if (
+                    encoder_output.infos is not None
+                    and "gs_refine_history_views" in encoder_output.infos
+                ):
+                    final_history = int(
+                        encoder_output.infos["gs_refine_history_views"].item()
+                    )
+                    if final_history != ctx_img_num - 1:
+                        raise RuntimeError(
+                            "GS refiner test rollout did not consume all causal context views: "
+                            f"history={final_history}, expected={ctx_img_num - 1}."
+                        )
         # if self.global_rank == 0:
         # export_ply(gaussians.means[0], gaussians.scales[0], gaussians.rotations[0], gaussians.harmonics[0].permute(0,2,1), single_opacities, Path(f"gaussians_{[x[:20] for x in batch['scene']]}.ply"))
         
