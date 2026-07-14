@@ -181,8 +181,19 @@ class DynamicBatchSampler(Sampler):
         while True:
             try:
                 # Sample random image number and aspect ratio
-                random_image_num = int(np.random.choice(self.possible_nums, p=self.normalized_weights))
-                random_ps_h = np.random.randint(low=(self.h_range[0] // 14), high=(self.h_range[1] // 14)+1)
+                # Use the sampler-local RNG so every DDP rank, seeded with the
+                # same epoch, executes the same view-count and resolution graph.
+                random_image_num = int(
+                    self.rng.choices(
+                        self.possible_nums.tolist(),
+                        weights=self.normalized_weights.tolist(),
+                        k=1,
+                    )[0]
+                )
+                random_ps_h = self.rng.randint(
+                    self.h_range[0] // 14,
+                    self.h_range[1] // 14,
+                )
 
                 # Update sampler parameters
                 self.sampler.update_parameters(
@@ -301,9 +312,14 @@ class MixedBatchSampler(BatchSampler):
                 ds.epoch = 0
             if hasattr(ds, "set_epoch"):
                 ds.set_epoch(0)
+            # AnySplat splits the sampled sequence into source/held-out halves.
+            # Old-only refinement needs at least two source views, hence at
+            # least four total sampled views during training.
+            max_context_views = ds.cfg.view_sampler.num_context_views
+            min_context_views = min(4, max_context_views)
             batch_sampler = DynamicBatchSampler(
                 sampler, 
-                [2, ds.cfg.view_sampler.num_context_views], 
+                [min_context_views, max_context_views],
                 ds.cfg.input_image_shape,
                 seed=42,
                 max_img_per_gpu=ds.cfg.view_sampler.max_img_per_gpu,

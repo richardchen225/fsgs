@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import gc
 import random
+import sys
 from typing import Literal, Optional, Protocol, runtime_checkable, Any
 import json
 import torch
@@ -388,9 +389,14 @@ class ModelWrapper(LightningModule):
             if param.requires_grad and param.grad is None
         ]
         if unused:
-            print(
+            details = (
                 f"[DDP unused parameters][rank={self.global_rank}]\n"
                 + "\n".join(unused)
+            )
+            print(details, file=sys.stderr, flush=True)
+            raise RuntimeError(
+                "Trainable parameters are disconnected from the training loss; "
+                "see the parameter list printed immediately above."
             )
 
     def on_before_optimizer_step(self, optimizer):

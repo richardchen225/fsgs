@@ -409,6 +409,11 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         features = refine_info["features"]
         b, s, _, h, w = features.shape
         if s <= 1:
+            if self.training:
+                raise RuntimeError(
+                    "Old-only GS refinement requires at least two source views. "
+                    "Increase the training sampler's minimum total view count to four."
+                )
             return encoder_output.gaussians
 
         device = features.device
