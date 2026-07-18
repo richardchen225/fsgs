@@ -468,27 +468,30 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             error = F.interpolate(error, size=(h, w), mode="bilinear", align_corners=False)
             return rearrange(error, "(b s) c h w -> b s c h w", b=b)
 
-        def build_old_only_evidence(
+        def build_causal_evidence(
             view_idx: int,
             means_state: torch.Tensor,
             quats_state: torch.Tensor,
             scales_state: torch.Tensor,
             opacities_state: torch.Tensor,
             sh_state: torch.Tensor,
+            include_current: bool,
         ):
-            # The historical map is a fixed pseudo-state. Gradients only train
-            # how the current frame consumes that state and updates its own GS.
+            # The first iteration observes history only. Later iterations render
+            # the updated causal prefix, including the current view, to close the
+            # refinement loop without exposing any future views.
+            prefix_end = view_idx + 1 if include_current else view_idx
             with torch.no_grad():
-                old_gaussians = self._build_gaussians_from_raw_state(
-                    base_sh_raw[:, :view_idx].detach(),
-                    means_state[:, :view_idx].detach(),
-                    quats_state[:, :view_idx].detach(),
-                    scales_state[:, :view_idx].detach(),
-                    opacities_state[:, :view_idx].detach(),
-                    sh_state[:, :view_idx].detach(),
+                prefix_gaussians = self._build_gaussians_from_raw_state(
+                    base_sh_raw[:, :prefix_end].detach(),
+                    means_state[:, :prefix_end].detach(),
+                    quats_state[:, :prefix_end].detach(),
+                    scales_state[:, :prefix_end].detach(),
+                    opacities_state[:, :prefix_end].detach(),
+                    sh_state[:, :prefix_end].detach(),
                 )
-                old_output = self.decoder.forward(
-                    old_gaussians,
+                prefix_output = self.decoder.forward(
+                    prefix_gaussians,
                     pred_all_extrinsic[:, view_idx : view_idx + 1].detach(),
                     render_intrinsics,
                     near_tensor,
@@ -496,12 +499,12 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     (low_h, low_w),
                     "depth",
                 )
-                render_color = old_output.color.detach()
+                render_color = prefix_output.color.detach()
                 render_depth = self._normalize_render_depth(
-                    old_output.depth.detach(), b, 1, low_h, low_w
+                    prefix_output.depth.detach(), b, 1, low_h, low_w
                 )
                 render_alpha = self._normalize_render_alpha(
-                    old_output.alpha.detach(), b, 1, low_h, low_w
+                    prefix_output.alpha.detach(), b, 1, low_h, low_w
                 )
 
             current_target_low = target_low[:, view_idx : view_idx + 1]
@@ -525,7 +528,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             indices = torch.tensor(view_indices, device=state.device, dtype=torch.long)
             return state.index_select(1, indices)
 
-        def refine_view_batch(
+        def refine_view_batch_once(
             view_indices: list[int],
             means_state: torch.Tensor,
             quats_state: torch.Tensor,
@@ -533,6 +536,8 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             opacities_state: torch.Tensor,
             sh_state: torch.Tensor,
             evidence: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+            refiner_hidden: Optional[torch.Tensor],
+            refine_iter: int,
         ):
             rgb_residual = torch.cat([item[0] for item in evidence], dim=1)
             depth_residual = torch.cat([item[1] for item in evidence], dim=1)
@@ -565,49 +570,47 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 device=device,
                 dtype=features.dtype,
             )
-            refiner_hidden = None
 
-            for refine_iter in range(max(0, int(cfg.gs_refine_iters))):
-                opacity_source = current_opacities.detach() if cfg.gs_refine_detach_evidence else current_opacities
-                scale_source = current_scales.detach() if cfg.gs_refine_detach_evidence else current_scales
-                opacity = act_gs.reg_dense_opacities(opacity_source)
-                opacity = rearrange(opacity, "b s (h w) c -> b s c h w", h=h, w=w)
-                scale_norm = act_gs.reg_dense_scales(scale_source).clamp_max(0.1).norm(dim=-1, keepdim=True)
-                scale_norm = rearrange(scale_norm, "b s (h w) c -> b s c h w", h=h, w=w)
+            opacity_source = current_opacities.detach() if cfg.gs_refine_detach_evidence else current_opacities
+            scale_source = current_scales.detach() if cfg.gs_refine_detach_evidence else current_scales
+            opacity = act_gs.reg_dense_opacities(opacity_source)
+            opacity = rearrange(opacity, "b s (h w) c -> b s c h w", h=h, w=w)
+            scale_norm = act_gs.reg_dense_scales(scale_source).clamp_max(0.1).norm(dim=-1, keepdim=True)
+            scale_norm = rearrange(scale_norm, "b s (h w) c -> b s c h w", h=h, w=w)
 
-                (
-                    delta_mean,
-                    delta_quat,
-                    delta_opacity,
-                    delta_scale,
-                    delta_sh,
-                    refiner_hidden,
-                ) = self.gs_residual_refiner(
-                    current_features.float(),
-                    rgb_residual.float(),
-                    depth_residual.float(),
-                    alpha.float(),
-                    current_depth_conf.float(),
-                    current_depth_uncertainty.float(),
-                    opacity.float(),
-                    scale_norm.float(),
-                    view_gate.float(),
-                    error_context,
-                    refiner_hidden,
-                    refine_iter,
-                )
+            (
+                delta_mean,
+                delta_quat,
+                delta_opacity,
+                delta_scale,
+                delta_sh,
+                refiner_hidden,
+            ) = self.gs_residual_refiner(
+                current_features.float(),
+                rgb_residual.float(),
+                depth_residual.float(),
+                alpha.float(),
+                current_depth_conf.float(),
+                current_depth_uncertainty.float(),
+                opacity.float(),
+                scale_norm.float(),
+                view_gate.float(),
+                error_context,
+                refiner_hidden,
+                refine_iter,
+            )
 
-                delta_mean = rearrange(delta_mean, "b s c h w -> b s (h w) c")
-                delta_quat = rearrange(delta_quat, "b s c h w -> b s (h w) c")
-                delta_opacity = rearrange(delta_opacity, "b s c h w -> b s (h w) c")
-                delta_scale = rearrange(delta_scale, "b s c h w -> b s (h w) c")
-                delta_sh = rearrange(delta_sh, "b s c h w -> b s (h w) c")
+            delta_mean = rearrange(delta_mean, "b s c h w -> b s (h w) c")
+            delta_quat = rearrange(delta_quat, "b s c h w -> b s (h w) c")
+            delta_opacity = rearrange(delta_opacity, "b s c h w -> b s (h w) c")
+            delta_scale = rearrange(delta_scale, "b s c h w -> b s (h w) c")
+            delta_sh = rearrange(delta_sh, "b s c h w -> b s (h w) c")
 
-                current_means = current_means + mean_step.to(current_means.dtype) * delta_mean.to(current_means.dtype)
-                current_quats = current_quats + delta_quat.to(current_quats.dtype)
-                current_opacities = current_opacities + cfg.gs_refine_step_opacity * delta_opacity.to(current_opacities.dtype)
-                current_scales = current_scales + cfg.gs_refine_step_scale * delta_scale.to(current_scales.dtype)
-                current_sh = current_sh + cfg.gs_refine_step_sh * delta_sh.to(current_sh.dtype)
+            current_means = current_means + mean_step.to(current_means.dtype) * delta_mean.to(current_means.dtype)
+            current_quats = current_quats + delta_quat.to(current_quats.dtype)
+            current_opacities = current_opacities + cfg.gs_refine_step_opacity * delta_opacity.to(current_opacities.dtype)
+            current_scales = current_scales + cfg.gs_refine_step_scale * delta_scale.to(current_scales.dtype)
+            current_sh = current_sh + cfg.gs_refine_step_sh * delta_sh.to(current_sh.dtype)
 
             return (
                 current_means,
@@ -615,6 +618,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 current_scales,
                 current_opacities,
                 current_sh,
+                refiner_hidden,
             )
 
         def replace_view(
@@ -627,60 +631,28 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 dim=1,
             )
 
+        num_refine_iters = max(0, int(cfg.gs_refine_iters))
+        if num_refine_iters == 0:
+            return encoder_output.gaussians
+
         if self.training:
-            # Every causal transition is trained each step. Prefix renders are
-            # independent no-grad observations; the recurrent refiner updates
-            # all current views together in one batched call.
+            # Full-t synchronous causal refinement. Each round renders the
+            # states produced by the previous round, while every view is
+            # restricted to its own prefix and all updates remain batched.
             refine_view_indices = list(range(1, s))
-            evidence = [
-                build_old_only_evidence(
-                    view_idx,
-                    means_raw,
-                    quats_raw,
-                    scales_raw,
-                    opacities_raw,
-                    res_sh_raw,
-                )
-                for view_idx in refine_view_indices
-            ]
-            (
-                current_means,
-                current_quats,
-                current_scales,
-                current_opacities,
-                current_sh,
-            ) = refine_view_batch(
-                refine_view_indices,
-                means_raw,
-                quats_raw,
-                scales_raw,
-                opacities_raw,
-                res_sh_raw,
-                evidence,
-            )
-            # The first view initializes the map; every later source view uses
-            # its refined state, so no future-base fallback branch is needed.
-            refined_gaussians = self._build_gaussians_from_raw_state(
-                base_sh_raw,
-                torch.cat([means_raw[:, :1], current_means], dim=1),
-                torch.cat([quats_raw[:, :1], current_quats], dim=1),
-                torch.cat([scales_raw[:, :1], current_scales], dim=1),
-                torch.cat([opacities_raw[:, :1], current_opacities], dim=1),
-                torch.cat([res_sh_raw[:, :1], current_sh], dim=1),
-            )
-        else:
-            # Validation/test simulate streaming: each refined current frame is
-            # appended to the map and becomes history for the next frame.
-            for refine_view_idx in range(1, s):
+            refiner_hidden = None
+            for refine_iter in range(num_refine_iters):
                 evidence = [
-                    build_old_only_evidence(
-                        refine_view_idx,
+                    build_causal_evidence(
+                        view_idx,
                         means_raw,
                         quats_raw,
                         scales_raw,
                         opacities_raw,
                         res_sh_raw,
+                        include_current=refine_iter > 0,
                     )
+                    for view_idx in refine_view_indices
                 ]
                 (
                     current_means,
@@ -688,23 +660,79 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     current_scales,
                     current_opacities,
                     current_sh,
-                ) = refine_view_batch(
-                    [refine_view_idx],
+                    refiner_hidden,
+                ) = refine_view_batch_once(
+                    refine_view_indices,
                     means_raw,
                     quats_raw,
                     scales_raw,
                     opacities_raw,
                     res_sh_raw,
                     evidence,
+                    refiner_hidden,
+                    refine_iter,
                 )
 
-                means_raw = replace_view(means_raw, refine_view_idx, current_means)
-                quats_raw = replace_view(quats_raw, refine_view_idx, current_quats)
-                scales_raw = replace_view(scales_raw, refine_view_idx, current_scales)
-                opacities_raw = replace_view(
-                    opacities_raw, refine_view_idx, current_opacities
+                means_raw = torch.cat([means_raw[:, :1], current_means], dim=1)
+                quats_raw = torch.cat([quats_raw[:, :1], current_quats], dim=1)
+                scales_raw = torch.cat([scales_raw[:, :1], current_scales], dim=1)
+                opacities_raw = torch.cat(
+                    [opacities_raw[:, :1], current_opacities], dim=1
                 )
-                res_sh_raw = replace_view(res_sh_raw, refine_view_idx, current_sh)
+                res_sh_raw = torch.cat([res_sh_raw[:, :1], current_sh], dim=1)
+
+            refined_gaussians = self._build_gaussians_from_refine_state(
+                refine_info,
+                means_raw,
+                quats_raw,
+                scales_raw,
+                opacities_raw,
+                res_sh_raw,
+            )
+        else:
+            # Validation/test perform a streaming rollout. Previous views are
+            # fully refined and frozen before the newly arrived view runs its
+            # own closed-loop iterations.
+            for refine_view_idx in range(1, s):
+                refiner_hidden = None
+                for refine_iter in range(num_refine_iters):
+                    evidence = [
+                        build_causal_evidence(
+                            refine_view_idx,
+                            means_raw,
+                            quats_raw,
+                            scales_raw,
+                            opacities_raw,
+                            res_sh_raw,
+                            include_current=refine_iter > 0,
+                        )
+                    ]
+                    (
+                        current_means,
+                        current_quats,
+                        current_scales,
+                        current_opacities,
+                        current_sh,
+                        refiner_hidden,
+                    ) = refine_view_batch_once(
+                        [refine_view_idx],
+                        means_raw,
+                        quats_raw,
+                        scales_raw,
+                        opacities_raw,
+                        res_sh_raw,
+                        evidence,
+                        refiner_hidden,
+                        refine_iter,
+                    )
+
+                    means_raw = replace_view(means_raw, refine_view_idx, current_means)
+                    quats_raw = replace_view(quats_raw, refine_view_idx, current_quats)
+                    scales_raw = replace_view(scales_raw, refine_view_idx, current_scales)
+                    opacities_raw = replace_view(
+                        opacities_raw, refine_view_idx, current_opacities
+                    )
+                    res_sh_raw = replace_view(res_sh_raw, refine_view_idx, current_sh)
 
             refined_gaussians = self._build_gaussians_from_refine_state(
                 refine_info,
