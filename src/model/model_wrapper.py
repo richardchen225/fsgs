@@ -259,6 +259,14 @@ class ModelWrapper(LightningModule):
                 "train/gs_refine_history_views",
                 encoder_output.infos["gs_refine_history_views"].float(),
             )
+        if (
+            encoder_output.infos is not None
+            and "gs_refine_reprojection_gate" in encoder_output.infos
+        ):
+            self.log(
+                "train/gs_refine_reprojection_gate",
+                encoder_output.infos["gs_refine_reprojection_gate"].float(),
+            )
         
         target_gt = (batch["context"]["image"] + 1) / 2
         num_context_views = target_gt.shape[1]

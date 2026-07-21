@@ -109,7 +109,14 @@ class GaussianResidualRefiner(nn.Module):
             nn.GroupNorm(norm_groups, hidden_dim),
             nn.SiLU(inplace=True),
         )
+        self.reprojection_encoder = nn.Sequential(
+            nn.Conv2d(16, hidden_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(norm_groups, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+        )
         self.context_gate = nn.Parameter(torch.tensor(-4.0))
+        self.reprojection_gate = nn.Parameter(torch.tensor(0.0))
         self.iter_embed = nn.Parameter(torch.zeros(self.num_iters, hidden_dim, 1, 1))
         self.update_block = ConvGRUCell(hidden_dim, hidden_dim)
 
@@ -131,6 +138,8 @@ class GaussianResidualRefiner(nn.Module):
         for head in (self.geometry_head, self.density_head, self.appearance_head):
             nn.init.zeros_(head[-1].weight)
             nn.init.zeros_(head[-1].bias)
+        nn.init.zeros_(self.reprojection_encoder[-1].weight)
+        nn.init.zeros_(self.reprojection_encoder[-1].bias)
 
     def encode_feature_error(
         self,
@@ -155,6 +164,7 @@ class GaussianResidualRefiner(nn.Module):
         scale_norm: torch.Tensor,
         view_gate: torch.Tensor,
         causal_error_context: Optional[torch.Tensor] = None,
+        reprojection_evidence: Optional[torch.Tensor] = None,
         hidden_state: Optional[torch.Tensor] = None,
         iter_idx: int = 0,
     ) -> tuple[
@@ -188,6 +198,22 @@ class GaussianResidualRefiner(nn.Module):
             )
             context_evidence = self.error_context_encoder(causal_error_context)
             evidence = evidence + torch.sigmoid(self.context_gate).to(evidence.dtype) * context_evidence
+        if reprojection_evidence is not None:
+            reprojection_evidence = rearrange(
+                reprojection_evidence.to(evidence.dtype),
+                "b s c h w -> (b s) c h w",
+            )
+            reprojection_feature = self.reprojection_encoder(reprojection_evidence)
+            reprojection_feature = F.interpolate(
+                reprojection_feature,
+                size=evidence.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            evidence = evidence + (
+                torch.sigmoid(self.reprojection_gate).to(evidence.dtype)
+                * reprojection_feature
+            )
         iter_embed = self.iter_embed[min(max(int(iter_idx), 0), self.num_iters - 1)]
         evidence = evidence + iter_embed
         hidden_state = self.update_block(evidence, hidden_state)
@@ -463,10 +489,252 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         near_tensor = torch.full((b, 1), near, device=device)
         far_tensor = torch.full((b, 1), far, device=device)
 
+        with torch.no_grad():
+            reprojection_features_low = rearrange(
+                features.detach().float(), "b s c h w -> (b s) c h w"
+            )
+            reprojection_features_low = F.interpolate(
+                reprojection_features_low,
+                size=(low_h, low_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+            reprojection_features_low = F.normalize(
+                reprojection_features_low, dim=1, eps=1e-6
+            )
+            reprojection_features_low = rearrange(
+                reprojection_features_low,
+                "(b s) c h w -> b s c h w",
+                b=b,
+                s=s,
+            )
+            source_w2c = torch.linalg.inv(
+                pred_all_extrinsic[:, :s].detach().float()
+            )
+            source_intrinsics = pred_context_pose["intrinsic"].detach().float()
+            if source_intrinsics.shape[1] == 1 and s > 1:
+                source_intrinsics = source_intrinsics.expand(-1, s, -1, -1)
+            source_intrinsics = source_intrinsics[:, :s]
+            history_rgb_depth_low = torch.cat(
+                [target_low.detach().float(), depth_low.detach().float()], dim=2
+            )
+
+            reprojection_offsets = torch.tensor(
+                [
+                    [-1, -1],
+                    [0, -1],
+                    [1, -1],
+                    [-1, 0],
+                    [0, 0],
+                    [1, 0],
+                    [-1, 1],
+                    [0, 1],
+                    [1, 1],
+                ],
+                device=device,
+                dtype=torch.float32,
+            )
+            reprojection_offsets[:, 0] *= 2.0 / float(low_w)
+            reprojection_offsets[:, 1] *= 2.0 / float(low_h)
+
         def upsample_error(error: torch.Tensor) -> torch.Tensor:
             error = rearrange(error, "b s c h w -> (b s) c h w")
             error = F.interpolate(error, size=(h, w), mode="bilinear", align_corners=False)
             return rearrange(error, "(b s) c h w -> b s c h w", b=b)
+
+        def build_history_reprojection_evidence(
+            view_idx: int,
+            means_state: torch.Tensor,
+        ) -> torch.Tensor:
+            if view_idx <= 0:
+                return torch.zeros(
+                    (b, 1, 16, low_h, low_w),
+                    device=device,
+                    dtype=torch.float32,
+                )
+
+            with torch.no_grad():
+                current_means = rearrange(
+                    means_state[:, view_idx].detach().float(),
+                    "b (h w) c -> b c h w",
+                    h=h,
+                    w=w,
+                )
+                current_means = F.interpolate(
+                    current_means,
+                    size=(low_h, low_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                current_means = rearrange(
+                    current_means, "b c h w -> b h w c"
+                )
+                current_means_h = torch.cat(
+                    [
+                        current_means,
+                        torch.ones_like(current_means[..., :1]),
+                    ],
+                    dim=-1,
+                )
+
+                current_feature = reprojection_features_low[:, view_idx]
+                current_rgb = target_low[:, view_idx].detach().float()
+                pair_evidence = []
+                pair_scores = []
+                pair_masks = []
+                pair_max_correlations = []
+                pair_confidences = []
+
+                for history_idx in range(view_idx):
+                    points_history = torch.einsum(
+                        "bij,bhwj->bhwi",
+                        source_w2c[:, history_idx],
+                        current_means_h,
+                    )
+                    z_history = points_history[..., 2]
+                    z_safe = z_history.clamp_min(1e-4)
+
+                    intrinsic = source_intrinsics[:, history_idx]
+                    fx = intrinsic[:, 0, 0].view(b, 1, 1) * float(low_w)
+                    fy = intrinsic[:, 1, 1].view(b, 1, 1) * float(low_h)
+                    cx = intrinsic[:, 0, 2].view(b, 1, 1) * float(low_w)
+                    cy = intrinsic[:, 1, 2].view(b, 1, 1) * float(low_h)
+                    u_pixel = fx * points_history[..., 0] / z_safe + cx
+                    v_pixel = fy * points_history[..., 1] / z_safe + cy
+                    grid = torch.stack(
+                        [
+                            2.0 * (u_pixel + 0.5) / float(low_w) - 1.0,
+                            2.0 * (v_pixel + 0.5) / float(low_h) - 1.0,
+                        ],
+                        dim=-1,
+                    )
+
+                    projection_valid = (
+                        (z_history > 1e-4)
+                        & (u_pixel >= 0.0)
+                        & (u_pixel <= float(low_w - 1))
+                        & (v_pixel >= 0.0)
+                        & (v_pixel <= float(low_h - 1))
+                    ).unsqueeze(1)
+
+                    sampled_rgb_depth = F.grid_sample(
+                        history_rgb_depth_low[:, history_idx],
+                        grid,
+                        mode="bilinear",
+                        padding_mode="zeros",
+                        align_corners=False,
+                    )
+                    sampled_rgb = sampled_rgb_depth[:, :3]
+                    sampled_depth = sampled_rgb_depth[:, 3:4]
+
+                    offset_grid = grid.unsqueeze(3) + reprojection_offsets.view(
+                        1, 1, 1, 9, 2
+                    )
+                    offset_grid = offset_grid.reshape(
+                        b, low_h, low_w * 9, 2
+                    )
+                    sampled_feature = F.grid_sample(
+                        reprojection_features_low[:, history_idx],
+                        offset_grid,
+                        mode="bilinear",
+                        padding_mode="zeros",
+                        align_corners=False,
+                    )
+                    sampled_feature = sampled_feature.reshape(
+                        b,
+                        sampled_feature.shape[1],
+                        low_h,
+                        low_w,
+                        9,
+                    )
+                    sampled_feature = F.normalize(
+                        sampled_feature, dim=1, eps=1e-6
+                    )
+                    correlation = (
+                        current_feature.unsqueeze(-1) * sampled_feature
+                    ).sum(dim=1)
+                    correlation = rearrange(
+                        correlation, "b h w n -> b n h w"
+                    ).clamp(-1.0, 1.0)
+
+                    relative_depth = (
+                        z_history.unsqueeze(1) - sampled_depth
+                    ) / sampled_depth.clamp_min(1e-4)
+                    relative_depth = relative_depth.clamp(-1.0, 1.0)
+                    max_correlation = correlation.max(dim=1, keepdim=True).values
+                    depth_consistency = torch.exp(
+                        -relative_depth.abs() / 0.15
+                    )
+                    feature_consistency = (
+                        (max_correlation + 1.0) * 0.5
+                    ).clamp(1e-3, 1.0)
+                    visibility = (
+                        projection_valid
+                        & (sampled_depth > 1e-4)
+                        & (
+                            z_history.unsqueeze(1)
+                            <= sampled_depth * 1.10
+                        )
+                    )
+                    confidence = depth_consistency * feature_consistency
+                    score = torch.log(confidence.clamp_min(1e-6))
+
+                    pair_evidence.append(
+                        torch.cat(
+                            [
+                                current_rgb - sampled_rgb,
+                                relative_depth,
+                                correlation,
+                            ],
+                            dim=1,
+                        )
+                    )
+                    pair_scores.append(score)
+                    pair_masks.append(visibility)
+                    pair_max_correlations.append(max_correlation)
+                    pair_confidences.append(confidence)
+
+                pair_evidence = torch.stack(pair_evidence, dim=1)
+                pair_scores = torch.stack(pair_scores, dim=1)
+                pair_masks = torch.stack(pair_masks, dim=1)
+                pair_max_correlations = torch.stack(
+                    pair_max_correlations, dim=1
+                )
+                pair_confidences = torch.stack(pair_confidences, dim=1)
+
+                masked_scores = pair_scores.masked_fill(~pair_masks, -1e4)
+                score_max = masked_scores.max(dim=1, keepdim=True).values
+                raw_weights = (
+                    torch.exp((pair_scores - score_max).clamp(-30.0, 30.0))
+                    * pair_masks.to(pair_scores.dtype)
+                )
+                weights = raw_weights / raw_weights.sum(
+                    dim=1, keepdim=True
+                ).clamp_min(1e-6)
+                aggregated = (weights * pair_evidence).sum(dim=1)
+
+                any_visible = pair_masks.any(dim=1)
+                max_correlation = pair_max_correlations.masked_fill(
+                    ~pair_masks, -1.0
+                ).max(dim=1).values
+                max_correlation = torch.where(
+                    any_visible, max_correlation, torch.zeros_like(max_correlation)
+                )
+                visible_support = pair_masks.float().mean(dim=1)
+                aggregated_confidence = (
+                    weights * pair_confidences
+                ).sum(dim=1)
+
+                evidence = torch.cat(
+                    [
+                        aggregated,
+                        max_correlation,
+                        visible_support,
+                        aggregated_confidence,
+                    ],
+                    dim=1,
+                )
+                return evidence.unsqueeze(1)
 
         def build_causal_evidence(
             view_idx: int,
@@ -522,7 +790,17 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 current_target_low,
             )
             feature_error = upsample_error(feature_error)
-            return rgb_residual, depth_residual, alpha, feature_error
+            reprojection_evidence = build_history_reprojection_evidence(
+                view_idx,
+                means_state,
+            )
+            return (
+                rgb_residual,
+                depth_residual,
+                alpha,
+                feature_error,
+                reprojection_evidence,
+            )
 
         def select_views(state: torch.Tensor, view_indices: list[int]) -> torch.Tensor:
             indices = torch.tensor(view_indices, device=state.device, dtype=torch.long)
@@ -535,7 +813,15 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             scales_state: torch.Tensor,
             opacities_state: torch.Tensor,
             sh_state: torch.Tensor,
-            evidence: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+            evidence: list[
+                tuple[
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                ]
+            ],
             refiner_hidden: Optional[torch.Tensor],
             refine_iter: int,
         ):
@@ -543,6 +829,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             depth_residual = torch.cat([item[1] for item in evidence], dim=1)
             alpha = torch.cat([item[2] for item in evidence], dim=1)
             feature_error = torch.cat([item[3] for item in evidence], dim=1)
+            reprojection_evidence = torch.cat(
+                [item[4] for item in evidence], dim=1
+            )
             error_context = torch.cat(
                 [
                     rgb_residual.detach().float(),
@@ -595,9 +884,10 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 opacity.float(),
                 scale_norm.float(),
                 view_gate.float(),
-                error_context,
-                refiner_hidden,
-                refine_iter,
+                causal_error_context=error_context,
+                reprojection_evidence=reprojection_evidence,
+                hidden_state=refiner_hidden,
+                iter_idx=refine_iter,
             )
 
             delta_mean = rearrange(delta_mean, "b s c h w -> b s (h w) c")
@@ -750,6 +1040,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             )
             encoder_output.infos["gs_refine_history_views"] = torch.tensor(
                 s - 1, device=device
+            )
+            encoder_output.infos["gs_refine_reprojection_gate"] = torch.sigmoid(
+                self.gs_residual_refiner.reprojection_gate.detach()
             )
         return refined_gaussians
 
