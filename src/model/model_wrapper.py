@@ -267,6 +267,27 @@ class ModelWrapper(LightningModule):
                 "train/gs_refine_reprojection_gate",
                 encoder_output.infos["gs_refine_reprojection_gate"].float(),
             )
+        if encoder_output.infos is not None and "gir_add_gate" in encoder_output.infos:
+            self.log(
+                "train/gir_add_gate",
+                encoder_output.infos["gir_add_gate"].float(),
+            )
+            self.log(
+                "train/gir_historical_gate",
+                encoder_output.infos["gir_historical_gate"].float(),
+            )
+            self.log(
+                "train/gir_map_gaussians",
+                encoder_output.infos["gir_map_gaussians"].float(),
+            )
+            self.log(
+                "train/gir_visible_ratio",
+                encoder_output.infos["gir_visible_ratio"].float(),
+            )
+            self.log(
+                "train/gir_residual_magnitude",
+                encoder_output.infos["gir_residual_magnitude"].float(),
+            )
         
         target_gt = (batch["context"]["image"] + 1) / 2
         num_context_views = target_gt.shape[1]
@@ -282,6 +303,22 @@ class ModelWrapper(LightningModule):
         self.log("train/psnr_probabilistic", psnr_probabilistic.mean().item())
 
         total_loss = 0
+
+        if encoder_output.infos is not None and "gir_aux_loss" in encoder_output.infos:
+            gir_aux_loss = encoder_output.infos["gir_aux_loss"]
+            gir_aux_weight = float(self.model.encoder.cfg.gir_aux_loss_weight)
+            self.log("loss/gir_aux", gir_aux_loss.item())
+            total_loss = total_loss + gir_aux_weight * gir_aux_loss
+        if (
+            encoder_output.infos is not None
+            and "gir_regularization_loss" in encoder_output.infos
+        ):
+            gir_regularization = encoder_output.infos["gir_regularization_loss"]
+            regularization_weight = float(
+                self.model.encoder.cfg.gir_regularization_weight
+            )
+            self.log("loss/gir_regularization", gir_regularization.item())
+            total_loss = total_loss + regularization_weight * gir_regularization
 
         with torch.amp.autocast("cuda", enabled=False):
             depth_loss_idx = list(get_cfg()["loss"].keys()).index("depth")
@@ -560,6 +597,18 @@ class ModelWrapper(LightningModule):
                     if final_history != ctx_img_num - 1:
                         raise RuntimeError(
                             "GS refiner test rollout did not consume all causal context views: "
+                            f"history={final_history}, expected={ctx_img_num - 1}."
+                        )
+                if (
+                    encoder_output.infos is not None
+                    and "gir_history_views" in encoder_output.infos
+                ):
+                    final_history = int(
+                        encoder_output.infos["gir_history_views"].item()
+                    )
+                    if final_history != ctx_img_num - 1:
+                        raise RuntimeError(
+                            "GIR test rollout did not consume all causal context views: "
                             f"history={final_history}, expected={ctx_img_num - 1}."
                         )
         # if self.global_rank == 0:
@@ -925,6 +974,7 @@ class ModelWrapper(LightningModule):
         scratch_keys = (
             "model.encoder.depth_refiner",
             "model.gs_residual_refiner",
+            "model.gir_update_head",
         )
 
         for name, param in self.named_parameters():

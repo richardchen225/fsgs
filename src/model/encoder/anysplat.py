@@ -112,6 +112,13 @@ class EncoderAnySplatCfg:
     gs_refine_detach_evidence: bool = True
     gs_refine_max_render_views: Optional[int] = None
     gs_refine_geometry_neighbors: int = 2
+    gir_enabled: bool = False
+    gir_render_scale: float = 0.25
+    gir_hidden_dim: int = 64
+    gir_tbptt_chunk: int = 2
+    gir_replay_views: int = 1
+    gir_aux_loss_weight: float = 0.25
+    gir_regularization_weight: float = 1e-4
 
 class CameraDec(nn.Module):
     def __init__(self, dim_in=2048):
@@ -958,7 +965,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         gaussians = Gaussians(**gaussians)
 
         infos = {}
-        if self.cfg.gs_refine_enabled:
+        if self.cfg.gs_refine_enabled or self.cfg.gir_enabled:
             infos["gs_refine"] = {
                 "features": out,
                 "means": means_raw,

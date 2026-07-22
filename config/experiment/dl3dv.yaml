@@ -18,6 +18,15 @@ model:
     gs_refine_detach_evidence: false
     gs_refine_render_scale: 0.25
     depth_refine_downsample_factor: 4
+    depth_refine_enabled: false
+    gs_refine_enabled: false
+    gir_enabled: true
+    gir_render_scale: 0.5
+    gir_hidden_dim: 64
+    gir_tbptt_chunk: 4
+    gir_replay_views: 1
+    gir_aux_loss_weight: 0.25
+    gir_regularization_weight: 1e-4
     
 dataset:
   dl3dv:

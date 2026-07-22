@@ -12,6 +12,12 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 
 from src.model.types import Gaussians
+from src.model.streaming_gir import (
+    DominantGIR,
+    DominantGIRRenderer,
+    GIRUpdateHead,
+    StreamingGaussianState,
+)
 from src.model.encoder import act_gs, sh_utils
 from src.model.encoder.common.gaussian_adapter import GaussianAdapterCfg
 from src.model.decoder.decoder_splatting_cuda import (
@@ -332,6 +338,20 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     def build_gs_refiner(self):
         cfg = self.encoder.cfg
         self.gs_residual_refiner = None
+        self.gir_renderer = None
+        self.gir_update_head = None
+        if getattr(cfg, "gir_enabled", False):
+            if getattr(cfg, "gs_refine_enabled", False):
+                raise ValueError(
+                    "gir_enabled and gs_refine_enabled are mutually exclusive."
+                )
+            self.gir_renderer = DominantGIRRenderer()
+            self.gir_update_head = GIRUpdateHead(
+                feature_dim=self.encoder.feature_dim // 2,
+                harmonic_dim=self.encoder.nums_sh * 3,
+                hidden_dim=cfg.gir_hidden_dim,
+            )
+            return
         if not getattr(cfg, "gs_refine_enabled", False):
             return
 
@@ -415,6 +435,235 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             alpha = alpha.reshape(b, views, h, w)
         return alpha.unsqueeze(2)
 
+    @staticmethod
+    def _slice_gaussian_view(
+        gaussians: Gaussians,
+        view_idx: int,
+        gaussians_per_view: int,
+    ) -> Gaussians:
+        start = view_idx * gaussians_per_view
+        end = start + gaussians_per_view
+        return Gaussians(
+            means=gaussians.means[:, start:end],
+            harmonics=gaussians.harmonics[:, start:end],
+            opacities=gaussians.opacities[:, start:end],
+            scales=gaussians.scales[:, start:end],
+            rotations=gaussians.rotations[:, start:end],
+        )
+
+    def _update_streaming_gaussians(
+        self,
+        encoder_output,
+        context_image: torch.Tensor,
+        pred_all_extrinsic: torch.Tensor,
+        pred_context_pose: dict,
+        ctx_img_num: int,
+        near: float,
+        far: float,
+    ) -> Gaussians:
+        refine_info = None if encoder_output.infos is None else encoder_output.infos.get("gs_refine")
+        if refine_info is None:
+            raise RuntimeError("GIR is enabled, but the encoder did not return per-view GS data.")
+
+        cfg = self.encoder.cfg
+        features = refine_info["features"]
+        b, source_views, _, h, w = features.shape
+        if source_views != ctx_img_num:
+            raise RuntimeError(
+                "GIR source-view mismatch: "
+                f"encoder returned {source_views}, expected {ctx_img_num}."
+            )
+
+        render_scale = float(max(0.05, min(1.0, cfg.gir_render_scale)))
+        low_h = max(8, int(round(h * render_scale)))
+        low_w = max(8, int(round(w * render_scale)))
+        gaussians_per_view = h * w
+        intrinsics = pred_context_pose["intrinsic"]
+        if intrinsics.shape[1] == 1 and source_views > 1:
+            intrinsics = intrinsics.expand(-1, source_views, -1, -1)
+
+        depth = refine_info["depth"]
+        depth_confidence = refine_info["depth_conf"]
+        state: Optional[StreamingGaussianState] = None
+        auxiliary_losses = []
+        regularization_losses = []
+        add_gates = []
+        historical_gates = []
+        visible_ratios = []
+        residual_magnitudes = []
+
+        for view_idx in range(source_views):
+            current_feature = features[:, view_idx]
+            current_rgb = context_image[:, view_idx]
+            current_depth = depth[:, view_idx].permute(0, 3, 1, 2)
+            current_depth_confidence = depth_confidence[:, view_idx].permute(0, 3, 1, 2)
+            current_gaussians = self._slice_gaussian_view(
+                encoder_output.gaussians,
+                view_idx,
+                gaussians_per_view,
+            )
+
+            if state is None:
+                gir = DominantGIR.empty(
+                    b,
+                    low_h,
+                    low_w,
+                    features.device,
+                    features.dtype,
+                )
+            else:
+                gir = self.gir_renderer(
+                    state,
+                    pred_all_extrinsic[:, view_idx],
+                    intrinsics[:, view_idx],
+                    (low_h, low_w),
+                )
+
+            prediction = self.gir_update_head(
+                current_feature,
+                current_rgb,
+                current_depth,
+                current_depth_confidence,
+                gir,
+            )
+            prediction.historical_gate = prediction.historical_gate - 4.0
+
+            if state is not None:
+                state = state.update_historical(
+                    gir,
+                    prediction,
+                    pred_all_extrinsic[:, view_idx],
+                )
+
+            coverage = gir.valid.to(prediction.add_logit.dtype)
+            visible_ratios.append(coverage.mean())
+            if state is None:
+                # Keep frame zero identical to the base GS prediction.
+                add_gate_low = torch.ones_like(prediction.add_logit) + (
+                    0.0 * prediction.add_logit
+                )
+            else:
+                add_prior = torch.where(
+                    gir.valid,
+                    prediction.add_logit.new_full((), -2.0),
+                    prediction.add_logit.new_full((), 6.0),
+                )
+                add_gate_low = torch.sigmoid(prediction.add_logit + add_prior)
+            add_gate = F.interpolate(
+                add_gate_low,
+                size=(h, w),
+                mode="bilinear",
+                align_corners=False,
+            )
+            add_gates.append(add_gate_low.mean())
+            historical_gates.append(
+                (prediction.historical_gate.sigmoid() * coverage).sum()
+                / coverage.sum().clamp_min(1.0)
+            )
+            valid_normalizer = coverage.sum().clamp_min(1.0)
+            residual_energy = (
+                prediction.delta_mean_camera.square().sum(dim=1, keepdim=True)
+                + prediction.delta_rotation.square().sum(dim=1, keepdim=True)
+                + prediction.delta_log_scale.square().sum(dim=1, keepdim=True)
+                + prediction.delta_opacity_logit.square()
+                + prediction.delta_harmonics.square().mean(dim=1, keepdim=True)
+            )
+            residual_magnitudes.append(residual_energy.mean().sqrt())
+            covered_add = add_gate_low.square() * coverage
+            uncovered_missing = (1.0 - add_gate_low).square() * (1.0 - coverage)
+            regularization_losses.append(
+                (residual_energy * coverage).sum() / valid_normalizer
+                + covered_add.sum() / valid_normalizer
+                + uncovered_missing.mean()
+            )
+
+            if state is None:
+                state = StreamingGaussianState.from_current(
+                    current_gaussians,
+                    add_gate,
+                )
+            else:
+                state = state.append(current_gaussians, add_gate)
+
+            if self.training and cfg.gir_aux_loss_weight > 0:
+                replay_count = max(0, int(cfg.gir_replay_views))
+                replay_indices = list(
+                    range(max(0, view_idx - replay_count), view_idx)
+                )
+                render_indices = replay_indices + [view_idx]
+                render_views = len(render_indices)
+                render_output = self.decoder.forward(
+                    state.gaussians,
+                    pred_all_extrinsic[:, render_indices],
+                    intrinsics[:, render_indices],
+                    torch.full(
+                        (b, render_views), near, device=features.device
+                    ),
+                    torch.full(
+                        (b, render_views), far, device=features.device
+                    ),
+                    (low_h, low_w),
+                    "depth",
+                )
+                target = context_image[:, render_indices]
+                target = rearrange(target, "b v c h w -> (b v) c h w")
+                target = F.interpolate(
+                    target.float(),
+                    size=(low_h, low_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                target = rearrange(
+                    target,
+                    "(b v) c h w -> b v c h w",
+                    b=b,
+                    v=render_views,
+                ).to(render_output.color.dtype)
+                difference = render_output.color - target
+                auxiliary_losses.append(
+                    torch.sqrt(difference.square() + 1e-6).mean()
+                )
+
+            chunk_size = max(0, int(cfg.gir_tbptt_chunk))
+            if (
+                self.training
+                and chunk_size > 0
+                and (view_idx + 1) % chunk_size == 0
+                and view_idx + 1 < source_views
+            ):
+                state = state.detach()
+
+        if state is None:
+            return encoder_output.gaussians
+
+        if encoder_output.infos is not None:
+            encoder_output.infos.pop("gs_refine", None)
+            encoder_output.infos["gir_history_views"] = torch.tensor(
+                max(source_views - 1, 0), device=features.device
+            )
+            encoder_output.infos["gir_map_gaussians"] = torch.tensor(
+                state.num_gaussians, device=features.device
+            )
+            encoder_output.infos["gir_add_gate"] = torch.stack(add_gates).mean()
+            encoder_output.infos["gir_historical_gate"] = torch.stack(
+                historical_gates
+            ).mean()
+            encoder_output.infos["gir_visible_ratio"] = torch.stack(
+                visible_ratios
+            ).mean()
+            encoder_output.infos["gir_residual_magnitude"] = torch.stack(
+                residual_magnitudes
+            ).mean()
+            if auxiliary_losses:
+                encoder_output.infos["gir_aux_loss"] = torch.stack(
+                    auxiliary_losses
+                ).mean()
+            encoder_output.infos["gir_regularization_loss"] = torch.stack(
+                regularization_losses
+            ).mean()
+
+        return state.gaussians
+
     def _refine_gaussians(
         self,
         encoder_output,
@@ -425,6 +674,16 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         near: float,
         far: float,
     ) -> Gaussians:
+        if self.gir_update_head is not None:
+            return self._update_streaming_gaussians(
+                encoder_output,
+                context_image,
+                pred_all_extrinsic,
+                pred_context_pose,
+                ctx_img_num,
+                near,
+                far,
+            )
         if self.gs_residual_refiner is None:
             return encoder_output.gaussians
         refine_info = None if encoder_output.infos is None else encoder_output.infos.get("gs_refine")

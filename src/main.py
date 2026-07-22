@@ -167,7 +167,16 @@ def train(cfg_dict: DictConfig):
             ckpt = torch.load(test_checkpoint, map_location='cpu')
         ckpt = ckpt.get("state_dict", ckpt)
         ckpt = {key.replace('model.', ''): value for key, value in ckpt.items()}
-        ckpt = {key: value for key, value in ckpt.items() if 'gaussian_param_head' in key or 'gs_head' in key or 'cam_dec' in key or 'depth_refiner' in key or 'gs_residual_refiner' in key}
+        ckpt = {
+            key: value
+            for key, value in ckpt.items()
+            if "gaussian_param_head" in key
+            or "gs_head" in key
+            or "cam_dec" in key
+            or "depth_refiner" in key
+            or "gs_residual_refiner" in key
+            or "gir_update_head" in key
+        }
 
         model_state = model.state_dict()
         compatible_ckpt = {}
@@ -223,6 +232,18 @@ def train(cfg_dict: DictConfig):
 
         if skipped_keys:
             print(f"Skipped {len(skipped_keys)} incompatible checkpoint keys.")
+        if getattr(cfg.model.encoder, "gir_enabled", False):
+            required_gir_keys = {
+                key for key in model_state if key.startswith("gir_update_head.")
+            }
+            missing_gir_keys = sorted(required_gir_keys - compatible_ckpt.keys())
+            if missing_gir_keys:
+                preview = ", ".join(missing_gir_keys[:4])
+                raise RuntimeError(
+                    "GIR is enabled, but the test checkpoint does not contain a "
+                    "complete trained GIR update head. Missing keys include: "
+                    f"{preview}"
+                )
         model.load_state_dict(compatible_ckpt, strict=False)
     
     model_wrapper = ModelWrapper(
