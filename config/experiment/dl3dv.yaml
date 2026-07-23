@@ -57,7 +57,7 @@ optimizer:
 
 data_loader:
   train:
-    batch_size: 1
+    batch_size: 2
   val:
     batch_size: 1
     
@@ -66,7 +66,7 @@ trainer:
   val_check_interval: 100
   num_nodes: 1
   devices: 4
-  accumulate_grad_batches: 2
+  accumulate_grad_batches: 1
   precision: 16-mixed
 
 checkpointing:
