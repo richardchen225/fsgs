@@ -232,18 +232,25 @@ def train(cfg_dict: DictConfig):
 
         if skipped_keys:
             print(f"Skipped {len(skipped_keys)} incompatible checkpoint keys.")
+        required_prefixes = [
+            "encoder.gaussian_param_head.",
+            "encoder.gs_head.",
+        ]
         if getattr(cfg.model.encoder, "gir_enabled", False):
-            required_gir_keys = {
-                key for key in model_state if key.startswith("gir_update_head.")
-            }
-            missing_gir_keys = sorted(required_gir_keys - compatible_ckpt.keys())
-            if missing_gir_keys:
-                preview = ", ".join(missing_gir_keys[:4])
-                raise RuntimeError(
-                    "GIR is enabled, but the test checkpoint does not contain a "
-                    "complete trained GIR update head. Missing keys include: "
-                    f"{preview}"
-                )
+            required_prefixes.append("gir_update_head.")
+        required_keys = {
+            key
+            for key in model_state
+            if any(key.startswith(prefix) for prefix in required_prefixes)
+        }
+        missing_keys = sorted(required_keys - compatible_ckpt.keys())
+        if missing_keys:
+            preview = ", ".join(missing_keys[:4])
+            raise RuntimeError(
+                "The test checkpoint is incomplete or incompatible with the "
+                "configured GS/GIR heads. Missing keys include: "
+                f"{preview}"
+            )
         model.load_state_dict(compatible_ckpt, strict=False)
     
     model_wrapper = ModelWrapper(

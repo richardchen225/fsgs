@@ -288,6 +288,11 @@ class ModelWrapper(LightningModule):
                 "train/gir_residual_magnitude",
                 encoder_output.infos["gir_residual_magnitude"].float(),
             )
+            if "gir_raster_alpha" in encoder_output.infos:
+                self.log(
+                    "train/gir_raster_alpha",
+                    encoder_output.infos["gir_raster_alpha"].float(),
+                )
         
         target_gt = (batch["context"]["image"] + 1) / 2
         num_context_views = target_gt.shape[1]
@@ -556,6 +561,20 @@ class ModelWrapper(LightningModule):
         
         target_image = batch["target"]["image"]
         target_view_count = target_image.shape[1]
+        context_indices = batch["context"]["index"]
+        target_indices = batch["target"]["index"]
+        if context_indices.shape[1] <= target_view_count:
+            raise RuntimeError(
+                "Test input must contain source views followed by duplicated target "
+                "views for causal target-pose prediction."
+            )
+        if not torch.equal(
+            context_indices[:, -target_view_count:], target_indices
+        ):
+            raise RuntimeError(
+                "Test context/target mismatch: the final context views must match "
+                "the target views in the same order."
+            )
         
         with torch.no_grad():
             with self.benchmarker.time("encoder"):
@@ -716,6 +735,11 @@ class ModelWrapper(LightningModule):
         num_context_view = ctx_img_num
         pred_all_target_extrinsic = pred_all_extrinsic[:, ctx_img_num:]
         render_view_count = pred_all_target_extrinsic.shape[1]
+        if render_view_count != target_view_count:
+            raise RuntimeError(
+                "Test target-pose count mismatch: "
+                f"predicted={render_view_count}, expected={target_view_count}."
+            )
         render_device = gaussians.means.device
                 
         with self.benchmarker.time("decoder", num_calls=v):
@@ -729,15 +753,11 @@ class ModelWrapper(LightningModule):
                 (h, w),
             )
 
-        # depth_pred = vis_depth_map(output.depth[0])
-        # model_depth_pred = depth_map.squeeze(-1)[0]
-        # model_depth_pred = vis_depth_map(model_depth_pred)
-        
+        rgb_pred = output.color[0].float()
+        rgb_gt = target_image[0].float()
         psnr = None
         with torch.no_grad():
             if self.test_cfg.compute_scores:
-                rgb_pred = output.color[0]
-                rgb_gt = target_image[0]
                 psnr = compute_psnr(rgb_gt, rgb_pred).mean().item()
                 all_metrics = {
                     f"lpips_ours": compute_lpips(rgb_gt, rgb_pred).mean().item(),
@@ -760,7 +780,11 @@ class ModelWrapper(LightningModule):
         #     save_image(single_color, res_path)
 
         if self.test_cfg.save_compare:
-            context_img = inverse_normalize(batch["context"]["image"][0])
+            context_img = inverse_normalize(
+                batch["context"]["image"][0, :ctx_img_num]
+            )
+            model_depth_pred = vis_depth_map(depth_map.squeeze(-1)[0])
+            depth_pred = vis_depth_map(output.depth[0])
             comparison = hcat(
                 add_label(vcat(*context_img), "Context"),
                 add_label(vcat(*rgb_gt), "Target (Ground Truth)"),

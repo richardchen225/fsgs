@@ -114,6 +114,7 @@ class EncoderAnySplatCfg:
     gs_refine_geometry_neighbors: int = 2
     gir_enabled: bool = False
     gir_render_scale: float = 0.25
+    gir_raster_evidence_enabled: bool = False
     gir_hidden_dim: int = 64
     gir_tbptt_chunk: int = 2
     gir_replay_views: int = 1

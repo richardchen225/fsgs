@@ -22,6 +22,7 @@ model:
     gs_refine_enabled: false
     gir_enabled: true
     gir_render_scale: 0.5
+    gir_raster_evidence_enabled: true
     gir_hidden_dim: 64
     gir_tbptt_chunk: 4
     gir_replay_views: 1

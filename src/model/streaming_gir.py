@@ -56,6 +56,8 @@ class DominantGIR:
     opacity: torch.Tensor
     scale: torch.Tensor
     observation_count: torch.Tensor
+    raster_depth: torch.Tensor
+    raster_alpha: torch.Tensor
 
     @classmethod
     def empty(
@@ -80,6 +82,8 @@ class DominantGIR:
             opacity=torch.zeros(image_shape, device=device, dtype=dtype),
             scale=torch.zeros(image_shape, device=device, dtype=dtype),
             observation_count=torch.zeros(image_shape, device=device, dtype=dtype),
+            raster_depth=torch.zeros(image_shape, device=device, dtype=dtype),
+            raster_alpha=torch.zeros(image_shape, device=device, dtype=dtype),
         )
 
 
@@ -413,10 +417,12 @@ class GIRUpdateHead(nn.Module):
         feature_dim: int,
         harmonic_dim: int,
         hidden_dim: int = 64,
+        use_raster_evidence: bool = False,
     ) -> None:
         super().__init__()
         self.harmonic_dim = harmonic_dim
-        evidence_dim = feature_dim + 15
+        self.use_raster_evidence = use_raster_evidence
+        evidence_dim = feature_dim + 15 + int(use_raster_evidence)
         output_dim = 3 + 3 + 3 + 1 + harmonic_dim + 1 + 1
         groups = _group_count(hidden_dim)
         self.encoder = nn.Sequential(
@@ -461,26 +467,28 @@ class GIRUpdateHead(nn.Module):
 
         valid = gir.valid.to(current_feature.dtype)
         historical_rgb = gir.rgb.to(current_feature.dtype)
-        historical_depth = gir.depth.to(current_feature.dtype)
+        historical_depth = (
+            gir.raster_depth if self.use_raster_evidence else gir.depth
+        ).to(current_feature.dtype)
         relative_depth = (
             (historical_depth - current_depth) / current_depth.clamp_min(1e-4)
         ).clamp(-2.0, 2.0)
         log_depth = current_depth.clamp_min(1e-4).log().clamp(-8.0, 8.0)
-        evidence = torch.cat(
-            [
-                current_feature,
-                current_rgb,
-                historical_rgb,
-                current_rgb - historical_rgb,
-                log_depth,
-                relative_depth,
-                gir.opacity.to(current_feature.dtype),
-                gir.scale.to(current_feature.dtype),
-                current_depth_confidence,
-                valid,
-            ],
-            dim=1,
-        )
+        evidence_parts = [
+            current_feature,
+            current_rgb,
+            historical_rgb,
+            current_rgb - historical_rgb,
+            log_depth,
+            relative_depth,
+            gir.opacity.to(current_feature.dtype),
+            gir.scale.to(current_feature.dtype),
+            current_depth_confidence,
+            valid,
+        ]
+        if self.use_raster_evidence:
+            evidence_parts.append(gir.raster_alpha.to(current_feature.dtype))
+        evidence = torch.cat(evidence_parts, dim=1)
         prediction = self.prediction(self.encoder(evidence))
         splits = torch.split(
             prediction,

@@ -350,6 +350,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 feature_dim=self.encoder.feature_dim // 2,
                 harmonic_dim=self.encoder.nums_sh * 3,
                 hidden_dim=cfg.gir_hidden_dim,
+                use_raster_evidence=getattr(
+                    cfg, "gir_raster_evidence_enabled", False
+                ),
             )
             return
         if not getattr(cfg, "gs_refine_enabled", False):
@@ -435,6 +438,50 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             alpha = alpha.reshape(b, views, h, w)
         return alpha.unsqueeze(2)
 
+    @torch.no_grad()
+    def _render_old_map_gir_evidence(
+        self,
+        gir: DominantGIR,
+        state: StreamingGaussianState,
+        camera_to_world: torch.Tensor,
+        intrinsics: torch.Tensor,
+        image_shape: tuple[int, int],
+        near: float,
+        far: float,
+    ) -> DominantGIR:
+        b = state.batch_size
+        h, w = image_shape
+        device = state.gaussians.means.device
+        render_output = self.decoder.forward(
+            state.gaussians,
+            camera_to_world[:, None].detach(),
+            intrinsics[:, None].detach(),
+            torch.full((b, 1), near, device=device, dtype=torch.float32),
+            torch.full((b, 1), far, device=device, dtype=torch.float32),
+            image_shape,
+            "depth",
+        )
+
+        render_alpha = self._normalize_render_alpha(
+            render_output.alpha, b, 1, h, w
+        )[:, 0]
+        render_alpha = torch.nan_to_num(render_alpha.float()).clamp_(0.0, 1.0)
+        render_depth = self._normalize_render_depth(
+            render_output.depth, b, 1, h, w
+        )[:, 0]
+        render_depth = torch.nan_to_num(render_depth.float())
+        render_depth = torch.where(
+            render_alpha > 1e-4,
+            render_depth.clamp_min(1e-6),
+            torch.zeros_like(render_depth),
+        )
+
+        render_color = torch.nan_to_num(render_output.color[:, 0].float())
+        gir.rgb = render_color.clamp_(0.0, 1.0).to(gir.rgb.dtype)
+        gir.raster_depth = render_depth.to(gir.depth.dtype)
+        gir.raster_alpha = render_alpha.to(gir.opacity.dtype)
+        return gir
+
     @staticmethod
     def _slice_gaussian_view(
         gaussians: Gaussians,
@@ -466,6 +513,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             raise RuntimeError("GIR is enabled, but the encoder did not return per-view GS data.")
 
         cfg = self.encoder.cfg
+        use_raster_evidence = bool(
+            getattr(cfg, "gir_raster_evidence_enabled", False)
+        )
         features = refine_info["features"]
         b, source_views, _, h, w = features.shape
         if source_views != ctx_img_num:
@@ -491,6 +541,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         historical_gates = []
         visible_ratios = []
         residual_magnitudes = []
+        raster_alpha_means = []
 
         for view_idx in range(source_views):
             current_feature = features[:, view_idx]
@@ -518,6 +569,19 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     intrinsics[:, view_idx],
                     (low_h, low_w),
                 )
+                if use_raster_evidence:
+                    gir = self._render_old_map_gir_evidence(
+                        gir,
+                        state,
+                        pred_all_extrinsic[:, view_idx],
+                        intrinsics[:, view_idx],
+                        (low_h, low_w),
+                        near,
+                        far,
+                    )
+
+            if use_raster_evidence:
+                raster_alpha_means.append(gir.raster_alpha.mean())
 
             prediction = self.gir_update_head(
                 current_feature,
@@ -654,6 +718,10 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             encoder_output.infos["gir_residual_magnitude"] = torch.stack(
                 residual_magnitudes
             ).mean()
+            if raster_alpha_means:
+                encoder_output.infos["gir_raster_alpha"] = torch.stack(
+                    raster_alpha_means
+                ).mean()
             if auxiliary_losses:
                 encoder_output.infos["gir_aux_loss"] = torch.stack(
                     auxiliary_losses
