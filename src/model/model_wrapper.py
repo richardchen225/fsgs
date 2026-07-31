@@ -293,6 +293,11 @@ class ModelWrapper(LightningModule):
                     "train/gir_raster_alpha",
                     encoder_output.infos["gir_raster_alpha"].float(),
                 )
+            if "gir_dominant_weight" in encoder_output.infos:
+                self.log(
+                    "train/gir_dominant_weight",
+                    encoder_output.infos["gir_dominant_weight"].float(),
+                )
         
         target_gt = (batch["context"]["image"] + 1) / 2
         num_context_views = target_gt.shape[1]

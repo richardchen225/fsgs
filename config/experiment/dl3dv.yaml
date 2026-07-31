@@ -23,6 +23,8 @@ model:
     gir_enabled: true
     gir_render_scale: 0.5
     gir_raster_evidence_enabled: true
+    gir_dominant_id_enabled: true
+    gir_dominant_min_weight: 1e-4
     gir_hidden_dim: 64
     gir_tbptt_chunk: 4
     gir_replay_views: 1

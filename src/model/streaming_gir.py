@@ -58,6 +58,7 @@ class DominantGIR:
     observation_count: torch.Tensor
     raster_depth: torch.Tensor
     raster_alpha: torch.Tensor
+    dominant_weight: torch.Tensor
 
     @classmethod
     def empty(
@@ -84,6 +85,7 @@ class DominantGIR:
             observation_count=torch.zeros(image_shape, device=device, dtype=dtype),
             raster_depth=torch.zeros(image_shape, device=device, dtype=dtype),
             raster_alpha=torch.zeros(image_shape, device=device, dtype=dtype),
+            dominant_weight=torch.zeros(image_shape, device=device, dtype=dtype),
         )
 
 
@@ -209,7 +211,9 @@ class StreamingGaussianState:
             gate = prediction.historical_gate[batch_idx].reshape(-1).sigmoid()
             old_count = self.observation_count[batch_idx].gather(0, safe_indices)
             damping = old_count.add(1.0).rsqrt()
-            pixel_weight = visible * gate * damping
+            contribution = gir.dominant_weight[batch_idx].reshape(-1).clamp_min(0.0)
+            support_weight = visible * contribution
+            update_weight = support_weight * gate * damping
 
             depth = gir.depth[batch_idx].reshape(-1).clamp_min(1e-4)
             delta_mean_camera = prediction.delta_mean_camera[batch_idx]
@@ -221,13 +225,19 @@ class StreamingGaussianState:
             delta_mean_world = delta_mean_camera @ rotation_c2w.transpose(0, 1)
 
             def aggregate(values: torch.Tensor) -> torch.Tensor:
-                weighted = values * pixel_weight.unsqueeze(-1)
+                weighted = values * update_weight.unsqueeze(-1)
                 index = safe_indices.unsqueeze(-1).expand(-1, values.shape[-1])
-                return torch.zeros(
+                numerator = torch.zeros(
                     (n, values.shape[-1]),
                     device=values.device,
                     dtype=values.dtype,
                 ).scatter_add(0, index, weighted)
+                denominator = torch.zeros(
+                    n,
+                    device=values.device,
+                    dtype=values.dtype,
+                ).scatter_add(0, safe_indices, support_weight)
+                return numerator / denominator.clamp_min(1e-8).unsqueeze(-1)
 
             mean_updates.append(aggregate(delta_mean_world))
 
@@ -402,6 +412,7 @@ class DominantGIRRenderer(nn.Module):
                 .gather(0, safe_winners[valid_pixel])
                 .to(result.observation_count.dtype)
             )
+            result.dominant_weight[batch_idx].view(-1)[valid_pixel] = 1.0
             result.rgb[batch_idx].reshape(3, -1)[:, valid_pixel] = rgb[
                 batch_idx
             ].gather(

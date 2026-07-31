@@ -9,14 +9,62 @@
 ```bash
 conda create -n fsgs python=3.10 -y
 conda activate fsgs
-pip install -U pip
-pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu130
+pip install -U pip setuptools wheel ninja
+pip install torch==2.11.0+cu130 torchvision==0.26.0+cu130 torchaudio==2.11.0+cu130 \
+  --index-url https://download.pytorch.org/whl/cu130
+export BUILD_EXPERIMENTAL=0
+pip install --no-build-isolation -r requirements.txt \
+  --extra-index-url https://download.pytorch.org/whl/cu130
 ```
+
+### Dominant GIR rasterizer 依赖
+
+GIR 按 `alpha * transmittance` 返回每个像素贡献最大的 Gaussian。默认的
+`gsplat==1.5.3` 使用已有的 contributor API，并在 PyTorch 中重建 Top-1 结果，
+不需要安装带自定义 Top-1 kernel 的 Git commit。代码仍兼容带官方 Top-1 API 的
+新版 gsplat，并会在该 API 存在时自动使用它。
 
 如果 `torch-scatter` 这类包安装失败，通常是本机 CUDA、PyTorch wheel 或编译器版本没有对齐。先确认：
 
 ```bash
 python -c "import torch; print(torch.__version__, torch.version.cuda)"
+```
+
+### CUDA 12.1 / PyTorch 2.2 环境
+
+CUDA Toolkit 12.1 的机器使用独立的 `requirements_121.txt`。其中 gsplat 固定在
+`1.5.3`；现有的 `1.5.3+pt22cu121` 已满足要求，不需要卸载。推荐创建新环境时分
+两阶段安装，保证任何 CUDA 扩展初始化时 PyTorch 已经存在：
+
+```bash
+conda create -n fsgs_gir121 python=3.10 -y
+conda activate fsgs_gir121
+
+pip install -U pip "setuptools<82" wheel ninja
+pip install torch==2.2.2+cu121 torchvision==0.17.2+cu121 \
+  torchaudio==2.2.2+cu121 \
+  --index-url https://download.pytorch.org/whl/cu121
+
+export CUDA_HOME="$(dirname "$(dirname "$(which nvcc)")")"
+export MAX_JOBS=4
+export TORCH_CUDA_ARCH_LIST="8.0"  # A100；H100 改为 9.0
+
+pip install --no-build-isolation -r requirements_121.txt \
+  --extra-index-url https://download.pytorch.org/whl/cu121
+```
+
+现有环境只需确认 gsplat 和 contributor API，无需替换：
+
+```bash
+python - <<'PY'
+import gsplat
+from gsplat import rasterize_to_indices_in_range
+from gsplat.cuda._backend import _C
+
+assert _C is not None, "gsplat CUDA backend failed to load"
+print("gsplat:", gsplat.__version__)
+print("gsplat 1.5.3 contributor fallback API: OK")
+PY
 ```
 
 需要实验日志同步到 Weights & Biases，登录：
@@ -216,5 +264,3 @@ python -m src.main +experiment=dl3dv \
 - 下载无权限：先在 `DL3DV/DL3DV-ALL-480P` 页面申请访问，再执行 `huggingface-cli login`。
 - 想断点续训：显式设置 `checkpointing.load=/path/to/checkpoint.ckpt`，通常指向上一次实验 `checkpoints/` 目录下最新或最好的完整 checkpoint。
 - 想换数据目录：同步改 `config/dataset/dl3dv.yaml` 和 `config/experiment/dl3dv.yaml` 里的 `roots`，或在命令行覆盖 `dataset.dl3dv.roots`。
-
-

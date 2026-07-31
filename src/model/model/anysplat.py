@@ -345,6 +345,12 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 raise ValueError(
                     "gir_enabled and gs_refine_enabled are mutually exclusive."
                 )
+            if getattr(cfg, "gir_dominant_id_enabled", False) and not getattr(
+                cfg, "gir_raster_evidence_enabled", False
+            ):
+                raise ValueError(
+                    "gir_dominant_id_enabled requires gir_raster_evidence_enabled."
+                )
             self.gir_renderer = DominantGIRRenderer()
             self.gir_update_head = GIRUpdateHead(
                 feature_dim=self.encoder.feature_dim // 2,
@@ -446,40 +452,98 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         camera_to_world: torch.Tensor,
         intrinsics: torch.Tensor,
         image_shape: tuple[int, int],
-        near: float,
-        far: float,
+        use_dominant_ids: bool,
+        min_dominant_weight: float,
     ) -> DominantGIR:
         b = state.batch_size
         h, w = image_shape
-        device = state.gaussians.means.device
-        render_output = self.decoder.forward(
+        render_output = self.decoder.render_gir_evidence(
             state.gaussians,
-            camera_to_world[:, None].detach(),
-            intrinsics[:, None].detach(),
-            torch.full((b, 1), near, device=device, dtype=torch.float32),
-            torch.full((b, 1), far, device=device, dtype=torch.float32),
+            camera_to_world.detach(),
+            intrinsics.detach(),
             image_shape,
-            "depth",
         )
 
-        render_alpha = self._normalize_render_alpha(
-            render_output.alpha, b, 1, h, w
-        )[:, 0]
-        render_alpha = torch.nan_to_num(render_alpha.float()).clamp_(0.0, 1.0)
-        render_depth = self._normalize_render_depth(
-            render_output.depth, b, 1, h, w
-        )[:, 0]
-        render_depth = torch.nan_to_num(render_depth.float())
+        render_alpha = torch.nan_to_num(
+            render_output.alpha.float(), nan=0.0, posinf=0.0, neginf=0.0
+        ).clamp_(0.0, 1.0)
+        render_depth = render_output.expected_depth
+        render_depth = torch.nan_to_num(
+            render_depth.float(), nan=0.0, posinf=0.0, neginf=0.0
+        )
         render_depth = torch.where(
             render_alpha > 1e-4,
             render_depth.clamp_min(1e-6),
             torch.zeros_like(render_depth),
         )
 
-        render_color = torch.nan_to_num(render_output.color[:, 0].float())
+        render_color = torch.nan_to_num(
+            render_output.color.float(), nan=0.0, posinf=0.0, neginf=0.0
+        )
         gir.rgb = render_color.clamp_(0.0, 1.0).to(gir.rgb.dtype)
         gir.raster_depth = render_depth.to(gir.depth.dtype)
         gir.raster_alpha = render_alpha.to(gir.opacity.dtype)
+
+        if use_dominant_ids:
+            ids = render_output.dominant_ids
+            weights = torch.nan_to_num(
+                render_output.dominant_weights.float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_min_(0.0)
+            valid = (
+                (ids >= 0)
+                & (ids < state.num_gaussians)
+                & (weights[:, 0] >= min_dominant_weight)
+                & (render_alpha[:, 0] > 1e-4)
+            )
+            safe_ids = ids.clamp(min=0, max=max(state.num_gaussians - 1, 0))
+            flat_ids = safe_ids.reshape(b, -1)
+
+            def gather_scalar(values: torch.Tensor) -> torch.Tensor:
+                gathered = values.gather(1, flat_ids).reshape(b, 1, h, w)
+                return torch.where(
+                    valid[:, None], gathered, torch.zeros_like(gathered)
+                )
+
+            means = state.gaussians.means.float()
+            ones = torch.ones(
+                (b, state.num_gaussians, 1),
+                device=means.device,
+                dtype=means.dtype,
+            )
+            means_h = torch.cat([means, ones], dim=-1)
+            world_to_camera = torch.linalg.inv(camera_to_world.detach().float())
+            camera_points = torch.einsum("bij,bnj->bni", world_to_camera, means_h)
+            dominant_depth = gather_scalar(camera_points[..., 2])
+            valid = valid & (dominant_depth[:, 0] > 1e-5)
+
+            gir.indices = torch.where(valid, ids, torch.full_like(ids, -1))
+            stable_ids = state.stable_ids.gather(1, flat_ids).reshape(b, h, w)
+            gir.stable_ids = torch.where(
+                valid, stable_ids, torch.full_like(stable_ids, -1)
+            )
+            gir.valid = valid[:, None]
+            gir.depth = torch.where(
+                gir.valid,
+                dominant_depth.to(gir.depth.dtype),
+                torch.zeros_like(gir.depth),
+            )
+            gir.opacity = gather_scalar(state.gaussians.opacities).to(
+                gir.opacity.dtype
+            )
+            gir.scale = gather_scalar(state.gaussians.scales.norm(dim=-1)).to(
+                gir.scale.dtype
+            )
+            gir.observation_count = gather_scalar(state.observation_count).to(
+                gir.observation_count.dtype
+            )
+            gir.dominant_weight = torch.where(
+                gir.valid,
+                weights.to(gir.dominant_weight.dtype),
+                torch.zeros_like(gir.dominant_weight),
+            )
         return gir
 
     @staticmethod
@@ -516,6 +580,10 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         use_raster_evidence = bool(
             getattr(cfg, "gir_raster_evidence_enabled", False)
         )
+        use_dominant_ids = bool(getattr(cfg, "gir_dominant_id_enabled", False))
+        min_dominant_weight = float(
+            max(0.0, getattr(cfg, "gir_dominant_min_weight", 1e-4))
+        )
         features = refine_info["features"]
         b, source_views, _, h, w = features.shape
         if source_views != ctx_img_num:
@@ -542,6 +610,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         visible_ratios = []
         residual_magnitudes = []
         raster_alpha_means = []
+        dominant_weight_means = []
 
         for view_idx in range(source_views):
             current_feature = features[:, view_idx]
@@ -563,12 +632,21 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     features.dtype,
                 )
             else:
-                gir = self.gir_renderer(
-                    state,
-                    pred_all_extrinsic[:, view_idx],
-                    intrinsics[:, view_idx],
-                    (low_h, low_w),
-                )
+                if use_dominant_ids:
+                    gir = DominantGIR.empty(
+                        b,
+                        low_h,
+                        low_w,
+                        features.device,
+                        features.dtype,
+                    )
+                else:
+                    gir = self.gir_renderer(
+                        state,
+                        pred_all_extrinsic[:, view_idx],
+                        intrinsics[:, view_idx],
+                        (low_h, low_w),
+                    )
                 if use_raster_evidence:
                     gir = self._render_old_map_gir_evidence(
                         gir,
@@ -576,12 +654,17 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                         pred_all_extrinsic[:, view_idx],
                         intrinsics[:, view_idx],
                         (low_h, low_w),
-                        near,
-                        far,
+                        use_dominant_ids,
+                        min_dominant_weight,
                     )
 
             if use_raster_evidence:
                 raster_alpha_means.append(gir.raster_alpha.mean())
+            if use_dominant_ids and state is not None:
+                valid_count = gir.valid.sum().clamp_min(1)
+                dominant_weight_means.append(
+                    (gir.dominant_weight * gir.valid).sum() / valid_count
+                )
 
             prediction = self.gir_update_head(
                 current_feature,
@@ -721,6 +804,10 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             if raster_alpha_means:
                 encoder_output.infos["gir_raster_alpha"] = torch.stack(
                     raster_alpha_means
+                ).mean()
+            if dominant_weight_means:
+                encoder_output.infos["gir_dominant_weight"] = torch.stack(
+                    dominant_weight_means
                 ).mean()
             if auxiliary_losses:
                 encoder_output.infos["gir_aux_loss"] = torch.stack(

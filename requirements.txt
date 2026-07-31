@@ -61,8 +61,9 @@ typer==0.12.3
 pydantic==2.8.2
 requests==2.32.3
 
-# Gaussian splatting backends.
-gsplat==1.3.0
+# Gaussian splatting backend. Dominant GIR reconstructs Top-1 contributors
+# with the contributor API included in this release.
+gsplat==1.5.3
 
 # MoGe is imported as moge.model.v2. Its setup.py also pulls utils3d and pipeline
 # from GitHub.

@@ -10,8 +10,18 @@ import torchvision
 from ..types import Gaussians
 # from .cuda_splatting import DepthRenderingMode, render_cuda
 from .decoder import Decoder, DecoderOutput
-from math import sqrt 
-from gsplat import rasterization, rasterization_2dgs
+from math import prod, sqrt
+from gsplat import rasterization
+
+try:
+    from gsplat import rasterize_top_contributing_gaussian_ids
+except ImportError:
+    rasterize_top_contributing_gaussian_ids = None
+
+try:
+    from gsplat import rasterize_to_indices_in_range
+except ImportError:
+    rasterize_to_indices_in_range = None
 
 from ...misc.utils import vis_depth_map
 
@@ -22,6 +32,156 @@ class DecoderSplattingCUDACfg:
     name: Literal["splatting_cuda"]
     background_color: list[float]
     make_scale_invariant: bool
+
+
+@dataclass
+class GIRRasterizationOutput:
+    color: Tensor
+    expected_depth: Tensor
+    alpha: Tensor
+    dominant_ids: Tensor
+    dominant_weights: Tensor
+
+
+@torch.no_grad()
+def _rasterize_top_contributor_fallback(
+    means2d: Tensor,
+    conics: Tensor,
+    opacities: Tensor,
+    tile_offsets: Tensor,
+    flatten_ids: Tensor,
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+) -> tuple[Tensor, Tensor]:
+    """Reconstruct top alpha*T contributors with the gsplat 1.5.3 API."""
+    if rasterize_to_indices_in_range is None:
+        raise RuntimeError(
+            "Dominant GIR requires gsplat 1.5.3 or a newer build with a "
+            "contributor rasterization API."
+        )
+
+    image_dims = means2d.shape[:-2]
+    num_images = prod(image_dims)
+    num_gaussians = means2d.shape[-2]
+    pixel_count = image_height * image_width
+    output_shape = image_dims + (image_height, image_width, 1)
+
+    dominant_ids = torch.full(
+        (num_images * pixel_count,),
+        -1,
+        device=means2d.device,
+        dtype=torch.long,
+    )
+    dominant_weights = torch.zeros(
+        (num_images * pixel_count,),
+        device=means2d.device,
+        dtype=means2d.dtype,
+    )
+    if num_gaussians == 0:
+        return dominant_ids.reshape(output_shape), dominant_weights.reshape(
+            output_shape
+        )
+
+    transmittances = torch.ones(
+        image_dims + (image_height, image_width),
+        device=means2d.device,
+        dtype=means2d.dtype,
+    )
+    gaussian_ids, pixel_ids, image_ids = rasterize_to_indices_in_range(
+        range_start=0,
+        range_end=2**31 - 1,
+        transmittances=transmittances,
+        means2d=means2d,
+        conics=conics,
+        opacities=opacities,
+        image_width=image_width,
+        image_height=image_height,
+        tile_size=tile_size,
+        isect_offsets=tile_offsets,
+        flatten_ids=flatten_ids,
+    )
+    if gaussian_ids.numel() == 0:
+        return dominant_ids.reshape(output_shape), dominant_weights.reshape(
+            output_shape
+        )
+
+    gaussian_ids = gaussian_ids.long()
+    pixel_ids = pixel_ids.long()
+    image_ids = image_ids.long()
+    flat_means2d = means2d.reshape(num_images, num_gaussians, 2)
+    flat_conics = conics.reshape(num_images, num_gaussians, 3)
+    flat_opacities = opacities.reshape(num_images, num_gaussians)
+
+    pair_means = flat_means2d[image_ids, gaussian_ids]
+    pair_conics = flat_conics[image_ids, gaussian_ids]
+    pair_opacities = flat_opacities[image_ids, gaussian_ids]
+    pixel_x = (pixel_ids % image_width).to(means2d.dtype) + 0.5
+    pixel_y = torch.div(
+        pixel_ids, image_width, rounding_mode="floor"
+    ).to(means2d.dtype) + 0.5
+    delta_x = pair_means[:, 0] - pixel_x
+    delta_y = pair_means[:, 1] - pixel_y
+    sigma = (
+        0.5
+        * (
+            pair_conics[:, 0] * delta_x.square()
+            + pair_conics[:, 2] * delta_y.square()
+        )
+        + pair_conics[:, 1] * delta_x * delta_y
+    )
+    pair_alpha = (pair_opacities * torch.exp(-sigma)).clamp_(0.0, 0.999)
+
+    # gsplat 1.5.3 writes pairs grouped by pixel and front-to-back within
+    # each group. A float64 prefix avoids precision loss when segment bases
+    # are subtracted after a long flattened cumulative sum.
+    global_pixel_ids = image_ids * pixel_count + pixel_ids
+    segment_start = torch.ones_like(global_pixel_ids, dtype=torch.bool)
+    segment_start[1:] = global_pixel_ids[1:] != global_pixel_ids[:-1]
+    segment_ids = segment_start.long().cumsum(0) - 1
+    log_survival = torch.log1p(-pair_alpha.double())
+    inclusive_log_survival = log_survival.cumsum(0)
+    exclusive_log_survival = inclusive_log_survival - log_survival
+    segment_bases = exclusive_log_survival[segment_start]
+    local_exclusive_log_survival = (
+        exclusive_log_survival - segment_bases[segment_ids]
+    )
+    pair_weights = pair_alpha * local_exclusive_log_survival.exp().to(
+        pair_alpha.dtype
+    )
+
+    dominant_weights.scatter_reduce_(
+        0,
+        global_pixel_ids,
+        pair_weights,
+        reduce="amax",
+        include_self=True,
+    )
+    pair_positions = torch.arange(
+        gaussian_ids.numel(), device=gaussian_ids.device, dtype=torch.long
+    )
+    sentinel = gaussian_ids.numel()
+    winning_positions = torch.full_like(dominant_ids, sentinel)
+    is_winner = (pair_weights == dominant_weights[global_pixel_ids]) & (
+        pair_weights > 0
+    )
+    winning_positions.scatter_reduce_(
+        0,
+        global_pixel_ids,
+        torch.where(
+            is_winner,
+            pair_positions,
+            torch.full_like(pair_positions, sentinel),
+        ),
+        reduce="amin",
+        include_self=True,
+    )
+    valid = winning_positions < sentinel
+    dominant_ids[valid] = gaussian_ids[winning_positions[valid]]
+    dominant_weights = torch.where(
+        valid, dominant_weights, torch.zeros_like(dominant_weights)
+    )
+    return dominant_ids.reshape(output_shape), dominant_weights.reshape(output_shape)
 
 
 class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
@@ -37,6 +197,118 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             "background_color",
             torch.tensor(cfg.background_color, dtype=torch.float32),
             persistent=False,
+        )
+
+    @torch.no_grad()
+    def render_gir_evidence(
+        self,
+        gaussians: Gaussians,
+        extrinsics: Float[Tensor, "batch 4 4"],
+        intrinsics: Float[Tensor, "batch 3 3"],
+        image_shape: tuple[int, int],
+    ) -> GIRRasterizationOutput:
+        if (
+            rasterize_top_contributing_gaussian_ids is None
+            and rasterize_to_indices_in_range is None
+        ):
+            raise RuntimeError(
+                "Dominant GIR requires gsplat 1.5.3 or a newer contributor "
+                "rasterization API."
+            )
+
+        b = gaussians.means.shape[0]
+        h, w = image_shape
+        colors = []
+        expected_depths = []
+        alphas = []
+        dominant_ids = []
+        dominant_weights = []
+
+        for batch_idx in range(b):
+            xyz = gaussians.means[batch_idx].float()
+            features = gaussians.harmonics[batch_idx].float()
+            scales = gaussians.scales[batch_idx].float()
+            rotations = gaussians.rotations[batch_idx].float()
+            opacities = gaussians.opacities[batch_idx].float()
+            world_to_camera = extrinsics[batch_idx : batch_idx + 1].float().inverse()
+            intrinsics_px = intrinsics[batch_idx : batch_idx + 1].float().clone()
+            intrinsics_px[:, 0] = intrinsics_px[:, 0] * w
+            intrinsics_px[:, 1] = intrinsics_px[:, 1] * h
+            sh_degree = int(sqrt(features.shape[-2])) - 1
+
+            rendering, alpha, info = rasterization(
+                xyz,
+                rotations,
+                scales,
+                opacities,
+                features,
+                world_to_camera,
+                intrinsics_px,
+                w,
+                h,
+                sh_degree=sh_degree,
+                render_mode="RGB+ED",
+                packed=False,
+                near_plane=1e-10,
+                backgrounds=self.background_color.unsqueeze(0),
+                radius_clip=0.1,
+                rasterize_mode="classic",
+            )
+            required_info = {
+                "means2d",
+                "conics",
+                "opacities",
+                "isect_offsets",
+                "flatten_ids",
+                "tile_size",
+            }
+            missing_info = required_info.difference(info)
+            if missing_info:
+                missing = ", ".join(sorted(missing_info))
+                raise RuntimeError(
+                    f"The installed gsplat GIR API is incompatible; missing: {missing}."
+                )
+
+            contributor_args = {
+                "means2d": info["means2d"],
+                "conics": info["conics"],
+                "opacities": info["opacities"],
+                "tile_offsets": info["isect_offsets"],
+                "flatten_ids": info["flatten_ids"],
+                "image_width": w,
+                "image_height": h,
+                "tile_size": info["tile_size"],
+            }
+            if rasterize_top_contributing_gaussian_ids is not None:
+                ids, weights = rasterize_top_contributing_gaussian_ids(
+                    **contributor_args,
+                    num_depth_samples=1,
+                )
+            else:
+                ids, weights = _rasterize_top_contributor_fallback(
+                    **contributor_args
+                )
+            expected_id_shape = (1, h, w, 1)
+            if ids.shape != expected_id_shape or weights.shape != expected_id_shape:
+                raise RuntimeError(
+                    "Unexpected dominant GIR output shapes: "
+                    f"ids={tuple(ids.shape)}, weights={tuple(weights.shape)}, "
+                    f"expected={expected_id_shape}."
+                )
+
+            rgb, depth = torch.split(rendering, [3, 1], dim=-1)
+            colors.append(rgb[0].permute(2, 0, 1).clamp(0.0, 1.0))
+            expected_depths.append(depth[0].permute(2, 0, 1))
+            alphas.append(alpha[0].permute(2, 0, 1))
+            dominant_ids.append(ids[0, ..., 0].long())
+            dominant_weights.append(weights[0, ..., 0].unsqueeze(0))
+
+        return GIRRasterizationOutput(
+            color=torch.stack(colors),
+            expected_depth=torch.stack(expected_depths),
+            alpha=torch.stack(alphas),
+            dominant_ids=torch.stack(dominant_ids),
+            dominant_weights=torch.stack(dominant_weights),
         )
 
     def rendering_fn(
