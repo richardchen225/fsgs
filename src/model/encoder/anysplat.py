@@ -121,6 +121,8 @@ class EncoderAnySplatCfg:
     gir_tbptt_chunk: int = 2
     gir_replay_views: int = 1
     gir_aux_loss_weight: float = 0.25
+    gir_history_loss_weight: float = 0.25
+    gir_history_loss_interval: int = 4
     gir_regularization_weight: float = 1e-4
 
 class CameraDec(nn.Module):

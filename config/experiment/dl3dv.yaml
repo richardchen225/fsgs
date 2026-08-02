@@ -29,6 +29,8 @@ model:
     gir_tbptt_chunk: 4
     gir_replay_views: 1
     gir_aux_loss_weight: 0.25
+    gir_history_loss_weight: 0.25
+    gir_history_loss_interval: 4
     gir_regularization_weight: 1e-4
     
 dataset:

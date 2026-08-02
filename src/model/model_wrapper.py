@@ -298,6 +298,28 @@ class ModelWrapper(LightningModule):
                     "train/gir_dominant_weight",
                     encoder_output.infos["gir_dominant_weight"].float(),
                 )
+            if "gir_new_residual_magnitude" in encoder_output.infos:
+                self.log(
+                    "train/gir_new_residual_magnitude",
+                    encoder_output.infos["gir_new_residual_magnitude"].float(),
+                )
+                self.log(
+                    "train/gir_new_residual_gate",
+                    encoder_output.infos["gir_new_residual_gate"].float(),
+                )
+            if "gir_history_before_error" in encoder_output.infos:
+                history_before = encoder_output.infos[
+                    "gir_history_before_error"
+                ].float()
+                history_after = encoder_output.infos[
+                    "gir_history_after_error"
+                ].float()
+                self.log("train/gir_history_before_error", history_before)
+                self.log("train/gir_history_after_error", history_after)
+                self.log(
+                    "train/gir_history_improvement",
+                    history_before - history_after,
+                )
         
         target_gt = (batch["context"]["image"] + 1) / 2
         num_context_views = target_gt.shape[1]
@@ -319,6 +341,16 @@ class ModelWrapper(LightningModule):
             gir_aux_weight = float(self.model.encoder.cfg.gir_aux_loss_weight)
             self.log("loss/gir_aux", gir_aux_loss.item())
             total_loss = total_loss + gir_aux_weight * gir_aux_loss
+        if (
+            encoder_output.infos is not None
+            and "gir_history_loss" in encoder_output.infos
+        ):
+            gir_history_loss = encoder_output.infos["gir_history_loss"]
+            gir_history_weight = float(
+                self.model.encoder.cfg.gir_history_loss_weight
+            )
+            self.log("loss/gir_history", gir_history_loss.item())
+            total_loss = total_loss + gir_history_weight * gir_history_loss
         if (
             encoder_output.infos is not None
             and "gir_regularization_loss" in encoder_output.infos

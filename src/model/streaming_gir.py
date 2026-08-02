@@ -98,6 +98,82 @@ class GIRPrediction:
     delta_harmonics: torch.Tensor
     historical_gate: torch.Tensor
     add_logit: torch.Tensor
+    current_delta_mean_camera: torch.Tensor
+    current_delta_rotation: torch.Tensor
+    current_delta_log_scale: torch.Tensor
+    current_delta_opacity_logit: torch.Tensor
+    current_delta_harmonics: torch.Tensor
+    current_residual_gate: torch.Tensor
+
+
+def apply_current_gaussian_residual(
+    current: Gaussians,
+    prediction: GIRPrediction,
+    camera_to_world: torch.Tensor,
+    current_depth: torch.Tensor,
+) -> Gaussians:
+    """Apply history-conditioned residuals to the current per-pixel Gaussians."""
+    b, n = current.means.shape[:2]
+    h, w = current_depth.shape[-2:]
+    if n != h * w:
+        raise RuntimeError(
+            "Current GS residual expects one Gaussian per image pixel: "
+            f"gaussians={n}, image_shape={(h, w)}."
+        )
+
+    def upsample_flat(values: torch.Tensor) -> torch.Tensor:
+        values = F.interpolate(
+            values,
+            size=(h, w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return values.permute(0, 2, 3, 1).reshape(b, n, values.shape[1])
+
+    gate = upsample_flat(prediction.current_residual_gate).sigmoid()
+    depth = current_depth[:, 0].reshape(b, n, 1).to(current.means.dtype)
+
+    delta_mean_camera = upsample_flat(
+        prediction.current_delta_mean_camera
+    ).tanh()
+    delta_mean_camera = delta_mean_camera * depth * gate
+    rotation_c2w = camera_to_world[:, :3, :3].to(delta_mean_camera.dtype)
+    delta_mean_world = torch.einsum(
+        "bij,bnj->bni", rotation_c2w, delta_mean_camera
+    )
+
+    delta_rotation = upsample_flat(prediction.current_delta_rotation).tanh()
+    delta_rotation = delta_rotation * gate
+    delta_quaternion = _axis_angle_to_quaternion_xyzw(delta_rotation)
+    rotations = _quat_multiply_xyzw(delta_quaternion, current.rotations)
+    rotations = F.normalize(rotations, dim=-1, eps=1e-8)
+
+    delta_log_scale = upsample_flat(prediction.current_delta_log_scale).tanh()
+    delta_log_scale = delta_log_scale * gate
+    scales = current.scales * torch.exp(delta_log_scale.clamp(-2.0, 2.0))
+
+    delta_opacity = upsample_flat(
+        prediction.current_delta_opacity_logit
+    ).squeeze(-1).tanh()
+    delta_opacity = delta_opacity * gate.squeeze(-1)
+    opacity_logit = torch.logit(current.opacities.clamp(1e-5, 1.0 - 1e-5))
+    opacities = torch.sigmoid(opacity_logit + delta_opacity)
+
+    harmonics_flat = _flatten_harmonics(current.harmonics)
+    delta_harmonics = upsample_flat(prediction.current_delta_harmonics).tanh()
+    delta_harmonics = delta_harmonics * gate
+    harmonics = _restore_harmonics(
+        harmonics_flat + delta_harmonics,
+        current.harmonics,
+    )
+
+    return Gaussians(
+        means=current.means + delta_mean_world,
+        harmonics=harmonics,
+        opacities=opacities,
+        scales=scales.clamp(1e-6, 0.1),
+        rotations=rotations,
+    )
 
 
 @dataclass
@@ -435,6 +511,7 @@ class GIRUpdateHead(nn.Module):
         self.use_raster_evidence = use_raster_evidence
         evidence_dim = feature_dim + 15 + int(use_raster_evidence)
         output_dim = 3 + 3 + 3 + 1 + harmonic_dim + 1 + 1
+        current_output_dim = 3 + 3 + 3 + 1 + harmonic_dim + 1
         groups = _group_count(hidden_dim)
         self.encoder = nn.Sequential(
             nn.Conv2d(evidence_dim, hidden_dim, kernel_size=3, padding=1),
@@ -448,8 +525,15 @@ class GIRUpdateHead(nn.Module):
             nn.SiLU(inplace=True),
         )
         self.prediction = nn.Conv2d(hidden_dim, output_dim, kernel_size=1)
+        self.current_prediction = nn.Conv2d(
+            hidden_dim + 1,
+            current_output_dim,
+            kernel_size=1,
+        )
         nn.init.zeros_(self.prediction.weight)
         nn.init.zeros_(self.prediction.bias)
+        nn.init.zeros_(self.current_prediction.weight)
+        nn.init.zeros_(self.current_prediction.bias)
 
     def forward(
         self,
@@ -500,10 +584,20 @@ class GIRUpdateHead(nn.Module):
         if self.use_raster_evidence:
             evidence_parts.append(gir.raster_alpha.to(current_feature.dtype))
         evidence = torch.cat(evidence_parts, dim=1)
-        prediction = self.prediction(self.encoder(evidence))
+        encoded = self.encoder(evidence)
+        prediction = self.prediction(encoded)
         splits = torch.split(
             prediction,
             [3, 3, 3, 1, self.harmonic_dim, 1, 1],
             dim=1,
         )
-        return GIRPrediction(*splits)
+        dominant_weight = gir.dominant_weight.to(encoded.dtype)
+        current_prediction = self.current_prediction(
+            torch.cat([encoded, dominant_weight], dim=1)
+        )
+        current_splits = torch.split(
+            current_prediction,
+            [3, 3, 3, 1, self.harmonic_dim, 1],
+            dim=1,
+        )
+        return GIRPrediction(*splits, *current_splits)

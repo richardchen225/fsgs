@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from src.model.types import Gaussians
 from src.model.streaming_gir import (
+    apply_current_gaussian_residual,
     DominantGIR,
     DominantGIRRenderer,
     GIRUpdateHead,
@@ -604,6 +605,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         depth_confidence = refine_info["depth_conf"]
         state: Optional[StreamingGaussianState] = None
         auxiliary_losses = []
+        history_only_losses = []
+        history_before_errors = []
+        history_after_errors = []
         regularization_losses = []
         add_gates = []
         historical_gates = []
@@ -611,6 +615,8 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         residual_magnitudes = []
         raster_alpha_means = []
         dominant_weight_means = []
+        new_residual_magnitudes = []
+        new_residual_gates = []
 
         for view_idx in range(source_views):
             current_feature = features[:, view_idx]
@@ -622,6 +628,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 view_idx,
                 gaussians_per_view,
             )
+            has_history = state is not None
 
             if state is None:
                 gir = DominantGIR.empty(
@@ -675,12 +682,89 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             )
             prediction.historical_gate = prediction.historical_gate - 4.0
 
-            if state is not None:
+            if has_history:
                 state = state.update_historical(
                     gir,
                     prediction,
                     pred_all_extrinsic[:, view_idx],
                 )
+
+                history_interval = max(
+                    1, int(getattr(cfg, "gir_history_loss_interval", 4))
+                )
+                supervise_history = (
+                    (view_idx + 1) % history_interval == 0
+                    or (
+                        source_views < history_interval
+                        and view_idx + 1 == source_views
+                    )
+                )
+                if (
+                    self.training
+                    and cfg.gir_history_loss_weight > 0
+                    and supervise_history
+                ):
+                    history_render = self.decoder.forward(
+                        state.gaussians,
+                        pred_all_extrinsic[:, view_idx : view_idx + 1],
+                        intrinsics[:, view_idx : view_idx + 1],
+                        torch.full((b, 1), near, device=features.device),
+                        torch.full((b, 1), far, device=features.device),
+                        (low_h, low_w),
+                        "depth",
+                    )
+                    history_target = F.interpolate(
+                        current_rgb.float(),
+                        size=(low_h, low_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).to(history_render.color.dtype)
+                    history_mask = gir.valid.to(history_render.color.dtype)
+                    history_normalizer = history_mask.sum().clamp_min(1.0)
+                    before_error = torch.sqrt(
+                        (gir.rgb.to(history_target.dtype) - history_target).square()
+                        + 1e-6
+                    ).mean(dim=1, keepdim=True)
+                    after_error = torch.sqrt(
+                        (history_render.color[:, 0] - history_target).square()
+                        + 1e-6
+                    ).mean(dim=1, keepdim=True)
+                    history_before_errors.append(
+                        (before_error * history_mask).sum() / history_normalizer
+                    )
+                    history_after = (
+                        after_error * history_mask
+                    ).sum() / history_normalizer
+                    history_after_errors.append(history_after.detach())
+                    history_only_losses.append(history_after)
+
+                current_gaussians = apply_current_gaussian_residual(
+                    current_gaussians,
+                    prediction,
+                    pred_all_extrinsic[:, view_idx],
+                    current_depth,
+                )
+                new_residual_energy = (
+                    prediction.current_delta_mean_camera.square().sum(
+                        dim=1, keepdim=True
+                    )
+                    + prediction.current_delta_rotation.square().sum(
+                        dim=1, keepdim=True
+                    )
+                    + prediction.current_delta_log_scale.square().sum(
+                        dim=1, keepdim=True
+                    )
+                    + prediction.current_delta_opacity_logit.square()
+                    + prediction.current_delta_harmonics.square().mean(
+                        dim=1, keepdim=True
+                    )
+                )
+                new_residual_magnitudes.append(new_residual_energy.mean().sqrt())
+                new_residual_gates.append(
+                    prediction.current_residual_gate.sigmoid().mean()
+                )
+            else:
+                new_residual_energy = prediction.add_logit.new_zeros(())
 
             coverage = gir.valid.to(prediction.add_logit.dtype)
             visible_ratios.append(coverage.mean())
@@ -722,6 +806,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 (residual_energy * coverage).sum() / valid_normalizer
                 + covered_add.sum() / valid_normalizer
                 + uncovered_missing.mean()
+                + new_residual_energy.mean()
             )
 
             if state is None:
@@ -808,6 +893,23 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             if dominant_weight_means:
                 encoder_output.infos["gir_dominant_weight"] = torch.stack(
                     dominant_weight_means
+                ).mean()
+            if new_residual_magnitudes:
+                encoder_output.infos["gir_new_residual_magnitude"] = torch.stack(
+                    new_residual_magnitudes
+                ).mean()
+                encoder_output.infos["gir_new_residual_gate"] = torch.stack(
+                    new_residual_gates
+                ).mean()
+            if history_only_losses:
+                encoder_output.infos["gir_history_loss"] = torch.stack(
+                    history_only_losses
+                ).mean()
+                encoder_output.infos["gir_history_before_error"] = torch.stack(
+                    history_before_errors
+                ).mean()
+                encoder_output.infos["gir_history_after_error"] = torch.stack(
+                    history_after_errors
                 ).mean()
             if auxiliary_losses:
                 encoder_output.infos["gir_aux_loss"] = torch.stack(
