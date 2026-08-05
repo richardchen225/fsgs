@@ -31,6 +31,10 @@ model:
     gir_aux_loss_weight: 0.25
     gir_history_loss_weight: 0.25
     gir_history_loss_interval: 4
+    gir_add_loss_weight: 0.01
+    gir_add_depth_tolerance: 0.15
+    gir_add_alpha_threshold: 0.5
+    gir_add_prior_floor: 0.02
     gir_regularization_weight: 1e-4
     
 dataset:

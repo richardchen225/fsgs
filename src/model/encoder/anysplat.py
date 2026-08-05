@@ -123,6 +123,10 @@ class EncoderAnySplatCfg:
     gir_aux_loss_weight: float = 0.25
     gir_history_loss_weight: float = 0.25
     gir_history_loss_interval: int = 4
+    gir_add_loss_weight: float = 0.01
+    gir_add_depth_tolerance: float = 0.15
+    gir_add_alpha_threshold: float = 0.5
+    gir_add_prior_floor: float = 0.02
     gir_regularization_weight: float = 1e-4
 
 class CameraDec(nn.Module):

@@ -272,6 +272,31 @@ class ModelWrapper(LightningModule):
                 "train/gir_add_gate",
                 encoder_output.infos["gir_add_gate"].float(),
             )
+            if "gir_add_target" in encoder_output.infos:
+                self.log(
+                    "train/gir_add_target",
+                    encoder_output.infos["gir_add_target"].float(),
+                )
+                self.log(
+                    "train/gir_add_gate_covered",
+                    encoder_output.infos["gir_add_gate_covered"].float(),
+                )
+                self.log(
+                    "train/gir_add_gate_uncovered",
+                    encoder_output.infos["gir_add_gate_uncovered"].float(),
+                )
+                self.log(
+                    "train/gir_add_gate_supported",
+                    encoder_output.infos["gir_add_gate_supported"].float(),
+                )
+                self.log(
+                    "train/gir_add_gate_unsupported",
+                    encoder_output.infos["gir_add_gate_unsupported"].float(),
+                )
+                self.log(
+                    "train/gir_effective_new_ratio",
+                    encoder_output.infos["gir_effective_new_ratio"].float(),
+                )
             self.log(
                 "train/gir_historical_gate",
                 encoder_output.infos["gir_historical_gate"].float(),
@@ -351,6 +376,14 @@ class ModelWrapper(LightningModule):
             )
             self.log("loss/gir_history", gir_history_loss.item())
             total_loss = total_loss + gir_history_weight * gir_history_loss
+        if (
+            encoder_output.infos is not None
+            and "gir_add_loss" in encoder_output.infos
+        ):
+            gir_add_loss = encoder_output.infos["gir_add_loss"]
+            gir_add_weight = float(self.model.encoder.cfg.gir_add_loss_weight)
+            self.log("loss/gir_add", gir_add_loss.item())
+            total_loss = total_loss + gir_add_weight * gir_add_loss
         if (
             encoder_output.infos is not None
             and "gir_regularization_loss" in encoder_output.infos
