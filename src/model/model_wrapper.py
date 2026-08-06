@@ -345,6 +345,19 @@ class ModelWrapper(LightningModule):
                     "train/gir_history_improvement",
                     history_before - history_after,
                 )
+            if "gir_history_past_before_error" in encoder_output.infos:
+                self.log(
+                    "train/gir_history_past_before_error",
+                    encoder_output.infos["gir_history_past_before_error"].float(),
+                )
+                self.log(
+                    "train/gir_history_past_after_error",
+                    encoder_output.infos["gir_history_past_after_error"].float(),
+                )
+                self.log(
+                    "train/gir_history_past_degradation",
+                    encoder_output.infos["gir_history_past_degradation"].float(),
+                )
         
         target_gt = (batch["context"]["image"] + 1) / 2
         num_context_views = target_gt.shape[1]
@@ -368,14 +381,29 @@ class ModelWrapper(LightningModule):
             total_loss = total_loss + gir_aux_weight * gir_aux_loss
         if (
             encoder_output.infos is not None
-            and "gir_history_loss" in encoder_output.infos
+            and "gir_history_adapt_loss" in encoder_output.infos
         ):
-            gir_history_loss = encoder_output.infos["gir_history_loss"]
-            gir_history_weight = float(
-                self.model.encoder.cfg.gir_history_loss_weight
+            gir_history_adapt = encoder_output.infos["gir_history_adapt_loss"]
+            adapt_weight = float(
+                self.model.encoder.cfg.gir_history_adapt_weight
             )
-            self.log("loss/gir_history", gir_history_loss.item())
-            total_loss = total_loss + gir_history_weight * gir_history_loss
+            self.log("loss/gir_history_adapt", gir_history_adapt.item())
+            total_loss = total_loss + adapt_weight * gir_history_adapt
+        if (
+            encoder_output.infos is not None
+            and "gir_history_preserve_loss" in encoder_output.infos
+        ):
+            gir_history_preserve = encoder_output.infos[
+                "gir_history_preserve_loss"
+            ]
+            preserve_weight = float(
+                self.model.encoder.cfg.gir_history_preserve_weight
+            )
+            self.log(
+                "loss/gir_history_preserve",
+                gir_history_preserve.item(),
+            )
+            total_loss = total_loss + preserve_weight * gir_history_preserve
         if (
             encoder_output.infos is not None
             and "gir_add_loss" in encoder_output.infos

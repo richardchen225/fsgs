@@ -605,9 +605,13 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         depth_confidence = refine_info["depth_conf"]
         state: Optional[StreamingGaussianState] = None
         auxiliary_losses = []
-        history_only_losses = []
+        history_adapt_losses = []
+        history_preserve_losses = []
         history_before_errors = []
         history_after_errors = []
+        history_past_before_errors = []
+        history_past_after_errors = []
+        history_past_degradations = []
         add_suppression_losses = []
         regularization_losses = []
         add_gates = []
@@ -690,33 +694,86 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             prediction.historical_gate = prediction.historical_gate - 4.0
 
             if has_history:
+                history_interval = max(
+                    1, int(getattr(cfg, "gir_history_loss_interval", 4))
+                )
+                supervise_history = (
+                    (view_idx + 1) % history_interval == 0
+                    or view_idx + 1 == source_views
+                )
+                adapt_weight = max(
+                    0.0,
+                    float(getattr(cfg, "gir_history_adapt_weight", 0.05)),
+                )
+                preserve_weight = max(
+                    0.0,
+                    float(getattr(cfg, "gir_history_preserve_weight", 0.10)),
+                )
+                replay_indices = []
+                history_before_render = None
+
+                if (
+                    self.training
+                    and supervise_history
+                    and preserve_weight > 0
+                ):
+                    replay_count = min(
+                        max(0, int(getattr(cfg, "gir_history_replay_views", 1))),
+                        view_idx,
+                    )
+                    if replay_count > 0:
+                        # Replay the source views from the previous TBPTT chunk.
+                        # This is deterministic across DDP ranks and strictly causal.
+                        replay_start = max(0, view_idx - history_interval)
+                        replay_indices = list(
+                            range(
+                                replay_start,
+                                min(view_idx, replay_start + replay_count),
+                            )
+                        )
+                        replay_views = len(replay_indices)
+                        with torch.no_grad():
+                            history_before_render = self.decoder.forward(
+                                state.gaussians,
+                                pred_all_extrinsic[:, replay_indices],
+                                intrinsics[:, replay_indices],
+                                torch.full(
+                                    (b, replay_views),
+                                    near,
+                                    device=features.device,
+                                ),
+                                torch.full(
+                                    (b, replay_views),
+                                    far,
+                                    device=features.device,
+                                ),
+                                (low_h, low_w),
+                                "depth",
+                            )
+
                 state = state.update_historical(
                     gir,
                     prediction,
                     pred_all_extrinsic[:, view_idx],
                 )
 
-                history_interval = max(
-                    1, int(getattr(cfg, "gir_history_loss_interval", 4))
-                )
-                supervise_history = (
-                    (view_idx + 1) % history_interval == 0
-                    or (
-                        source_views < history_interval
-                        and view_idx + 1 == source_views
-                    )
-                )
                 if (
                     self.training
-                    and cfg.gir_history_loss_weight > 0
                     and supervise_history
+                    and (adapt_weight > 0 or replay_indices)
                 ):
-                    history_render = self.decoder.forward(
+                    render_indices = [view_idx] + replay_indices
+                    render_views = len(render_indices)
+                    history_after_render = self.decoder.forward(
                         state.gaussians,
-                        pred_all_extrinsic[:, view_idx : view_idx + 1],
-                        intrinsics[:, view_idx : view_idx + 1],
-                        torch.full((b, 1), near, device=features.device),
-                        torch.full((b, 1), far, device=features.device),
+                        pred_all_extrinsic[:, render_indices],
+                        intrinsics[:, render_indices],
+                        torch.full(
+                            (b, render_views), near, device=features.device
+                        ),
+                        torch.full(
+                            (b, render_views), far, device=features.device
+                        ),
                         (low_h, low_w),
                         "depth",
                     )
@@ -725,25 +782,112 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                         size=(low_h, low_w),
                         mode="bilinear",
                         align_corners=False,
-                    ).to(history_render.color.dtype)
-                    history_mask = gir.valid.to(history_render.color.dtype)
+                    ).to(history_after_render.color.dtype)
+                    history_mask = gir.valid.to(history_after_render.color.dtype)
                     history_normalizer = history_mask.sum().clamp_min(1.0)
                     before_error = torch.sqrt(
                         (gir.rgb.to(history_target.dtype) - history_target).square()
                         + 1e-6
                     ).mean(dim=1, keepdim=True)
                     after_error = torch.sqrt(
-                        (history_render.color[:, 0] - history_target).square()
+                        (history_after_render.color[:, 0] - history_target).square()
                         + 1e-6
                     ).mean(dim=1, keepdim=True)
-                    history_before_errors.append(
-                        (before_error * history_mask).sum() / history_normalizer
-                    )
                     history_after = (
                         after_error * history_mask
                     ).sum() / history_normalizer
-                    history_after_errors.append(history_after.detach())
-                    history_only_losses.append(history_after)
+                    if adapt_weight > 0:
+                        history_before_errors.append(
+                            (before_error * history_mask).sum()
+                            / history_normalizer
+                        )
+                        history_after_errors.append(history_after.detach())
+                        history_adapt_losses.append(history_after)
+
+                    if replay_indices and history_before_render is not None:
+                        replay_views = len(replay_indices)
+                        replay_target = context_image[:, replay_indices]
+                        replay_target = rearrange(
+                            replay_target,
+                            "b v c h w -> (b v) c h w",
+                        )
+                        replay_target = F.interpolate(
+                            replay_target.float(),
+                            size=(low_h, low_w),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        replay_target = rearrange(
+                            replay_target,
+                            "(b v) c h w -> b v c h w",
+                            b=b,
+                            v=replay_views,
+                        ).to(history_after_render.color.dtype)
+
+                        replay_before_color = history_before_render.color
+                        replay_after_color = history_after_render.color[:, 1:]
+                        replay_before_error = torch.sqrt(
+                            (replay_before_color - replay_target).square()
+                            + 1e-6
+                        ).mean(dim=2, keepdim=True)
+                        replay_after_error = torch.sqrt(
+                            (replay_after_color - replay_target).square()
+                            + 1e-6
+                        ).mean(dim=2, keepdim=True)
+
+                        if history_before_render.alpha is None:
+                            replay_mask = torch.ones_like(replay_before_error)
+                        else:
+                            replay_alpha = self._normalize_render_alpha(
+                                history_before_render.alpha,
+                                b,
+                                replay_views,
+                                low_h,
+                                low_w,
+                            )
+                            replay_mask = (replay_alpha > 1e-4).to(
+                                replay_before_error.dtype
+                            )
+
+                        replay_normalizer = replay_mask.sum().clamp_min(1.0)
+                        replay_degradation = (
+                            replay_after_error - replay_before_error.detach()
+                        )
+                        preserve_margin = max(
+                            0.0,
+                            float(
+                                getattr(
+                                    cfg,
+                                    "gir_history_preserve_margin",
+                                    0.002,
+                                )
+                            ),
+                        )
+                        preserve_penalty = F.relu(
+                            replay_degradation - preserve_margin
+                        )
+                        history_preserve_losses.append(
+                            (preserve_penalty * replay_mask).sum()
+                            / replay_normalizer
+                        )
+                        history_past_before_errors.append(
+                            (
+                                replay_before_error.detach() * replay_mask
+                            ).sum()
+                            / replay_normalizer
+                        )
+                        history_past_after_errors.append(
+                            (
+                                replay_after_error.detach() * replay_mask
+                            ).sum()
+                            / replay_normalizer
+                        )
+                        history_past_degradations.append(
+                            (
+                                replay_degradation.detach() * replay_mask
+                            ).sum()
+                            / replay_normalizer
+                        )
 
                 current_gaussians = apply_current_gaussian_residual(
                     current_gaussians,
@@ -1005,15 +1149,28 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 encoder_output.infos["gir_new_residual_gate"] = torch.stack(
                     new_residual_gates
                 ).mean()
-            if history_only_losses:
-                encoder_output.infos["gir_history_loss"] = torch.stack(
-                    history_only_losses
+            if history_adapt_losses:
+                encoder_output.infos["gir_history_adapt_loss"] = torch.stack(
+                    history_adapt_losses
                 ).mean()
                 encoder_output.infos["gir_history_before_error"] = torch.stack(
                     history_before_errors
                 ).mean()
                 encoder_output.infos["gir_history_after_error"] = torch.stack(
                     history_after_errors
+                ).mean()
+            if history_preserve_losses:
+                encoder_output.infos["gir_history_preserve_loss"] = torch.stack(
+                    history_preserve_losses
+                ).mean()
+                encoder_output.infos["gir_history_past_before_error"] = torch.stack(
+                    history_past_before_errors
+                ).mean()
+                encoder_output.infos["gir_history_past_after_error"] = torch.stack(
+                    history_past_after_errors
+                ).mean()
+                encoder_output.infos["gir_history_past_degradation"] = torch.stack(
+                    history_past_degradations
                 ).mean()
             if auxiliary_losses:
                 encoder_output.infos["gir_aux_loss"] = torch.stack(

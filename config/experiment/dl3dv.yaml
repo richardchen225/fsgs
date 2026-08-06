@@ -29,8 +29,11 @@ model:
     gir_tbptt_chunk: 4
     gir_replay_views: 1
     gir_aux_loss_weight: 0.25
-    gir_history_loss_weight: 0.25
+    gir_history_adapt_weight: 0.0
+    gir_history_preserve_weight: 0.0
     gir_history_loss_interval: 4
+    gir_history_preserve_margin: 0.002
+    gir_history_replay_views: 1
     gir_add_loss_weight: 0.01
     gir_add_depth_tolerance: 0.15
     gir_add_alpha_threshold: 0.5
