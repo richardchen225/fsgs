@@ -227,9 +227,30 @@ class StreamingGaussianState:
             ),
         )
 
-    def append(self, current: Gaussians, add_gate: torch.Tensor) -> "StreamingGaussianState":
+    def append(
+        self,
+        current: Gaussians,
+        add_gate: torch.Tensor,
+        prune_threshold: float = 0.0,
+    ) -> "StreamingGaussianState":
         b, n = current.means.shape[:2]
         gate = add_gate.reshape(b, n).to(current.opacities.dtype)
+        if prune_threshold > 0.0:
+            if b != 1:
+                raise RuntimeError(
+                    "Test-only GIR gate pruning currently requires batch size 1."
+                )
+            keep = gate[0] >= prune_threshold
+            current = Gaussians(
+                means=current.means[:, keep],
+                harmonics=current.harmonics[:, keep],
+                opacities=current.opacities[:, keep],
+                scales=current.scales[:, keep],
+                rotations=current.rotations[:, keep],
+            )
+            gate = gate[:, keep]
+            n = int(keep.sum().item())
+
         first_new_id = self.stable_ids.max(dim=1, keepdim=True).values + 1
         offsets = torch.arange(n, device=current.means.device, dtype=torch.long)
         new_ids = first_new_id + offsets.unsqueeze(0)
@@ -266,6 +287,7 @@ class StreamingGaussianState:
         gir: DominantGIR,
         prediction: GIRPrediction,
         camera_to_world: torch.Tensor,
+        update_confidence: torch.Tensor | None = None,
     ) -> "StreamingGaussianState":
         b, n = self.gaussians.means.shape[:2]
         harmonics_flat = _flatten_harmonics(self.gaussians.harmonics)
@@ -290,6 +312,11 @@ class StreamingGaussianState:
             contribution = gir.dominant_weight[batch_idx].reshape(-1).clamp_min(0.0)
             support_weight = visible * contribution
             update_weight = support_weight * gate * damping
+            if update_confidence is not None:
+                confidence = update_confidence[batch_idx].reshape(-1).to(
+                    update_weight.dtype
+                )
+                update_weight = update_weight * confidence
 
             depth = gir.depth[batch_idx].reshape(-1).clamp_min(1e-4)
             delta_mean_camera = prediction.delta_mean_camera[batch_idx]

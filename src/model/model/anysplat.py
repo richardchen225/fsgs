@@ -572,12 +572,52 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         ctx_img_num: int,
         near: float,
         far: float,
+        test_add_gate_prune_threshold: float = 0.0,
+        test_top1_confidence_mode: str = "inherit",
+        test_top1_confidence_floor: float = 0.25,
     ) -> Gaussians:
         refine_info = None if encoder_output.infos is None else encoder_output.infos.get("gs_refine")
         if refine_info is None:
             raise RuntimeError("GIR is enabled, but the encoder did not return per-view GS data.")
 
         cfg = self.encoder.cfg
+        prune_threshold = float(test_add_gate_prune_threshold)
+        if not 0.0 <= prune_threshold <= 1.0:
+            raise ValueError(
+                "GIR add-gate prune threshold must be in [0, 1], "
+                f"got {prune_threshold}."
+            )
+        if self.training and prune_threshold > 0.0:
+            raise RuntimeError("GIR add-gate pruning is test-only.")
+        requested_confidence_mode = str(test_top1_confidence_mode)
+        if requested_confidence_mode not in {
+            "inherit",
+            "none",
+            "floor_sqrt",
+            "sqrt",
+        }:
+            raise ValueError(
+                "GIR top-1 confidence mode must be one of "
+                "inherit, none, floor_sqrt, sqrt; "
+                f"got {requested_confidence_mode}."
+            )
+        if requested_confidence_mode == "inherit":
+            top1_confidence_mode = str(
+                getattr(cfg, "gir_top1_confidence_mode", "none")
+            )
+            confidence_floor = float(
+                getattr(cfg, "gir_top1_confidence_floor", 0.25)
+            )
+        else:
+            top1_confidence_mode = requested_confidence_mode
+            confidence_floor = float(test_top1_confidence_floor)
+        if top1_confidence_mode not in {"none", "floor_sqrt", "sqrt"}:
+            raise ValueError(
+                "Configured GIR top-1 confidence mode must be one of "
+                "none, floor_sqrt, sqrt; "
+                f"got {top1_confidence_mode}."
+            )
+        confidence_floor = max(0.0, min(1.0, confidence_floor))
         use_raster_evidence = bool(
             getattr(cfg, "gir_raster_evidence_enabled", False)
         )
@@ -621,6 +661,20 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         supported_add_gates = []
         unsupported_add_gates = []
         effective_new_ratios = []
+        new_opacity_mass_ratios = []
+        low_add_gate_ratios = {0.1: [], 0.2: []}
+        effective_new_threshold_ratios = {
+            0.001: [],
+            0.003: [],
+            0.005: [],
+            0.01: [],
+        }
+        test_pruned_new_ratios = []
+        top1_ownership_means = []
+        top1_ownership_above_0_1 = []
+        top1_ownership_above_0_25 = []
+        top1_ownership_above_0_5 = []
+        top1_confidence_means = []
         historical_gates = []
         visible_ratios = []
         residual_magnitudes = []
@@ -751,10 +805,50 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                                 "depth",
                             )
 
+                evidence_alpha = (
+                    gir.raster_alpha if use_raster_evidence else gir.opacity
+                ).detach().float()
+                ownership = (
+                    gir.dominant_weight.detach().float()
+                    / evidence_alpha.clamp_min(1e-6)
+                ).clamp(0.0, 1.0)
+                valid_float = gir.valid.detach().float()
+                valid_count = valid_float.sum().clamp_min(1.0)
+                top1_ownership_means.append(
+                    (ownership * valid_float).sum() / valid_count
+                )
+                top1_ownership_above_0_1.append(
+                    ((ownership > 0.1).float() * valid_float).sum()
+                    / valid_count
+                )
+                top1_ownership_above_0_25.append(
+                    ((ownership > 0.25).float() * valid_float).sum()
+                    / valid_count
+                )
+                top1_ownership_above_0_5.append(
+                    ((ownership > 0.5).float() * valid_float).sum()
+                    / valid_count
+                )
+                historical_update_confidence = None
+                if top1_confidence_mode == "sqrt":
+                    historical_update_confidence = ownership.sqrt()
+                elif top1_confidence_mode == "floor_sqrt":
+                    historical_update_confidence = confidence_floor + (
+                        1.0 - confidence_floor
+                    ) * ownership.sqrt()
+                if historical_update_confidence is None:
+                    top1_confidence_means.append(ownership.new_ones(()))
+                else:
+                    top1_confidence_means.append(
+                        (historical_update_confidence * valid_float).sum()
+                        / valid_count
+                    )
+
                 state = state.update_historical(
                     gir,
                     prediction,
                     pred_all_extrinsic[:, view_idx],
+                    update_confidence=historical_update_confidence,
                 )
 
                 if (
@@ -1017,6 +1111,19 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 effective_new_ratios.append(
                     (effective_opacity > cfg.opacity_threshold).float().mean()
                 )
+                if not self.training:
+                    original_opacity_float = current_gaussians.opacities.float()
+                    effective_opacity_float = effective_opacity.float()
+                    new_opacity_mass_ratios.append(
+                        effective_opacity_float.sum()
+                        / original_opacity_float.sum().clamp_min(1e-8)
+                    )
+                    for threshold, ratios in low_add_gate_ratios.items():
+                        ratios.append((add_gate < threshold).float().mean())
+                    for threshold, ratios in effective_new_threshold_ratios.items():
+                        ratios.append(
+                            (effective_opacity_float > threshold).float().mean()
+                        )
             historical_gates.append(
                 (prediction.historical_gate.sigmoid() * coverage).sum()
                 / coverage.sum().clamp_min(1.0)
@@ -1041,7 +1148,17 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     add_gate,
                 )
             else:
-                state = state.append(current_gaussians, add_gate)
+                if not self.training:
+                    test_pruned_new_ratios.append(
+                        (add_gate < prune_threshold).float().mean()
+                        if prune_threshold > 0.0
+                        else add_gate.new_zeros(())
+                    )
+                state = state.append(
+                    current_gaussians,
+                    add_gate,
+                    prune_threshold=prune_threshold,
+                )
 
             if self.training and cfg.gir_aux_loss_weight > 0:
                 replay_count = max(0, int(cfg.gir_replay_views))
@@ -1102,6 +1219,46 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             encoder_output.infos["gir_map_gaussians"] = torch.tensor(
                 state.num_gaussians, device=features.device
             )
+            if test_pruned_new_ratios:
+                unpruned_map_gaussians = source_views * gaussians_per_view
+                encoder_output.infos["gir_test_prune_threshold"] = torch.tensor(
+                    prune_threshold,
+                    device=features.device,
+                )
+                encoder_output.infos["gir_test_pruned_new_ratio"] = torch.stack(
+                    test_pruned_new_ratios
+                ).mean()
+                encoder_output.infos["gir_test_map_reduction_ratio"] = torch.tensor(
+                    1.0 - state.num_gaussians / max(unpruned_map_gaussians, 1),
+                    device=features.device,
+                )
+            if top1_ownership_means:
+                encoder_output.infos[
+                    "gir_top1_confidence_mode_code"
+                ] = torch.tensor(
+                    {"none": 0.0, "floor_sqrt": 1.0, "sqrt": 2.0}[
+                        top1_confidence_mode
+                    ],
+                    device=features.device,
+                )
+                encoder_output.infos[
+                    "gir_top1_confidence_floor"
+                ] = torch.tensor(confidence_floor, device=features.device)
+                encoder_output.infos["gir_top1_ownership_mean"] = torch.stack(
+                    top1_ownership_means
+                ).mean()
+                encoder_output.infos[
+                    "gir_top1_ownership_above_0_1_ratio"
+                ] = torch.stack(top1_ownership_above_0_1).mean()
+                encoder_output.infos[
+                    "gir_top1_ownership_above_0_25_ratio"
+                ] = torch.stack(top1_ownership_above_0_25).mean()
+                encoder_output.infos[
+                    "gir_top1_ownership_above_0_5_ratio"
+                ] = torch.stack(top1_ownership_above_0_5).mean()
+                encoder_output.infos["gir_top1_confidence_mean"] = torch.stack(
+                    top1_confidence_means
+                ).mean()
             encoder_output.infos["gir_add_gate"] = torch.stack(add_gates).mean()
             if add_suppression_losses:
                 encoder_output.infos["gir_add_loss"] = torch.stack(
@@ -1125,6 +1282,20 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 encoder_output.infos["gir_effective_new_ratio"] = torch.stack(
                     effective_new_ratios
                 ).mean()
+                if new_opacity_mass_ratios:
+                    encoder_output.infos[
+                        "gir_new_opacity_mass_ratio"
+                    ] = torch.stack(new_opacity_mass_ratios).mean()
+                    for threshold, ratios in low_add_gate_ratios.items():
+                        suffix = str(threshold).replace(".", "_")
+                        encoder_output.infos[
+                            f"gir_add_gate_below_{suffix}_ratio"
+                        ] = torch.stack(ratios).mean()
+                    for threshold, ratios in effective_new_threshold_ratios.items():
+                        suffix = str(threshold).replace(".", "_")
+                        encoder_output.infos[
+                            f"gir_effective_new_above_{suffix}_ratio"
+                        ] = torch.stack(ratios).mean()
             encoder_output.infos["gir_historical_gate"] = torch.stack(
                 historical_gates
             ).mean()
@@ -1191,6 +1362,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         ctx_img_num: int,
         near: float,
         far: float,
+        test_add_gate_prune_threshold: float = 0.0,
+        test_top1_confidence_mode: str = "inherit",
+        test_top1_confidence_floor: float = 0.25,
     ) -> Gaussians:
         if self.gir_update_head is not None:
             return self._update_streaming_gaussians(
@@ -1201,6 +1375,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 ctx_img_num,
                 near,
                 far,
+                test_add_gate_prune_threshold,
+                test_top1_confidence_mode,
+                test_top1_confidence_floor,
             )
         if self.gs_residual_refiner is None:
             return encoder_output.gaussians

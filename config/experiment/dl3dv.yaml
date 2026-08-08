@@ -25,6 +25,8 @@ model:
     gir_raster_evidence_enabled: true
     gir_dominant_id_enabled: true
     gir_dominant_min_weight: 1e-4
+    gir_top1_confidence_mode: floor_sqrt
+    gir_top1_confidence_floor: 0.25
     gir_hidden_dim: 64
     gir_tbptt_chunk: 4
     gir_replay_views: 1

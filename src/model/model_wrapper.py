@@ -85,6 +85,11 @@ class TestCfg:
     generate_video: bool
     mode: Literal["inference", "evaluation"]
     image_folder: str
+    gir_add_gate_prune_threshold: float = 0.0
+    gir_test_top1_confidence_mode: Literal[
+        "inherit", "none", "floor_sqrt", "sqrt"
+    ] = "inherit"
+    gir_test_top1_confidence_floor: float = 0.25
 
 
 @dataclass
@@ -323,6 +328,19 @@ class ModelWrapper(LightningModule):
                     "train/gir_dominant_weight",
                     encoder_output.infos["gir_dominant_weight"].float(),
                 )
+            for metric_name in (
+                "gir_top1_ownership_mean",
+                "gir_top1_confidence_mean",
+                "gir_top1_ownership_above_0_1_ratio",
+                "gir_top1_ownership_above_0_25_ratio",
+                "gir_top1_confidence_mode_code",
+                "gir_top1_confidence_floor",
+            ):
+                if metric_name in encoder_output.infos:
+                    self.log(
+                        f"train/{metric_name}",
+                        encoder_output.infos[metric_name].float(),
+                    )
             if "gir_new_residual_magnitude" in encoder_output.infos:
                 self.log(
                     "train/gir_new_residual_magnitude",
@@ -703,6 +721,15 @@ class ModelWrapper(LightningModule):
                     ctx_img_num,
                     0.01,
                     100.0,
+                    test_add_gate_prune_threshold=(
+                        self.test_cfg.gir_add_gate_prune_threshold
+                    ),
+                    test_top1_confidence_mode=(
+                        self.test_cfg.gir_test_top1_confidence_mode
+                    ),
+                    test_top1_confidence_floor=(
+                        self.test_cfg.gir_test_top1_confidence_floor
+                    ),
                 )
                 if (
                     encoder_output.infos is not None
@@ -728,6 +755,85 @@ class ModelWrapper(LightningModule):
                             "GIR test rollout did not consume all causal context views: "
                             f"history={final_history}, expected={ctx_img_num - 1}."
                         )
+
+        if (
+            encoder_output.infos is not None
+            and "gir_map_gaussians" in encoder_output.infos
+        ):
+            opacity = gaussians.opacities.detach().float()
+            gir_diagnostics = {
+                "map_gaussians": float(opacity.numel()),
+                "map_opacity_mean": opacity.mean().item(),
+                "map_opacity_mass": opacity.sum().item(),
+            }
+            for threshold in (0.001, 0.003, 0.005, 0.01):
+                suffix = str(threshold).replace(".", "_")
+                gir_diagnostics[f"map_above_{suffix}_ratio"] = (
+                    (opacity > threshold).float().mean().item()
+                )
+
+            info_keys = (
+                "gir_add_gate",
+                "gir_add_target",
+                "gir_add_gate_supported",
+                "gir_add_gate_unsupported",
+                "gir_new_opacity_mass_ratio",
+                "gir_add_gate_below_0_1_ratio",
+                "gir_add_gate_below_0_2_ratio",
+                "gir_effective_new_above_0_001_ratio",
+                "gir_effective_new_above_0_003_ratio",
+                "gir_effective_new_above_0_005_ratio",
+                "gir_effective_new_above_0_01_ratio",
+                "gir_test_prune_threshold",
+                "gir_test_pruned_new_ratio",
+                "gir_test_map_reduction_ratio",
+                "gir_top1_ownership_mean",
+                "gir_top1_ownership_above_0_1_ratio",
+                "gir_top1_ownership_above_0_25_ratio",
+                "gir_top1_ownership_above_0_5_ratio",
+                "gir_top1_confidence_mean",
+                "gir_top1_confidence_mode_code",
+                "gir_top1_confidence_floor",
+            )
+            for key in info_keys:
+                if key in encoder_output.infos:
+                    gir_diagnostics[key.removeprefix("gir_")] = float(
+                        encoder_output.infos[key].detach().float().item()
+                    )
+
+            self.log_dict(
+                {
+                    f"test/gir_{key}": torch.tensor(value, device=opacity.device)
+                    for key, value in gir_diagnostics.items()
+                },
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+            self._record_test_gir_diagnostics(gir_diagnostics)
+
+            scene_name = str(batch["scene"][0])
+            print(
+                "[GIR TEST] "
+                f"scene={scene_name} "
+                f"top1_mode_code="
+                f"{gir_diagnostics.get('top1_confidence_mode_code', float('nan')):.0f} "
+                f"prune_threshold="
+                f"{gir_diagnostics.get('test_prune_threshold', 0.0):.3f} "
+                f"pruned_new="
+                f"{gir_diagnostics.get('test_pruned_new_ratio', 0.0):.4f} "
+                f"map_reduction="
+                f"{gir_diagnostics.get('test_map_reduction_ratio', 0.0):.4f} "
+                f"map={int(gir_diagnostics['map_gaussians'])} "
+                f"opacity_mass_ratio="
+                f"{gir_diagnostics.get('new_opacity_mass_ratio', float('nan')):.4f} "
+                f"add_gate={gir_diagnostics.get('add_gate', float('nan')):.4f} "
+                f"gate<0.1="
+                f"{gir_diagnostics.get('add_gate_below_0_1_ratio', float('nan')):.4f} "
+                f"map>0.001={gir_diagnostics['map_above_0_001_ratio']:.4f} "
+                f"map>0.005={gir_diagnostics['map_above_0_005_ratio']:.4f} "
+                f"map>0.01={gir_diagnostics['map_above_0_01_ratio']:.4f}"
+            )
         # if self.global_rank == 0:
         # export_ply(gaussians.means[0], gaussians.scales[0], gaussians.rotations[0], gaussians.harmonics[0].permute(0,2,1), single_opacities, Path(f"gaussians_{[x[:20] for x in batch['scene']]}.ply"))
         
@@ -955,6 +1061,77 @@ class ModelWrapper(LightningModule):
 
     def on_test_end(self) -> None:
         self.benchmarker.summarize()
+        self._print_test_gir_diagnostics()
+
+    def _record_test_gir_diagnostics(
+        self,
+        diagnostics: dict[str, float],
+    ) -> None:
+        if not hasattr(self, "_test_gir_diagnostic_sums"):
+            self._test_gir_diagnostic_sums = {
+                key: 0.0 for key in diagnostics
+            }
+            self._test_gir_diagnostic_count = 0
+        for key, value in diagnostics.items():
+            self._test_gir_diagnostic_sums[key] += value
+        self._test_gir_diagnostic_count += 1
+
+    def _print_test_gir_diagnostics(self) -> None:
+        if not hasattr(self, "_test_gir_diagnostic_sums"):
+            return
+
+        keys = sorted(self._test_gir_diagnostic_sums)
+        values = [self._test_gir_diagnostic_sums[key] for key in keys]
+        values.append(float(self._test_gir_diagnostic_count))
+        totals = torch.tensor(values, device=self.device, dtype=torch.float64)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
+
+        if self.global_rank != 0:
+            return
+
+        count = totals[-1].item()
+        averages = {
+            key: totals[index].item() / max(count, 1.0)
+            for index, key in enumerate(keys)
+        }
+        print("\n[GIR TEST SUMMARY]")
+        print(f"scenes={int(count)}")
+        for key in (
+            "map_gaussians",
+            "map_opacity_mean",
+            "map_opacity_mass",
+            "test_prune_threshold",
+            "test_pruned_new_ratio",
+            "test_map_reduction_ratio",
+            "top1_ownership_mean",
+            "top1_ownership_above_0_1_ratio",
+            "top1_ownership_above_0_25_ratio",
+            "top1_ownership_above_0_5_ratio",
+            "top1_confidence_mean",
+            "top1_confidence_mode_code",
+            "top1_confidence_floor",
+            "new_opacity_mass_ratio",
+            "add_gate",
+            "add_target",
+            "add_gate_supported",
+            "add_gate_unsupported",
+            "add_gate_below_0_1_ratio",
+            "add_gate_below_0_2_ratio",
+            "effective_new_above_0_001_ratio",
+            "effective_new_above_0_003_ratio",
+            "effective_new_above_0_005_ratio",
+            "effective_new_above_0_01_ratio",
+            "map_above_0_001_ratio",
+            "map_above_0_003_ratio",
+            "map_above_0_005_ratio",
+            "map_above_0_01_ratio",
+        ):
+            if key in averages:
+                if key == "map_gaussians":
+                    print(f"{key}={averages[key]:.1f}")
+                else:
+                    print(f"{key}={averages[key]:.6f}")
 
     def print_preview_metrics(
         self,

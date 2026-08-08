@@ -39,3 +39,5 @@ add_view: false
 color_attr: 3D # 3D or RGB
 mlp_type: unified
 scaffold: true
+gir_top1_confidence_mode: none
+gir_top1_confidence_floor: 0.25
