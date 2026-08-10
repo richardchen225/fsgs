@@ -90,6 +90,13 @@ class TestCfg:
         "inherit", "none", "floor_sqrt", "sqrt"
     ] = "inherit"
     gir_test_top1_confidence_floor: float = 0.25
+    gir_test_correspondence_diagnostics: bool = False
+    gir_test_correspondence_topk: int = 8
+    gir_test_old_gs_final_prune_enabled: bool = False
+    gir_test_old_gs_prune_min_candidate_views: int = 2
+    gir_test_old_gs_prune_max_top1_rate: float = 0.0
+    gir_test_old_gs_prune_max_mean_weight: float = 0.01
+    gir_test_old_gs_prune_max_opacity: float = 1.0
 
 
 @dataclass
@@ -335,6 +342,8 @@ class ModelWrapper(LightningModule):
                 "gir_top1_ownership_above_0_25_ratio",
                 "gir_top1_confidence_mode_code",
                 "gir_top1_confidence_floor",
+                "gir_soft_update_topk",
+                "gir_soft_update_coverage_mean",
             ):
                 if metric_name in encoder_output.infos:
                     self.log(
@@ -730,6 +739,27 @@ class ModelWrapper(LightningModule):
                     test_top1_confidence_floor=(
                         self.test_cfg.gir_test_top1_confidence_floor
                     ),
+                    test_correspondence_diagnostics=(
+                        self.test_cfg.gir_test_correspondence_diagnostics
+                    ),
+                    test_correspondence_topk=(
+                        self.test_cfg.gir_test_correspondence_topk
+                    ),
+                    test_old_gs_final_prune_enabled=(
+                        self.test_cfg.gir_test_old_gs_final_prune_enabled
+                    ),
+                    test_old_gs_prune_min_candidate_views=(
+                        self.test_cfg.gir_test_old_gs_prune_min_candidate_views
+                    ),
+                    test_old_gs_prune_max_top1_rate=(
+                        self.test_cfg.gir_test_old_gs_prune_max_top1_rate
+                    ),
+                    test_old_gs_prune_max_mean_weight=(
+                        self.test_cfg.gir_test_old_gs_prune_max_mean_weight
+                    ),
+                    test_old_gs_prune_max_opacity=(
+                        self.test_cfg.gir_test_old_gs_prune_max_opacity
+                    ),
                 )
                 if (
                     encoder_output.infos is not None
@@ -794,6 +824,40 @@ class ModelWrapper(LightningModule):
                 "gir_top1_confidence_mean",
                 "gir_top1_confidence_mode_code",
                 "gir_top1_confidence_floor",
+                "gir_soft_update_topk",
+                "gir_soft_update_coverage_mean",
+                "gir_test_corr_top1_weight_mean",
+                "gir_test_corr_top2_weight_mean",
+                "gir_test_corr_top2_to_top1_mean",
+                "gir_test_corr_top1_top2_relative_gap_mean",
+                "gir_test_corr_top2_over_0_5_ratio",
+                "gir_test_corr_top2_over_0_8_ratio",
+                "gir_test_corr_significant_contributors_mean",
+                "gir_test_corr_multi_contributor_pixel_ratio",
+                "gir_test_corr_contributor_cap_ratio",
+                "gir_test_corr_matched_old_gs_per_view_ratio",
+                "gir_test_corr_pixels_per_matched_gs",
+                "gir_test_corr_matched_gs_ge_4_pixels_ratio",
+                "gir_test_corr_old_gs_with_future_view_ratio",
+                "gir_test_corr_never_top1_after_future_view_ratio",
+                "gir_test_corr_never_top1_after_2_future_views_ratio",
+                "gir_test_corr_old_gs_future_view_top1_rate",
+                "gir_test_corr_old_gs_top1_pixels_per_future_view",
+                "gir_test_corr_old_gs_candidate_visible_ratio",
+                "gir_test_corr_candidate_never_top1_ratio",
+                "gir_test_corr_top1_given_candidate_view_rate",
+                "gir_test_corr_topk",
+                "gir_test_old_gs_prune_enabled",
+                "gir_test_old_gs_prune_min_candidate_views",
+                "gir_test_old_gs_prune_max_top1_rate",
+                "gir_test_old_gs_prune_max_mean_weight",
+                "gir_test_old_gs_prune_max_opacity",
+                "gir_test_old_gs_prune_map_before",
+                "gir_test_old_gs_prune_map_after",
+                "gir_test_old_gs_prune_ratio",
+                "gir_test_old_gs_prune_candidate_eligible_ratio",
+                "gir_test_old_gs_prune_removed_opacity_mass_ratio",
+                "gir_test_old_gs_prune_safeguard_kept",
             )
             for key in info_keys:
                 if key in encoder_output.infos:
@@ -832,7 +896,24 @@ class ModelWrapper(LightningModule):
                 f"{gir_diagnostics.get('add_gate_below_0_1_ratio', float('nan')):.4f} "
                 f"map>0.001={gir_diagnostics['map_above_0_001_ratio']:.4f} "
                 f"map>0.005={gir_diagnostics['map_above_0_005_ratio']:.4f} "
-                f"map>0.01={gir_diagnostics['map_above_0_01_ratio']:.4f}"
+                f"map>0.01={gir_diagnostics['map_above_0_01_ratio']:.4f} "
+                f"top2/top1="
+                f"{gir_diagnostics.get('test_corr_top2_to_top1_mean', float('nan')):.4f} "
+                f"multi_pixel="
+                f"{gir_diagnostics.get('test_corr_multi_contributor_pixel_ratio', float('nan')):.4f} "
+                f"candidate_never_top1="
+                f"{gir_diagnostics.get('test_corr_candidate_never_top1_ratio', float('nan')):.4f} "
+                f"soft_k="
+                f"{gir_diagnostics.get('soft_update_topk', 1.0):.0f} "
+                f"soft_coverage="
+                f"{gir_diagnostics.get('soft_update_coverage_mean', float('nan')):.4f} "
+                f"old_pruned="
+                f"{gir_diagnostics.get('test_old_gs_prune_ratio', 0.0):.4f} "
+                f"old_map="
+                f"{gir_diagnostics.get('test_old_gs_prune_map_before', gir_diagnostics['map_gaussians']):.0f}->"
+                f"{gir_diagnostics.get('test_old_gs_prune_map_after', gir_diagnostics['map_gaussians']):.0f} "
+                f"old_opacity_removed="
+                f"{gir_diagnostics.get('test_old_gs_prune_removed_opacity_mass_ratio', 0.0):.4f}"
             )
         # if self.global_rank == 0:
         # export_ply(gaussians.means[0], gaussians.scales[0], gaussians.rotations[0], gaussians.harmonics[0].permute(0,2,1), single_opacities, Path(f"gaussians_{[x[:20] for x in batch['scene']]}.ply"))
@@ -1111,6 +1192,40 @@ class ModelWrapper(LightningModule):
             "top1_confidence_mean",
             "top1_confidence_mode_code",
             "top1_confidence_floor",
+            "test_corr_top1_weight_mean",
+            "test_corr_top2_weight_mean",
+            "test_corr_top2_to_top1_mean",
+            "test_corr_top1_top2_relative_gap_mean",
+            "test_corr_top2_over_0_5_ratio",
+            "test_corr_top2_over_0_8_ratio",
+            "test_corr_significant_contributors_mean",
+            "test_corr_multi_contributor_pixel_ratio",
+            "test_corr_contributor_cap_ratio",
+            "test_corr_matched_old_gs_per_view_ratio",
+            "test_corr_pixels_per_matched_gs",
+            "test_corr_matched_gs_ge_4_pixels_ratio",
+            "test_corr_old_gs_with_future_view_ratio",
+            "test_corr_never_top1_after_future_view_ratio",
+            "test_corr_never_top1_after_2_future_views_ratio",
+            "test_corr_old_gs_future_view_top1_rate",
+            "test_corr_old_gs_top1_pixels_per_future_view",
+            "test_corr_old_gs_candidate_visible_ratio",
+            "test_corr_candidate_never_top1_ratio",
+            "test_corr_top1_given_candidate_view_rate",
+            "test_corr_topk",
+            "soft_update_topk",
+            "soft_update_coverage_mean",
+            "test_old_gs_prune_enabled",
+            "test_old_gs_prune_min_candidate_views",
+            "test_old_gs_prune_max_top1_rate",
+            "test_old_gs_prune_max_mean_weight",
+            "test_old_gs_prune_max_opacity",
+            "test_old_gs_prune_map_before",
+            "test_old_gs_prune_map_after",
+            "test_old_gs_prune_ratio",
+            "test_old_gs_prune_candidate_eligible_ratio",
+            "test_old_gs_prune_removed_opacity_mass_ratio",
+            "test_old_gs_prune_safeguard_kept",
             "new_opacity_mass_ratio",
             "add_gate",
             "add_target",

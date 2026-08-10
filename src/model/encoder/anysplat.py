@@ -117,6 +117,7 @@ class EncoderAnySplatCfg:
     gir_raster_evidence_enabled: bool = False
     gir_dominant_id_enabled: bool = False
     gir_dominant_min_weight: float = 1e-4
+    gir_soft_update_topk: int = 1
     gir_top1_confidence_mode: Literal["none", "floor_sqrt", "sqrt"] = "none"
     gir_top1_confidence_floor: float = 0.25
     gir_hidden_dim: int = 64

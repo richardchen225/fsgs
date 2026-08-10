@@ -59,6 +59,8 @@ class DominantGIR:
     raster_depth: torch.Tensor
     raster_alpha: torch.Tensor
     dominant_weight: torch.Tensor
+    contributor_ids: torch.Tensor | None = None
+    contributor_weights: torch.Tensor | None = None
 
     @classmethod
     def empty(
@@ -203,6 +205,31 @@ class StreamingGaussianState:
             observation_count=self.observation_count.detach(),
         )
 
+    def select(self, keep: torch.Tensor) -> "StreamingGaussianState":
+        if self.batch_size != 1:
+            raise RuntimeError(
+                "Test-only GIR map selection currently requires batch size 1."
+            )
+        keep = keep.reshape(-1).to(device=self.gaussians.means.device, dtype=torch.bool)
+        if keep.numel() != self.num_gaussians:
+            raise ValueError(
+                "GIR map selection mask has the wrong size: "
+                f"mask={keep.numel()}, gaussians={self.num_gaussians}."
+            )
+        if not keep.any():
+            raise RuntimeError("GIR map selection cannot remove every Gaussian.")
+        return StreamingGaussianState(
+            gaussians=Gaussians(
+                means=self.gaussians.means[:, keep],
+                harmonics=self.gaussians.harmonics[:, keep],
+                opacities=self.gaussians.opacities[:, keep],
+                scales=self.gaussians.scales[:, keep],
+                rotations=self.gaussians.rotations[:, keep],
+            ),
+            stable_ids=self.stable_ids[:, keep],
+            observation_count=self.observation_count[:, keep],
+        )
+
     @classmethod
     def from_current(
         cls,
@@ -288,10 +315,40 @@ class StreamingGaussianState:
         prediction: GIRPrediction,
         camera_to_world: torch.Tensor,
         update_confidence: torch.Tensor | None = None,
+        num_contributors: int = 1,
     ) -> "StreamingGaussianState":
         b, n = self.gaussians.means.shape[:2]
         harmonics_flat = _flatten_harmonics(self.gaussians.harmonics)
         harmonic_dim = harmonics_flat.shape[-1]
+
+        num_contributors = max(1, int(num_contributors))
+        if (
+            num_contributors > 1
+            and gir.contributor_ids is not None
+            and gir.contributor_weights is not None
+        ):
+            contributor_count = min(
+                num_contributors, gir.contributor_ids.shape[1]
+            )
+            contributor_ids = gir.contributor_ids[:, :contributor_count]
+            contributor_weights = gir.contributor_weights[:, :contributor_count]
+        else:
+            contributor_count = 1
+            contributor_ids = gir.indices.unsqueeze(1)
+            contributor_weights = gir.dominant_weight.unsqueeze(1)
+
+        # The rasterizer is detached, but each contributor still uses its own
+        # camera-space depth when the shared pixel residual updates geometry.
+        with torch.no_grad():
+            means = self.gaussians.means.detach().float()
+            ones = torch.ones((b, n, 1), device=means.device, dtype=means.dtype)
+            means_h = torch.cat([means, ones], dim=-1)
+            world_to_camera = torch.linalg.inv(
+                camera_to_world.detach().float()
+            )
+            contributor_depths = torch.einsum(
+                "bij,bnj->bni", world_to_camera, means_h
+            )[..., 2]
 
         mean_updates = []
         rotation_updates = []
@@ -301,35 +358,70 @@ class StreamingGaussianState:
         observation_increments = []
 
         for batch_idx in range(b):
-            point_indices = gir.indices[batch_idx].reshape(-1)
-            valid = point_indices >= 0
-            safe_indices = point_indices.clamp_min(0)
-            visible = valid.to(self.gaussians.means.dtype)
+            point_indices = contributor_ids[batch_idx].reshape(
+                contributor_count, -1
+            )
+            contribution = contributor_weights[batch_idx].reshape(
+                contributor_count, -1
+            )
+            pixel_valid = gir.valid[batch_idx].reshape(1, -1)
+            valid = (
+                (point_indices >= 0)
+                & (point_indices < n)
+                & pixel_valid
+                & (contribution > 0)
+            )
+            safe_indices = point_indices.clamp_min(0).clamp_max(max(n - 1, 0))
+            depth = contributor_depths[batch_idx].gather(
+                0, safe_indices.reshape(-1)
+            ).reshape_as(safe_indices)
+            valid = valid & (depth > 1e-5)
+            depth = depth.clamp_min(1e-4)
 
             gate = prediction.historical_gate[batch_idx].reshape(-1).sigmoid()
-            old_count = self.observation_count[batch_idx].gather(0, safe_indices)
+            gate = gate.unsqueeze(0).expand(contributor_count, -1)
+            old_count = self.observation_count[batch_idx].gather(
+                0, safe_indices.reshape(-1)
+            ).reshape_as(safe_indices)
             damping = old_count.add(1.0).rsqrt()
-            contribution = gir.dominant_weight[batch_idx].reshape(-1).clamp_min(0.0)
-            support_weight = visible * contribution
-            update_weight = support_weight * gate * damping
+            support_weight = torch.where(
+                valid,
+                contribution.clamp_min(0.0),
+                torch.zeros_like(contribution),
+            )
+            assignment_weight = support_weight / support_weight.sum(
+                dim=0, keepdim=True
+            ).clamp_min(1e-8)
+            update_weight = assignment_weight * gate * damping
             if update_confidence is not None:
                 confidence = update_confidence[batch_idx].reshape(-1).to(
                     update_weight.dtype
                 )
-                update_weight = update_weight * confidence
+                update_weight = update_weight * confidence.unsqueeze(0)
 
-            depth = gir.depth[batch_idx].reshape(-1).clamp_min(1e-4)
+            def expand_pixels(values: torch.Tensor) -> torch.Tensor:
+                channels = values.shape[0]
+                values = values.permute(1, 2, 0).reshape(-1, channels)
+                return values.unsqueeze(0).expand(
+                    contributor_count, -1, -1
+                ).reshape(-1, values.shape[-1])
+
             delta_mean_camera = prediction.delta_mean_camera[batch_idx]
-            delta_mean_camera = delta_mean_camera.permute(1, 2, 0).reshape(-1, 3)
-            delta_mean_camera = delta_mean_camera.tanh() * depth.unsqueeze(-1)
+            delta_mean_camera = expand_pixels(delta_mean_camera).tanh()
+            delta_mean_camera = delta_mean_camera * depth.reshape(-1, 1).to(
+                delta_mean_camera.dtype
+            )
             rotation_c2w = camera_to_world[batch_idx, :3, :3].to(
                 delta_mean_camera.dtype
             )
             delta_mean_world = delta_mean_camera @ rotation_c2w.transpose(0, 1)
 
             def aggregate(values: torch.Tensor) -> torch.Tensor:
-                weighted = values * update_weight.unsqueeze(-1)
-                index = safe_indices.unsqueeze(-1).expand(-1, values.shape[-1])
+                flat_update_weight = update_weight.reshape(-1).to(values.dtype)
+                flat_support_count = valid.reshape(-1).to(values.dtype)
+                flat_indices = safe_indices.reshape(-1)
+                weighted = values * flat_update_weight.unsqueeze(-1)
+                index = flat_indices.unsqueeze(-1).expand(-1, values.shape[-1])
                 numerator = torch.zeros(
                     (n, values.shape[-1]),
                     device=values.device,
@@ -339,36 +431,38 @@ class StreamingGaussianState:
                     n,
                     device=values.device,
                     dtype=values.dtype,
-                ).scatter_add(0, safe_indices, support_weight)
+                ).scatter_add(0, flat_indices, flat_support_count)
                 return numerator / denominator.clamp_min(1e-8).unsqueeze(-1)
 
             mean_updates.append(aggregate(delta_mean_world))
 
             delta_rotation = prediction.delta_rotation[batch_idx]
-            delta_rotation = delta_rotation.permute(1, 2, 0).reshape(-1, 3).tanh()
+            delta_rotation = expand_pixels(delta_rotation).tanh()
             rotation_updates.append(aggregate(delta_rotation))
 
             delta_scale = prediction.delta_log_scale[batch_idx]
-            delta_scale = delta_scale.permute(1, 2, 0).reshape(-1, 3).tanh()
+            delta_scale = expand_pixels(delta_scale).tanh()
             scale_updates.append(aggregate(delta_scale))
 
             delta_opacity = prediction.delta_opacity_logit[batch_idx]
-            delta_opacity = delta_opacity.permute(1, 2, 0).reshape(-1, 1).tanh()
+            delta_opacity = expand_pixels(delta_opacity).tanh()
             opacity_updates.append(aggregate(delta_opacity))
 
             delta_harmonics = prediction.delta_harmonics[batch_idx]
-            delta_harmonics = delta_harmonics.permute(1, 2, 0).reshape(
-                -1, harmonic_dim
-            ).tanh()
+            delta_harmonics = expand_pixels(delta_harmonics).tanh()
             harmonic_updates.append(aggregate(delta_harmonics))
 
             observation_increments.append(
                 torch.zeros(
                     n,
-                    device=visible.device,
+                    device=valid.device,
                     dtype=self.observation_count.dtype,
                 )
-                .scatter_add(0, safe_indices, visible)
+                .scatter_add(
+                    0,
+                    safe_indices.reshape(-1),
+                    valid.reshape(-1).to(self.observation_count.dtype),
+                )
                 .clamp_max(1.0)
             )
 

@@ -41,6 +41,8 @@ class GIRRasterizationOutput:
     alpha: Tensor
     dominant_ids: Tensor
     dominant_weights: Tensor
+    contributor_ids: Tensor | None = None
+    contributor_weights: Tensor | None = None
 
 
 @torch.no_grad()
@@ -53,6 +55,7 @@ def _rasterize_top_contributor_fallback(
     image_width: int,
     image_height: int,
     tile_size: int,
+    num_depth_samples: int = 1,
 ) -> tuple[Tensor, Tensor]:
     """Reconstruct top alpha*T contributors with the gsplat 1.5.3 API."""
     if rasterize_to_indices_in_range is None:
@@ -65,16 +68,22 @@ def _rasterize_top_contributor_fallback(
     num_images = prod(image_dims)
     num_gaussians = means2d.shape[-2]
     pixel_count = image_height * image_width
-    output_shape = image_dims + (image_height, image_width, 1)
+    if num_depth_samples <= 0:
+        raise ValueError("num_depth_samples must be greater than zero.")
+    output_shape = image_dims + (
+        image_height,
+        image_width,
+        num_depth_samples,
+    )
 
     dominant_ids = torch.full(
-        (num_images * pixel_count,),
+        (num_images * pixel_count, num_depth_samples),
         -1,
         device=means2d.device,
         dtype=torch.long,
     )
     dominant_weights = torch.zeros(
-        (num_images * pixel_count,),
+        (num_images * pixel_count, num_depth_samples),
         device=means2d.device,
         dtype=means2d.dtype,
     )
@@ -150,37 +159,53 @@ def _rasterize_top_contributor_fallback(
         pair_alpha.dtype
     )
 
-    dominant_weights.scatter_reduce_(
-        0,
-        global_pixel_ids,
-        pair_weights,
-        reduce="amax",
-        include_self=True,
-    )
     pair_positions = torch.arange(
         gaussian_ids.numel(), device=gaussian_ids.device, dtype=torch.long
     )
     sentinel = gaussian_ids.numel()
-    winning_positions = torch.full_like(dominant_ids, sentinel)
-    is_winner = (pair_weights == dominant_weights[global_pixel_ids]) & (
-        pair_weights > 0
-    )
-    winning_positions.scatter_reduce_(
-        0,
-        global_pixel_ids,
-        torch.where(
-            is_winner,
-            pair_positions,
-            torch.full_like(pair_positions, sentinel),
-        ),
-        reduce="amin",
-        include_self=True,
-    )
-    valid = winning_positions < sentinel
-    dominant_ids[valid] = gaussian_ids[winning_positions[valid]]
-    dominant_weights = torch.where(
-        valid, dominant_weights, torch.zeros_like(dominant_weights)
-    )
+    remaining_weights = pair_weights.clone()
+    flat_pixel_count = num_images * pixel_count
+    for rank in range(num_depth_samples):
+        rank_weights = torch.zeros(
+            flat_pixel_count,
+            device=means2d.device,
+            dtype=means2d.dtype,
+        )
+        rank_weights.scatter_reduce_(
+            0,
+            global_pixel_ids,
+            remaining_weights,
+            reduce="amax",
+            include_self=True,
+        )
+        winning_positions = torch.full(
+            (flat_pixel_count,),
+            sentinel,
+            device=gaussian_ids.device,
+            dtype=torch.long,
+        )
+        is_winner = (
+            remaining_weights == rank_weights[global_pixel_ids]
+        ) & (remaining_weights > 0)
+        winning_positions.scatter_reduce_(
+            0,
+            global_pixel_ids,
+            torch.where(
+                is_winner,
+                pair_positions,
+                torch.full_like(pair_positions, sentinel),
+            ),
+            reduce="amin",
+            include_self=True,
+        )
+        valid = winning_positions < sentinel
+        dominant_weights[:, rank] = torch.where(
+            valid, rank_weights, torch.zeros_like(rank_weights)
+        )
+        dominant_ids[valid, rank] = gaussian_ids[winning_positions[valid]]
+        if not valid.any():
+            break
+        remaining_weights[winning_positions[valid]] = -1
     return dominant_ids.reshape(output_shape), dominant_weights.reshape(output_shape)
 
 
@@ -206,6 +231,7 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         extrinsics: Float[Tensor, "batch 4 4"],
         intrinsics: Float[Tensor, "batch 3 3"],
         image_shape: tuple[int, int],
+        num_top_contributors: int = 1,
     ) -> GIRRasterizationOutput:
         if (
             rasterize_top_contributing_gaussian_ids is None
@@ -216,6 +242,8 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
                 "rasterization API."
             )
 
+        num_top_contributors = max(1, int(num_top_contributors))
+        return_contributors = num_top_contributors > 1
         b = gaussians.means.shape[0]
         h, w = image_shape
         colors = []
@@ -223,6 +251,8 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         alphas = []
         dominant_ids = []
         dominant_weights = []
+        contributor_ids = []
+        contributor_weights = []
 
         for batch_idx in range(b):
             xyz = gaussians.means[batch_idx].float()
@@ -279,29 +309,60 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
                 "image_height": h,
                 "tile_size": info["tile_size"],
             }
-            if rasterize_top_contributing_gaussian_ids is not None:
-                ids, weights = rasterize_top_contributing_gaussian_ids(
+            def rasterize_contributors(count: int) -> tuple[Tensor, Tensor]:
+                if rasterize_top_contributing_gaussian_ids is not None:
+                    return rasterize_top_contributing_gaussian_ids(
+                        **contributor_args,
+                        num_depth_samples=count,
+                    )
+                return _rasterize_top_contributor_fallback(
                     **contributor_args,
-                    num_depth_samples=1,
+                    num_depth_samples=count,
                 )
-            else:
-                ids, weights = _rasterize_top_contributor_fallback(
-                    **contributor_args
-                )
-            expected_id_shape = (1, h, w, 1)
-            if ids.shape != expected_id_shape or weights.shape != expected_id_shape:
+
+            # Keep the legacy K=1 query unchanged for checkpoint-compatible
+            # evidence; the separate top-k query is only used for soft writeback.
+            dominant_id, dominant_weight = rasterize_contributors(1)
+            if return_contributors:
+                ids, weights = rasterize_contributors(num_top_contributors)
+                expected_topk_shape = (1, h, w, num_top_contributors)
+                if (
+                    ids.shape != expected_topk_shape
+                    or weights.shape != expected_topk_shape
+                ):
+                    raise RuntimeError(
+                        "Unexpected contributor GIR output shapes: "
+                        f"ids={tuple(ids.shape)}, weights={tuple(weights.shape)}, "
+                        f"expected={expected_topk_shape}."
+                    )
+                weights = torch.nan_to_num(
+                    weights.float(), nan=0.0, posinf=0.0, neginf=0.0
+                ).clamp_min_(0.0)
+                weight_order = weights.argsort(dim=-1, descending=True)
+                ids = ids.gather(-1, weight_order)
+                weights = weights.gather(-1, weight_order)
+
+            expected_dominant_shape = (1, h, w, 1)
+            if (
+                dominant_id.shape != expected_dominant_shape
+                or dominant_weight.shape != expected_dominant_shape
+            ):
                 raise RuntimeError(
                     "Unexpected dominant GIR output shapes: "
-                    f"ids={tuple(ids.shape)}, weights={tuple(weights.shape)}, "
-                    f"expected={expected_id_shape}."
+                    f"ids={tuple(dominant_id.shape)}, "
+                    f"weights={tuple(dominant_weight.shape)}, "
+                    f"expected={expected_dominant_shape}."
                 )
 
             rgb, depth = torch.split(rendering, [3, 1], dim=-1)
             colors.append(rgb[0].permute(2, 0, 1).clamp(0.0, 1.0))
             expected_depths.append(depth[0].permute(2, 0, 1))
             alphas.append(alpha[0].permute(2, 0, 1))
-            dominant_ids.append(ids[0, ..., 0].long())
-            dominant_weights.append(weights[0, ..., 0].unsqueeze(0))
+            dominant_ids.append(dominant_id[0, ..., 0].long())
+            dominant_weights.append(dominant_weight[0, ..., 0].unsqueeze(0))
+            if return_contributors:
+                contributor_ids.append(ids[0].permute(2, 0, 1).long())
+                contributor_weights.append(weights[0].permute(2, 0, 1))
 
         return GIRRasterizationOutput(
             color=torch.stack(colors),
@@ -309,6 +370,12 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             alpha=torch.stack(alphas),
             dominant_ids=torch.stack(dominant_ids),
             dominant_weights=torch.stack(dominant_weights),
+            contributor_ids=(
+                torch.stack(contributor_ids) if return_contributors else None
+            ),
+            contributor_weights=(
+                torch.stack(contributor_weights) if return_contributors else None
+            ),
         )
 
     def rendering_fn(
