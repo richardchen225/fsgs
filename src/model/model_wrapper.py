@@ -372,6 +372,10 @@ class ModelWrapper(LightningModule):
                     "train/gir_history_improvement",
                     history_before - history_after,
                 )
+                self.log(
+                    "train/gir_history_mask_strength",
+                    encoder_output.infos["gir_history_mask_strength"].float(),
+                )
             if "gir_history_past_before_error" in encoder_output.infos:
                 self.log(
                     "train/gir_history_past_before_error",
@@ -586,6 +590,22 @@ class ModelWrapper(LightningModule):
                 self._skip_optimizer_step = True
                 self._bad_grad_name = name
                 break
+
+        historical_head = self.model.gir_update_head
+        if historical_head is not None:
+            grad = historical_head.prediction.weight.grad
+            # The final two output channels are historical_gate and add_logit.
+            # Track only residual channels so add-gate learning cannot mask a
+            # disconnected historical-update branch.
+            grad_norm = (
+                0.0 if grad is None else grad[:-2].float().norm().item()
+            )
+            self.log(
+                "train/gir_historical_residual_grad_norm",
+                grad_norm,
+                on_step=True,
+                on_epoch=False,
+            )
 
         if self._skip_optimizer_step:
             if self.global_rank == 0:

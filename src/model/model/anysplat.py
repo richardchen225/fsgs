@@ -723,6 +723,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         history_preserve_losses = []
         history_before_errors = []
         history_after_errors = []
+        history_mask_strengths = []
         history_past_before_errors = []
         history_past_after_errors = []
         history_past_degradations = []
@@ -983,7 +984,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 current_depth_confidence,
                 gir,
             )
-            prediction.historical_gate = prediction.historical_gate - 4.0
+            prediction.historical_gate = prediction.historical_gate + float(
+                getattr(cfg, "gir_history_gate_bias", -2.0)
+            )
 
             if has_history:
                 history_interval = max(
@@ -1131,8 +1134,56 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                         mode="bilinear",
                         align_corners=False,
                     ).to(history_after_render.color.dtype)
-                    history_mask = gir.valid.to(history_after_render.color.dtype)
+                    current_depth_low = F.interpolate(
+                        current_depth.detach().float(),
+                        size=(low_h, low_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    history_depth = (
+                        gir.raster_depth if use_raster_evidence else gir.depth
+                    ).detach().float()
+                    history_alpha = (
+                        gir.raster_alpha if use_raster_evidence else gir.opacity
+                    ).detach().float()
+                    alpha_threshold = min(
+                        0.99,
+                        max(
+                            0.0,
+                            float(
+                                getattr(cfg, "gir_history_alpha_threshold", 0.10)
+                            ),
+                        ),
+                    )
+                    depth_tolerance = max(
+                        1e-3,
+                        float(
+                            getattr(cfg, "gir_history_depth_tolerance", 0.20)
+                        ),
+                    )
+                    alpha_support = (
+                        (history_alpha - alpha_threshold)
+                        / max(1.0 - alpha_threshold, 1e-3)
+                    ).clamp(0.0, 1.0)
+                    relative_depth_error = (
+                        (history_depth - current_depth_low).abs()
+                        / current_depth_low.clamp_min(1e-4)
+                    )
+                    depth_support = torch.exp(
+                        -0.5 * (relative_depth_error / depth_tolerance).square()
+                    )
+                    depth_valid = (
+                        (history_depth > 1e-5) & (current_depth_low > 1e-5)
+                    ).to(depth_support.dtype)
+                    history_valid = gir.valid.detach().float() * depth_valid
+                    history_mask = (
+                        history_valid * alpha_support * depth_support
+                    ).to(history_after_render.color.dtype)
                     history_normalizer = history_mask.sum().clamp_min(1.0)
+                    history_mask_strengths.append(
+                        history_mask.sum()
+                        / history_valid.sum().clamp_min(1.0).to(history_mask.dtype)
+                    )
                     before_error = torch.sqrt(
                         (gir.rgb.to(history_target.dtype) - history_target).square()
                         + 1e-6
@@ -1843,6 +1894,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 ).mean()
                 encoder_output.infos["gir_history_after_error"] = torch.stack(
                     history_after_errors
+                ).mean()
+                encoder_output.infos["gir_history_mask_strength"] = torch.stack(
+                    history_mask_strengths
                 ).mean()
             if history_preserve_losses:
                 encoder_output.infos["gir_history_preserve_loss"] = torch.stack(
