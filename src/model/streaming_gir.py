@@ -61,6 +61,14 @@ class DominantGIR:
     dominant_weight: torch.Tensor
     contributor_ids: torch.Tensor | None = None
     contributor_weights: torch.Tensor | None = None
+    contributor_rgb: torch.Tensor | None = None
+    contributor_depth: torch.Tensor | None = None
+    contributor_camera_points: torch.Tensor | None = None
+    contributor_opacity: torch.Tensor | None = None
+    contributor_scales: torch.Tensor | None = None
+    contributor_rotations: torch.Tensor | None = None
+    contributor_harmonics: torch.Tensor | None = None
+    contributor_observation_count: torch.Tensor | None = None
 
     @classmethod
     def empty(
@@ -378,8 +386,9 @@ class StreamingGaussianState:
             valid = valid & (depth > 1e-5)
             depth = depth.clamp_min(1e-4)
 
-            gate = prediction.historical_gate[batch_idx].reshape(-1).sigmoid()
-            gate = gate.unsqueeze(0).expand(contributor_count, -1)
+            gate = prediction.historical_gate[
+                batch_idx, :contributor_count, 0
+            ].reshape(contributor_count, -1).sigmoid()
             old_count = self.observation_count[batch_idx].gather(
                 0, safe_indices.reshape(-1)
             ).reshape_as(safe_indices)
@@ -392,22 +401,21 @@ class StreamingGaussianState:
             assignment_weight = support_weight / support_weight.sum(
                 dim=0, keepdim=True
             ).clamp_min(1e-8)
-            update_weight = assignment_weight * gate * damping
+            update_weight = support_weight * gate * damping
             if update_confidence is not None:
-                confidence = update_confidence[batch_idx].reshape(-1).to(
-                    update_weight.dtype
-                )
-                update_weight = update_weight * confidence.unsqueeze(0)
+                confidence = update_confidence[batch_idx].to(update_weight.dtype)
+                if confidence.dim() == 4:
+                    confidence = confidence[:, 0]
+                confidence = confidence.reshape(contributor_count, -1)
+                update_weight = update_weight * confidence
 
-            def expand_pixels(values: torch.Tensor) -> torch.Tensor:
-                channels = values.shape[0]
-                values = values.permute(1, 2, 0).reshape(-1, channels)
-                return values.unsqueeze(0).expand(
-                    contributor_count, -1, -1
-                ).reshape(-1, values.shape[-1])
+            def flatten_contributors(values: torch.Tensor) -> torch.Tensor:
+                values = values[:contributor_count]
+                channels = values.shape[1]
+                return values.permute(0, 2, 3, 1).reshape(-1, channels)
 
             delta_mean_camera = prediction.delta_mean_camera[batch_idx]
-            delta_mean_camera = expand_pixels(delta_mean_camera).tanh()
+            delta_mean_camera = flatten_contributors(delta_mean_camera).tanh()
             delta_mean_camera = delta_mean_camera * depth.reshape(-1, 1).to(
                 delta_mean_camera.dtype
             )
@@ -418,7 +426,7 @@ class StreamingGaussianState:
 
             def aggregate(values: torch.Tensor) -> torch.Tensor:
                 flat_update_weight = update_weight.reshape(-1).to(values.dtype)
-                flat_support_count = valid.reshape(-1).to(values.dtype)
+                flat_support_weight = support_weight.reshape(-1).to(values.dtype)
                 flat_indices = safe_indices.reshape(-1)
                 weighted = values * flat_update_weight.unsqueeze(-1)
                 index = flat_indices.unsqueeze(-1).expand(-1, values.shape[-1])
@@ -431,25 +439,25 @@ class StreamingGaussianState:
                     n,
                     device=values.device,
                     dtype=values.dtype,
-                ).scatter_add(0, flat_indices, flat_support_count)
+                ).scatter_add(0, flat_indices, flat_support_weight)
                 return numerator / denominator.clamp_min(1e-8).unsqueeze(-1)
 
             mean_updates.append(aggregate(delta_mean_world))
 
             delta_rotation = prediction.delta_rotation[batch_idx]
-            delta_rotation = expand_pixels(delta_rotation).tanh()
+            delta_rotation = flatten_contributors(delta_rotation).tanh()
             rotation_updates.append(aggregate(delta_rotation))
 
             delta_scale = prediction.delta_log_scale[batch_idx]
-            delta_scale = expand_pixels(delta_scale).tanh()
+            delta_scale = flatten_contributors(delta_scale).tanh()
             scale_updates.append(aggregate(delta_scale))
 
             delta_opacity = prediction.delta_opacity_logit[batch_idx]
-            delta_opacity = expand_pixels(delta_opacity).tanh()
+            delta_opacity = flatten_contributors(delta_opacity).tanh()
             opacity_updates.append(aggregate(delta_opacity))
 
             delta_harmonics = prediction.delta_harmonics[batch_idx]
-            delta_harmonics = expand_pixels(delta_harmonics).tanh()
+            delta_harmonics = flatten_contributors(delta_harmonics).tanh()
             harmonic_updates.append(aggregate(delta_harmonics))
 
             observation_increments.append(
@@ -461,7 +469,9 @@ class StreamingGaussianState:
                 .scatter_add(
                     0,
                     safe_indices.reshape(-1),
-                    valid.reshape(-1).to(self.observation_count.dtype),
+                    assignment_weight.reshape(-1).to(
+                        self.observation_count.dtype
+                    ),
                 )
                 .clamp_max(1.0)
             )
@@ -626,12 +636,20 @@ class GIRUpdateHead(nn.Module):
         harmonic_dim: int,
         hidden_dim: int = 64,
         use_raster_evidence: bool = False,
+        num_contributors: int = 1,
     ) -> None:
         super().__init__()
         self.harmonic_dim = harmonic_dim
         self.use_raster_evidence = use_raster_evidence
-        evidence_dim = feature_dim + 15 + int(use_raster_evidence)
-        output_dim = 3 + 3 + 3 + 1 + harmonic_dim + 1 + 1
+        self.num_contributors = max(1, int(num_contributors))
+        base_evidence_dim = feature_dim + 11 + int(use_raster_evidence)
+        contributor_evidence_dim = 23 + harmonic_dim
+        evidence_dim = (
+            base_evidence_dim
+            + self.num_contributors * contributor_evidence_dim
+        )
+        self.historical_output_dim = 3 + 3 + 3 + 1 + harmonic_dim + 1
+        output_dim = self.num_contributors * self.historical_output_dim + 1
         current_output_dim = 3 + 3 + 3 + 1 + harmonic_dim + 1
         groups = _group_count(hidden_dim)
         self.encoder = nn.Sequential(
@@ -683,12 +701,6 @@ class GIRUpdateHead(nn.Module):
 
         valid = gir.valid.to(current_feature.dtype)
         historical_rgb = gir.rgb.to(current_feature.dtype)
-        historical_depth = (
-            gir.raster_depth if self.use_raster_evidence else gir.depth
-        ).to(current_feature.dtype)
-        relative_depth = (
-            (historical_depth - current_depth) / current_depth.clamp_min(1e-4)
-        ).clamp(-2.0, 2.0)
         log_depth = current_depth.clamp_min(1e-4).log().clamp(-8.0, 8.0)
         evidence_parts = [
             current_feature,
@@ -696,22 +708,114 @@ class GIRUpdateHead(nn.Module):
             historical_rgb,
             current_rgb - historical_rgb,
             log_depth,
-            relative_depth,
-            gir.opacity.to(current_feature.dtype),
-            gir.scale.to(current_feature.dtype),
             current_depth_confidence,
-            valid,
         ]
         if self.use_raster_evidence:
             evidence_parts.append(gir.raster_alpha.to(current_feature.dtype))
+
+        contributor_shape = (
+            current_feature.shape[0],
+            self.num_contributors,
+            1,
+            *size,
+        )
+
+        def contributor_or_zeros(
+            values: torch.Tensor | None,
+            channels: int,
+        ) -> torch.Tensor:
+            if values is None:
+                return current_feature.new_zeros(
+                    contributor_shape[:2] + (channels,) + contributor_shape[3:]
+                )
+            if values.shape[1] < self.num_contributors:
+                raise RuntimeError(
+                    "GIR has fewer contributor evidence maps than the head: "
+                    f"head={self.num_contributors}, evidence={values.shape[1]}."
+                )
+            return values[:, : self.num_contributors].to(current_feature.dtype)
+
+        contributor_rgb = contributor_or_zeros(gir.contributor_rgb, 3)
+        contributor_depth = contributor_or_zeros(gir.contributor_depth, 1)
+        contributor_camera_points = contributor_or_zeros(
+            gir.contributor_camera_points, 3
+        )
+        contributor_opacity = contributor_or_zeros(gir.contributor_opacity, 1)
+        contributor_scales = contributor_or_zeros(gir.contributor_scales, 3)
+        contributor_rotations = contributor_or_zeros(
+            gir.contributor_rotations, 4
+        )
+        contributor_harmonics = contributor_or_zeros(
+            gir.contributor_harmonics, self.harmonic_dim
+        )
+        contributor_count = contributor_or_zeros(
+            gir.contributor_observation_count, 1
+        )
+        contributor_weight = contributor_or_zeros(
+            None
+            if gir.contributor_weights is None
+            else gir.contributor_weights.unsqueeze(2),
+            1,
+        )
+        contributor_valid = (
+            contributor_weight > 0
+        ).to(current_feature.dtype)
+        current_rgb_per_contributor = current_rgb.unsqueeze(1)
+        current_depth_per_contributor = current_depth.unsqueeze(1)
+        relative_depth = (
+            (contributor_depth - current_depth_per_contributor)
+            / current_depth_per_contributor.clamp_min(1e-4)
+        ).clamp(-2.0, 2.0)
+        normalized_log_scale = (
+            contributor_scales.clamp_min(1e-8).log()
+            - current_depth_per_contributor.clamp_min(1e-4).log()
+        ).clamp(-12.0, 4.0)
+        log_contributor_depth = contributor_depth.clamp_min(1e-4).log().clamp(
+            -8.0, 8.0
+        )
+        normalized_camera_points = contributor_camera_points / (
+            current_depth_per_contributor.clamp_min(1e-4)
+        )
+        raster_alpha = gir.raster_alpha.to(current_feature.dtype).unsqueeze(1)
+        ownership = (
+            contributor_weight / raster_alpha.clamp_min(1e-6)
+        ).clamp(0.0, 1.0)
+        contributor_evidence = torch.cat(
+            [
+                contributor_rgb,
+                current_rgb_per_contributor - contributor_rgb,
+                relative_depth,
+                log_contributor_depth,
+                normalized_camera_points.clamp(-4.0, 4.0),
+                contributor_opacity,
+                normalized_log_scale,
+                contributor_rotations,
+                contributor_harmonics,
+                contributor_count.clamp_min(0.0).log1p().clamp_max(8.0),
+                contributor_weight,
+                ownership,
+                contributor_valid,
+            ],
+            dim=2,
+        )
+        evidence_parts.append(
+            contributor_evidence.flatten(1, 2)
+        )
         evidence = torch.cat(evidence_parts, dim=1)
         encoded = self.encoder(evidence)
         prediction = self.prediction(encoded)
-        splits = torch.split(
-            prediction,
-            [3, 3, 3, 1, self.harmonic_dim, 1, 1],
-            dim=1,
+        historical_prediction = prediction[:, :-1].reshape(
+            prediction.shape[0],
+            self.num_contributors,
+            self.historical_output_dim,
+            *prediction.shape[-2:],
         )
+        splits = torch.split(
+            historical_prediction,
+            [3, 3, 3, 1, self.harmonic_dim, 1],
+            dim=2,
+        )
+        add_logit = prediction[:, -1:]
         dominant_weight = gir.dominant_weight.to(encoded.dtype)
         current_prediction = self.current_prediction(
             torch.cat([encoded, dominant_weight], dim=1)
@@ -721,4 +825,4 @@ class GIRUpdateHead(nn.Module):
             [3, 3, 3, 1, self.harmonic_dim, 1],
             dim=1,
         )
-        return GIRPrediction(*splits, *current_splits)
+        return GIRPrediction(*splits, add_logit, *current_splits)

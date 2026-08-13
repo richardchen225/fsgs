@@ -594,12 +594,15 @@ class ModelWrapper(LightningModule):
         historical_head = self.model.gir_update_head
         if historical_head is not None:
             grad = historical_head.prediction.weight.grad
-            # The final two output channels are historical_gate and add_logit.
-            # Track only residual channels so add-gate learning cannot mask a
-            # disconnected historical-update branch.
-            grad_norm = (
-                0.0 if grad is None else grad[:-2].float().norm().item()
-            )
+            if grad is None:
+                grad_norm = 0.0
+            else:
+                historical_grad = grad[:-1].reshape(
+                    historical_head.num_contributors,
+                    historical_head.historical_output_dim,
+                    *grad.shape[1:],
+                )
+                grad_norm = historical_grad[:, :-1].float().norm().item()
             self.log(
                 "train/gir_historical_residual_grad_norm",
                 grad_norm,

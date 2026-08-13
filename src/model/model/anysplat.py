@@ -360,6 +360,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 use_raster_evidence=getattr(
                     cfg, "gir_raster_evidence_enabled", False
                 ),
+                num_contributors=getattr(cfg, "gir_soft_update_topk", 1),
             )
             return
         if not getattr(cfg, "gs_refine_enabled", False):
@@ -512,6 +513,78 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 torch.zeros_like(contributor_weights),
             )
 
+            safe_contributor_ids = contributor_ids.clamp(
+                min=0, max=max(state.num_gaussians - 1, 0)
+            )
+            k = safe_contributor_ids.shape[1]
+            flat_contributor_ids = safe_contributor_ids.reshape(b, -1)
+
+            def gather_contributor(values: torch.Tensor) -> torch.Tensor:
+                channels = values.shape[-1]
+                gathered = values.gather(
+                    1,
+                    flat_contributor_ids.unsqueeze(-1).expand(-1, -1, channels),
+                )
+                gathered = gathered.reshape(b, k, h, w, channels)
+                gathered = gathered.permute(0, 1, 4, 2, 3)
+                return torch.where(
+                    contributor_valid.unsqueeze(2),
+                    gathered,
+                    torch.zeros_like(gathered),
+                )
+
+            means = state.gaussians.means.detach().float()
+            means_h = torch.cat(
+                [
+                    means,
+                    torch.ones(
+                        (*means.shape[:2], 1),
+                        device=means.device,
+                        dtype=means.dtype,
+                    ),
+                ],
+                dim=-1,
+            )
+            world_to_camera = torch.linalg.inv(camera_to_world.detach().float())
+            camera_depth = torch.einsum(
+                "bij,bnj->bni", world_to_camera, means_h
+            )[..., 2:3]
+            harmonics = state.gaussians.harmonics.detach().reshape(
+                b, state.num_gaussians, -1
+            )
+            rgb = sh_utils.SH2RGB(harmonics[..., :3]).clamp(0.0, 1.0)
+            gir.contributor_rgb = gather_contributor(rgb).to(gir.rgb.dtype)
+            gir.contributor_depth = gather_contributor(camera_depth).to(
+                gir.depth.dtype
+            )
+            camera_points = torch.einsum(
+                "bij,bnj->bni", world_to_camera, means_h
+            )[..., :3]
+            gir.contributor_camera_points = gather_contributor(
+                camera_points
+            ).to(gir.depth.dtype)
+            gir.contributor_opacity = gather_contributor(
+                state.gaussians.opacities.detach().unsqueeze(-1)
+            ).to(gir.opacity.dtype)
+            gir.contributor_scales = gather_contributor(
+                state.gaussians.scales.detach()
+            ).to(gir.scale.dtype)
+            rotations = state.gaussians.rotations.detach()
+            rotations = torch.where(
+                rotations[..., 3:4] < 0,
+                -rotations,
+                rotations,
+            )
+            gir.contributor_rotations = gather_contributor(rotations).to(
+                gir.scale.dtype
+            )
+            gir.contributor_harmonics = gather_contributor(harmonics).to(
+                gir.rgb.dtype
+            )
+            gir.contributor_observation_count = gather_contributor(
+                state.observation_count.detach().unsqueeze(-1)
+            ).to(gir.observation_count.dtype)
+
         if use_dominant_ids:
             ids = render_output.dominant_ids
             weights = torch.nan_to_num(
@@ -571,6 +644,84 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 gir.valid,
                 weights.to(gir.dominant_weight.dtype),
                 torch.zeros_like(gir.dominant_weight),
+            )
+
+        if gir.contributor_ids is None:
+            gir.contributor_ids = gir.indices.unsqueeze(1)
+            gir.contributor_weights = gir.dominant_weight.unsqueeze(1)
+            gir.contributor_rgb = gir.rgb.unsqueeze(1)
+            gir.contributor_depth = gir.depth.unsqueeze(1)
+            gir.contributor_opacity = gir.opacity.unsqueeze(1)
+            gir.contributor_scales = state.gaussians.scales.new_zeros(
+                (b, 1, 3, h, w)
+            )
+            safe_ids = gir.indices.clamp(
+                min=0, max=max(state.num_gaussians - 1, 0)
+            ).reshape(b, -1)
+            means = state.gaussians.means.detach().float()
+            means_h = torch.cat(
+                [
+                    means,
+                    torch.ones(
+                        (*means.shape[:2], 1),
+                        device=means.device,
+                        dtype=means.dtype,
+                    ),
+                ],
+                dim=-1,
+            )
+            world_to_camera = torch.linalg.inv(camera_to_world.detach().float())
+            camera_points = torch.einsum(
+                "bij,bnj->bni", world_to_camera, means_h
+            )[..., :3]
+            gathered_camera_points = camera_points.gather(
+                1, safe_ids.unsqueeze(-1).expand(-1, -1, 3)
+            ).reshape(b, h, w, 3).permute(0, 3, 1, 2)
+            gir.contributor_camera_points = torch.where(
+                gir.valid,
+                gathered_camera_points,
+                torch.zeros_like(gathered_camera_points),
+            ).unsqueeze(1)
+            gathered_scales = state.gaussians.scales.detach().gather(
+                1, safe_ids.unsqueeze(-1).expand(-1, -1, 3)
+            )
+            gathered_scales = gathered_scales.reshape(b, h, w, 3).permute(
+                0, 3, 1, 2
+            )
+            gir.contributor_scales[:, 0] = torch.where(
+                gir.valid,
+                gathered_scales,
+                torch.zeros_like(gathered_scales),
+            )
+            rotations = state.gaussians.rotations.detach()
+            rotations = torch.where(
+                rotations[..., 3:4] < 0,
+                -rotations,
+                rotations,
+            )
+            gathered_rotations = rotations.gather(
+                1, safe_ids.unsqueeze(-1).expand(-1, -1, 4)
+            ).reshape(b, h, w, 4).permute(0, 3, 1, 2)
+            gir.contributor_rotations = torch.where(
+                gir.valid,
+                gathered_rotations,
+                torch.zeros_like(gathered_rotations),
+            ).unsqueeze(1)
+            harmonics = state.gaussians.harmonics.detach().reshape(
+                b, state.num_gaussians, -1
+            )
+            harmonic_dim = harmonics.shape[-1]
+            gathered_harmonics = harmonics.gather(
+                1,
+                safe_ids.unsqueeze(-1).expand(-1, -1, harmonic_dim),
+            ).reshape(b, h, w, harmonic_dim).permute(0, 3, 1, 2)
+            gir.contributor_harmonics = torch.where(
+                gir.valid,
+                gathered_harmonics,
+                torch.zeros_like(gathered_harmonics),
+            ).unsqueeze(1)
+            gir.contributor_observation_count = (
+                gir.observation_count.unsqueeze(1)
             )
 
         return gir
@@ -985,7 +1136,14 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 gir,
             )
             prediction.historical_gate = prediction.historical_gate + float(
-                getattr(cfg, "gir_history_gate_bias", -2.0)
+                getattr(cfg, "gir_history_gate_bias", -4.0)
+            )
+            historical_contributor_valid = prediction.historical_gate.new_zeros(
+                (
+                    prediction.historical_gate.shape[0],
+                    prediction.historical_gate.shape[1],
+                    *prediction.historical_gate.shape[-2:],
+                )
             )
 
             if has_history:
@@ -1086,18 +1244,32 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     / valid_count
                 )
                 historical_update_confidence = None
+                contributor_ownership = top1_ownership.unsqueeze(1)
+                if gir.contributor_weights is not None:
+                    contributor_ownership = (
+                        gir.contributor_weights[:, :soft_update_topk].detach().float()
+                        / evidence_alpha.clamp_min(1e-6)
+                    ).clamp(0.0, 1.0)
+                historical_contributor_valid = (contributor_ownership > 0).to(
+                    contributor_ownership.dtype
+                )
                 if top1_confidence_mode == "sqrt":
-                    historical_update_confidence = top1_ownership.sqrt()
+                    historical_update_confidence = (
+                        contributor_ownership.sqrt()
+                        * historical_contributor_valid
+                    )
                 elif top1_confidence_mode == "floor_sqrt":
-                    historical_update_confidence = confidence_floor + (
-                        1.0 - confidence_floor
-                    ) * top1_ownership.sqrt()
+                    historical_update_confidence = (
+                        confidence_floor
+                        + (1.0 - confidence_floor)
+                        * contributor_ownership.sqrt()
+                    ) * historical_contributor_valid
                 if historical_update_confidence is None:
                     top1_confidence_means.append(top1_ownership.new_ones(()))
                 else:
                     top1_confidence_means.append(
-                        (historical_update_confidence * valid_float).sum()
-                        / valid_count
+                        historical_update_confidence.sum()
+                        / historical_contributor_valid.sum().clamp_min(1.0)
                     )
 
                 state = state.update_historical(
@@ -1429,21 +1601,33 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                         ratios.append(
                             (effective_opacity_float > threshold).float().mean()
                         )
+            historical_coverage = historical_contributor_valid.to(
+                prediction.historical_gate.dtype
+            )
             historical_gates.append(
-                (prediction.historical_gate.sigmoid() * coverage).sum()
-                / coverage.sum().clamp_min(1.0)
+                (
+                    prediction.historical_gate.sigmoid()
+                    * historical_coverage.unsqueeze(2)
+                ).sum()
+                / historical_coverage.sum().clamp_min(1.0)
             )
-            valid_normalizer = coverage.sum().clamp_min(1.0)
             residual_energy = (
-                prediction.delta_mean_camera.square().sum(dim=1, keepdim=True)
-                + prediction.delta_rotation.square().sum(dim=1, keepdim=True)
-                + prediction.delta_log_scale.square().sum(dim=1, keepdim=True)
+                prediction.delta_mean_camera.square().sum(dim=2, keepdim=True)
+                + prediction.delta_rotation.square().sum(dim=2, keepdim=True)
+                + prediction.delta_log_scale.square().sum(dim=2, keepdim=True)
                 + prediction.delta_opacity_logit.square()
-                + prediction.delta_harmonics.square().mean(dim=1, keepdim=True)
+                + prediction.delta_harmonics.square().mean(dim=2, keepdim=True)
             )
-            residual_magnitudes.append(residual_energy.mean().sqrt())
+            historical_coverage = historical_coverage.unsqueeze(2)
+            historical_normalizer = historical_coverage.sum().clamp_min(1.0)
+            residual_magnitudes.append(
+                (
+                    residual_energy * historical_coverage
+                ).sum().div(historical_normalizer).sqrt()
+            )
             regularization_losses.append(
-                (residual_energy * coverage).sum() / valid_normalizer
+                (residual_energy * historical_coverage).sum()
+                / historical_normalizer
                 + new_residual_energy.mean()
             )
 

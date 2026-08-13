@@ -124,9 +124,9 @@ class EncoderAnySplatCfg:
     gir_tbptt_chunk: int = 2
     gir_replay_views: int = 1
     gir_aux_loss_weight: float = 0.25
-    gir_history_gate_bias: float = -2.0
-    gir_history_adapt_weight: float = 0.05
-    gir_history_preserve_weight: float = 0.10
+    gir_history_gate_bias: float = -4.0
+    gir_history_adapt_weight: float = 0.0
+    gir_history_preserve_weight: float = 0.0
     gir_history_loss_interval: int = 4
     gir_history_alpha_threshold: float = 0.10
     gir_history_depth_tolerance: float = 0.20
