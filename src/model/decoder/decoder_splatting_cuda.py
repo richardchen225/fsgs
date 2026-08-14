@@ -243,7 +243,6 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             )
 
         num_top_contributors = max(1, int(num_top_contributors))
-        return_contributors = num_top_contributors > 1
         b = gaussians.means.shape[0]
         h, w = image_shape
         colors = []
@@ -320,27 +319,32 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
                     num_depth_samples=count,
                 )
 
-            # Keep the legacy K=1 query unchanged for checkpoint-compatible
-            # evidence; the separate top-k query is only used for soft writeback.
+            # Keep the legacy K=1 query as the canonical dominant match. This
+            # makes K=1 checkpoint behavior independent of the top-k API.
             dominant_id, dominant_weight = rasterize_contributors(1)
-            if return_contributors:
+            if num_top_contributors == 1:
+                ids, weights = dominant_id, dominant_weight
+            else:
                 ids, weights = rasterize_contributors(num_top_contributors)
-                expected_topk_shape = (1, h, w, num_top_contributors)
-                if (
-                    ids.shape != expected_topk_shape
-                    or weights.shape != expected_topk_shape
-                ):
-                    raise RuntimeError(
-                        "Unexpected contributor GIR output shapes: "
-                        f"ids={tuple(ids.shape)}, weights={tuple(weights.shape)}, "
-                        f"expected={expected_topk_shape}."
-                    )
-                weights = torch.nan_to_num(
-                    weights.float(), nan=0.0, posinf=0.0, neginf=0.0
-                ).clamp_min_(0.0)
-                weight_order = weights.argsort(dim=-1, descending=True)
-                ids = ids.gather(-1, weight_order)
-                weights = weights.gather(-1, weight_order)
+            expected_id_shape = (1, h, w, num_top_contributors)
+            if ids.shape != expected_id_shape or weights.shape != expected_id_shape:
+                raise RuntimeError(
+                    "Unexpected contributor GIR output shapes: "
+                    f"ids={tuple(ids.shape)}, weights={tuple(weights.shape)}, "
+                    f"expected={expected_id_shape}."
+                )
+            weights = torch.nan_to_num(
+                weights.float(), nan=0.0, posinf=0.0, neginf=0.0
+            ).clamp_min_(0.0)
+            dominant_match = ids == dominant_id
+            ordering_score = weights + dominant_match.to(weights.dtype) * (
+                weights.amax(dim=-1, keepdim=True) + 1.0
+            )
+            order = ordering_score.argsort(dim=-1, descending=True)
+            ids = ids.gather(-1, order)
+            weights = weights.gather(-1, order)
+            ids[..., :1] = dominant_id
+            weights[..., :1] = dominant_weight.to(weights.dtype)
 
             expected_dominant_shape = (1, h, w, 1)
             if (
@@ -360,9 +364,8 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             alphas.append(alpha[0].permute(2, 0, 1))
             dominant_ids.append(dominant_id[0, ..., 0].long())
             dominant_weights.append(dominant_weight[0, ..., 0].unsqueeze(0))
-            if return_contributors:
-                contributor_ids.append(ids[0].permute(2, 0, 1).long())
-                contributor_weights.append(weights[0].permute(2, 0, 1))
+            contributor_ids.append(ids[0].permute(2, 0, 1).long())
+            contributor_weights.append(weights[0].permute(2, 0, 1))
 
         return GIRRasterizationOutput(
             color=torch.stack(colors),
@@ -370,12 +373,8 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             alpha=torch.stack(alphas),
             dominant_ids=torch.stack(dominant_ids),
             dominant_weights=torch.stack(dominant_weights),
-            contributor_ids=(
-                torch.stack(contributor_ids) if return_contributors else None
-            ),
-            contributor_weights=(
-                torch.stack(contributor_weights) if return_contributors else None
-            ),
+            contributor_ids=torch.stack(contributor_ids),
+            contributor_weights=torch.stack(contributor_weights),
         )
 
     def rendering_fn(

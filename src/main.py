@@ -147,14 +147,31 @@ def train(cfg_dict: DictConfig):
         if ckpt is not None:
             new_ckpt = {}
             for old_k, v in ckpt.items():
-                new_k = rename_key(old_k)
+                new_k = old_k.removeprefix("model.")
+                new_k = rename_key(new_k)
                 new_ckpt[new_k] = v
-             
-            ckpt = new_ckpt
-            ckpt1 = {key: value for key, value in ckpt.items() if 'gs_head' in key}
-            model.load_state_dict(ckpt1, strict=False)
-            ckpt2 = {key: value for key, value in ckpt.items() if 'gaussian_param_head' in key}
-            model.load_state_dict(ckpt2, strict=False)
+
+            load_prefixes = (
+                "encoder.gaussian_param_head.",
+                "encoder.gs_head.",
+                "encoder.cam_dec.",
+                "encoder.depth_refiner.",
+                "gs_residual_refiner.",
+                "gir_update_head.",
+            )
+            model_state = model.state_dict()
+            compatible_ckpt = {
+                key: value
+                for key, value in new_ckpt.items()
+                if key in model_state
+                and value.shape == model_state[key].shape
+                and key.startswith(load_prefixes)
+            }
+            model.load_state_dict(compatible_ckpt, strict=False)
+            print(
+                "Loaded "
+                f"{len(compatible_ckpt)} compatible pretrained head tensors."
+            )
                 
     else:
         if cfg.checkpointing.load is None:
@@ -243,6 +260,12 @@ def train(cfg_dict: DictConfig):
             for key in model_state
             if any(key.startswith(prefix) for prefix in required_prefixes)
         }
+        if not getattr(cfg.model.encoder, "gir_old_delete_enabled", False):
+            required_keys = {
+                key
+                for key in required_keys
+                if not key.startswith("gir_update_head.delete_prediction.")
+            }
         missing_keys = sorted(required_keys - compatible_ckpt.keys())
         if missing_keys:
             preview = ", ".join(missing_keys[:4])

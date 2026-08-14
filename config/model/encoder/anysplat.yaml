@@ -41,4 +41,11 @@ mlp_type: unified
 scaffold: true
 gir_top1_confidence_mode: none
 gir_top1_confidence_floor: 0.25
-gir_soft_update_topk: 1
+gir_old_delete_enabled: false
+gir_old_delete_warmup_steps: 1000
+gir_old_delete_target_ratio: 0.01
+gir_old_delete_budget_weight: 0.01
+gir_old_delete_threshold: 0.5
+gir_old_delete_temperature: 1.0
+gir_old_delete_min_observations: 2
+gir_old_delete_test_prune_enabled: true

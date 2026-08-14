@@ -90,13 +90,6 @@ class TestCfg:
         "inherit", "none", "floor_sqrt", "sqrt"
     ] = "inherit"
     gir_test_top1_confidence_floor: float = 0.25
-    gir_test_correspondence_diagnostics: bool = False
-    gir_test_correspondence_topk: int = 8
-    gir_test_old_gs_final_prune_enabled: bool = False
-    gir_test_old_gs_prune_min_candidate_views: int = 2
-    gir_test_old_gs_prune_max_top1_rate: float = 0.0
-    gir_test_old_gs_prune_max_mean_weight: float = 0.01
-    gir_test_old_gs_prune_max_opacity: float = 1.0
 
 
 @dataclass
@@ -342,8 +335,6 @@ class ModelWrapper(LightningModule):
                 "gir_top1_ownership_above_0_25_ratio",
                 "gir_top1_confidence_mode_code",
                 "gir_top1_confidence_floor",
-                "gir_soft_update_topk",
-                "gir_soft_update_coverage_mean",
             ):
                 if metric_name in encoder_output.infos:
                     self.log(
@@ -372,10 +363,6 @@ class ModelWrapper(LightningModule):
                     "train/gir_history_improvement",
                     history_before - history_after,
                 )
-                self.log(
-                    "train/gir_history_mask_strength",
-                    encoder_output.infos["gir_history_mask_strength"].float(),
-                )
             if "gir_history_past_before_error" in encoder_output.infos:
                 self.log(
                     "train/gir_history_past_before_error",
@@ -389,6 +376,21 @@ class ModelWrapper(LightningModule):
                     "train/gir_history_past_degradation",
                     encoder_output.infos["gir_history_past_degradation"].float(),
                 )
+            for metric_name in (
+                "gir_old_delete_target_ratio",
+                "gir_old_delete_candidate_probability",
+                "gir_old_delete_candidate_count",
+                "gir_old_delete_candidate_rate",
+                "gir_old_delete_hard_ratio",
+                "gir_old_delete_removed_opacity_mass_ratio",
+                "gir_old_delete_map_count_before",
+                "gir_old_delete_map_count_after",
+            ):
+                if metric_name in encoder_output.infos:
+                    self.log(
+                        f"train/{metric_name}",
+                        encoder_output.infos[metric_name].float(),
+                    )
         
         target_gt = (batch["context"]["image"] + 1) / 2
         num_context_views = target_gt.shape[1]
@@ -410,6 +412,21 @@ class ModelWrapper(LightningModule):
             gir_aux_weight = float(self.model.encoder.cfg.gir_aux_loss_weight)
             self.log("loss/gir_aux", gir_aux_loss.item())
             total_loss = total_loss + gir_aux_weight * gir_aux_loss
+        if (
+            encoder_output.infos is not None
+            and "gir_old_delete_budget_loss" in encoder_output.infos
+        ):
+            old_delete_budget_loss = encoder_output.infos[
+                "gir_old_delete_budget_loss"
+            ]
+            old_delete_budget_weight = float(
+                self.model.encoder.cfg.gir_old_delete_budget_weight
+            )
+            self.log("loss/gir_old_delete_budget", old_delete_budget_loss.item())
+            total_loss = (
+                total_loss
+                + old_delete_budget_weight * old_delete_budget_loss
+            )
         if (
             encoder_output.infos is not None
             and "gir_history_adapt_loss" in encoder_output.infos
@@ -591,25 +608,6 @@ class ModelWrapper(LightningModule):
                 self._bad_grad_name = name
                 break
 
-        historical_head = self.model.gir_update_head
-        if historical_head is not None:
-            grad = historical_head.prediction.weight.grad
-            if grad is None:
-                grad_norm = 0.0
-            else:
-                historical_grad = grad[:-1].reshape(
-                    historical_head.num_contributors,
-                    historical_head.historical_output_dim,
-                    *grad.shape[1:],
-                )
-                grad_norm = historical_grad[:, :-1].float().norm().item()
-            self.log(
-                "train/gir_historical_residual_grad_norm",
-                grad_norm,
-                on_step=True,
-                on_epoch=False,
-            )
-
         if self._skip_optimizer_step:
             if self.global_rank == 0:
                 print(
@@ -753,6 +751,7 @@ class ModelWrapper(LightningModule):
                     ctx_img_num,
                     0.01,
                     100.0,
+                    global_step=self.global_step,
                     test_add_gate_prune_threshold=(
                         self.test_cfg.gir_add_gate_prune_threshold
                     ),
@@ -761,27 +760,6 @@ class ModelWrapper(LightningModule):
                     ),
                     test_top1_confidence_floor=(
                         self.test_cfg.gir_test_top1_confidence_floor
-                    ),
-                    test_correspondence_diagnostics=(
-                        self.test_cfg.gir_test_correspondence_diagnostics
-                    ),
-                    test_correspondence_topk=(
-                        self.test_cfg.gir_test_correspondence_topk
-                    ),
-                    test_old_gs_final_prune_enabled=(
-                        self.test_cfg.gir_test_old_gs_final_prune_enabled
-                    ),
-                    test_old_gs_prune_min_candidate_views=(
-                        self.test_cfg.gir_test_old_gs_prune_min_candidate_views
-                    ),
-                    test_old_gs_prune_max_top1_rate=(
-                        self.test_cfg.gir_test_old_gs_prune_max_top1_rate
-                    ),
-                    test_old_gs_prune_max_mean_weight=(
-                        self.test_cfg.gir_test_old_gs_prune_max_mean_weight
-                    ),
-                    test_old_gs_prune_max_opacity=(
-                        self.test_cfg.gir_test_old_gs_prune_max_opacity
                     ),
                 )
                 if (
@@ -847,40 +825,15 @@ class ModelWrapper(LightningModule):
                 "gir_top1_confidence_mean",
                 "gir_top1_confidence_mode_code",
                 "gir_top1_confidence_floor",
-                "gir_soft_update_topk",
-                "gir_soft_update_coverage_mean",
-                "gir_test_corr_top1_weight_mean",
-                "gir_test_corr_top2_weight_mean",
-                "gir_test_corr_top2_to_top1_mean",
-                "gir_test_corr_top1_top2_relative_gap_mean",
-                "gir_test_corr_top2_over_0_5_ratio",
-                "gir_test_corr_top2_over_0_8_ratio",
-                "gir_test_corr_significant_contributors_mean",
-                "gir_test_corr_multi_contributor_pixel_ratio",
-                "gir_test_corr_contributor_cap_ratio",
-                "gir_test_corr_matched_old_gs_per_view_ratio",
-                "gir_test_corr_pixels_per_matched_gs",
-                "gir_test_corr_matched_gs_ge_4_pixels_ratio",
-                "gir_test_corr_old_gs_with_future_view_ratio",
-                "gir_test_corr_never_top1_after_future_view_ratio",
-                "gir_test_corr_never_top1_after_2_future_views_ratio",
-                "gir_test_corr_old_gs_future_view_top1_rate",
-                "gir_test_corr_old_gs_top1_pixels_per_future_view",
-                "gir_test_corr_old_gs_candidate_visible_ratio",
-                "gir_test_corr_candidate_never_top1_ratio",
-                "gir_test_corr_top1_given_candidate_view_rate",
-                "gir_test_corr_topk",
-                "gir_test_old_gs_prune_enabled",
-                "gir_test_old_gs_prune_min_candidate_views",
-                "gir_test_old_gs_prune_max_top1_rate",
-                "gir_test_old_gs_prune_max_mean_weight",
-                "gir_test_old_gs_prune_max_opacity",
-                "gir_test_old_gs_prune_map_before",
-                "gir_test_old_gs_prune_map_after",
-                "gir_test_old_gs_prune_ratio",
-                "gir_test_old_gs_prune_candidate_eligible_ratio",
-                "gir_test_old_gs_prune_removed_opacity_mass_ratio",
-                "gir_test_old_gs_prune_safeguard_kept",
+                "gir_old_delete_target_ratio",
+                "gir_old_delete_threshold",
+                "gir_old_delete_candidate_probability",
+                "gir_old_delete_candidate_count",
+                "gir_old_delete_candidate_rate",
+                "gir_old_delete_hard_ratio",
+                "gir_old_delete_removed_opacity_mass_ratio",
+                "gir_old_delete_map_count_before",
+                "gir_old_delete_map_count_after",
             )
             for key in info_keys:
                 if key in encoder_output.infos:
@@ -905,6 +858,15 @@ class ModelWrapper(LightningModule):
                 f"scene={scene_name} "
                 f"top1_mode_code="
                 f"{gir_diagnostics.get('top1_confidence_mode_code', float('nan')):.0f} "
+                f"old_delete_p="
+                f"{gir_diagnostics.get('old_delete_candidate_probability', float('nan')):.4f} "
+                f"old_delete_candidate_rate="
+                f"{gir_diagnostics.get('old_delete_candidate_rate', 0.0):.4f} "
+                f"old_deleted="
+                f"{gir_diagnostics.get('old_delete_hard_ratio', 0.0):.4f} "
+                f"old_map="
+                f"{gir_diagnostics.get('old_delete_map_count_before', gir_diagnostics['map_gaussians']):.0f}->"
+                f"{gir_diagnostics.get('old_delete_map_count_after', gir_diagnostics['map_gaussians']):.0f} "
                 f"prune_threshold="
                 f"{gir_diagnostics.get('test_prune_threshold', 0.0):.3f} "
                 f"pruned_new="
@@ -919,24 +881,7 @@ class ModelWrapper(LightningModule):
                 f"{gir_diagnostics.get('add_gate_below_0_1_ratio', float('nan')):.4f} "
                 f"map>0.001={gir_diagnostics['map_above_0_001_ratio']:.4f} "
                 f"map>0.005={gir_diagnostics['map_above_0_005_ratio']:.4f} "
-                f"map>0.01={gir_diagnostics['map_above_0_01_ratio']:.4f} "
-                f"top2/top1="
-                f"{gir_diagnostics.get('test_corr_top2_to_top1_mean', float('nan')):.4f} "
-                f"multi_pixel="
-                f"{gir_diagnostics.get('test_corr_multi_contributor_pixel_ratio', float('nan')):.4f} "
-                f"candidate_never_top1="
-                f"{gir_diagnostics.get('test_corr_candidate_never_top1_ratio', float('nan')):.4f} "
-                f"soft_k="
-                f"{gir_diagnostics.get('soft_update_topk', 1.0):.0f} "
-                f"soft_coverage="
-                f"{gir_diagnostics.get('soft_update_coverage_mean', float('nan')):.4f} "
-                f"old_pruned="
-                f"{gir_diagnostics.get('test_old_gs_prune_ratio', 0.0):.4f} "
-                f"old_map="
-                f"{gir_diagnostics.get('test_old_gs_prune_map_before', gir_diagnostics['map_gaussians']):.0f}->"
-                f"{gir_diagnostics.get('test_old_gs_prune_map_after', gir_diagnostics['map_gaussians']):.0f} "
-                f"old_opacity_removed="
-                f"{gir_diagnostics.get('test_old_gs_prune_removed_opacity_mass_ratio', 0.0):.4f}"
+                f"map>0.01={gir_diagnostics['map_above_0_01_ratio']:.4f}"
             )
         # if self.global_rank == 0:
         # export_ply(gaussians.means[0], gaussians.scales[0], gaussians.rotations[0], gaussians.harmonics[0].permute(0,2,1), single_opacities, Path(f"gaussians_{[x[:20] for x in batch['scene']]}.ply"))
@@ -1215,40 +1160,15 @@ class ModelWrapper(LightningModule):
             "top1_confidence_mean",
             "top1_confidence_mode_code",
             "top1_confidence_floor",
-            "test_corr_top1_weight_mean",
-            "test_corr_top2_weight_mean",
-            "test_corr_top2_to_top1_mean",
-            "test_corr_top1_top2_relative_gap_mean",
-            "test_corr_top2_over_0_5_ratio",
-            "test_corr_top2_over_0_8_ratio",
-            "test_corr_significant_contributors_mean",
-            "test_corr_multi_contributor_pixel_ratio",
-            "test_corr_contributor_cap_ratio",
-            "test_corr_matched_old_gs_per_view_ratio",
-            "test_corr_pixels_per_matched_gs",
-            "test_corr_matched_gs_ge_4_pixels_ratio",
-            "test_corr_old_gs_with_future_view_ratio",
-            "test_corr_never_top1_after_future_view_ratio",
-            "test_corr_never_top1_after_2_future_views_ratio",
-            "test_corr_old_gs_future_view_top1_rate",
-            "test_corr_old_gs_top1_pixels_per_future_view",
-            "test_corr_old_gs_candidate_visible_ratio",
-            "test_corr_candidate_never_top1_ratio",
-            "test_corr_top1_given_candidate_view_rate",
-            "test_corr_topk",
-            "soft_update_topk",
-            "soft_update_coverage_mean",
-            "test_old_gs_prune_enabled",
-            "test_old_gs_prune_min_candidate_views",
-            "test_old_gs_prune_max_top1_rate",
-            "test_old_gs_prune_max_mean_weight",
-            "test_old_gs_prune_max_opacity",
-            "test_old_gs_prune_map_before",
-            "test_old_gs_prune_map_after",
-            "test_old_gs_prune_ratio",
-            "test_old_gs_prune_candidate_eligible_ratio",
-            "test_old_gs_prune_removed_opacity_mass_ratio",
-            "test_old_gs_prune_safeguard_kept",
+            "old_delete_target_ratio",
+            "old_delete_threshold",
+            "old_delete_candidate_probability",
+            "old_delete_candidate_count",
+            "old_delete_candidate_rate",
+            "old_delete_hard_ratio",
+            "old_delete_removed_opacity_mass_ratio",
+            "old_delete_map_count_before",
+            "old_delete_map_count_after",
             "new_opacity_mass_ratio",
             "add_gate",
             "add_target",

@@ -360,7 +360,6 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 use_raster_evidence=getattr(
                     cfg, "gir_raster_evidence_enabled", False
                 ),
-                num_contributors=getattr(cfg, "gir_soft_update_topk", 1),
             )
             return
         if not getattr(cfg, "gs_refine_enabled", False):
@@ -456,7 +455,6 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         image_shape: tuple[int, int],
         use_dominant_ids: bool,
         min_dominant_weight: float,
-        num_top_contributors: int = 1,
     ) -> DominantGIR:
         b = state.batch_size
         h, w = image_shape
@@ -465,7 +463,6 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             camera_to_world.detach(),
             intrinsics.detach(),
             image_shape,
-            num_top_contributors=num_top_contributors,
         )
 
         render_alpha = torch.nan_to_num(
@@ -487,103 +484,6 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         gir.rgb = render_color.clamp_(0.0, 1.0).to(gir.rgb.dtype)
         gir.raster_depth = render_depth.to(gir.depth.dtype)
         gir.raster_alpha = render_alpha.to(gir.opacity.dtype)
-        contributor_ids = render_output.contributor_ids
-        contributor_weights = render_output.contributor_weights
-        if contributor_ids is not None and contributor_weights is not None:
-            contributor_weights = torch.nan_to_num(
-                contributor_weights.float(),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            ).clamp_min_(0.0)
-            contributor_valid = (
-                (contributor_ids >= 0)
-                & (contributor_ids < state.num_gaussians)
-                & (contributor_weights >= min_dominant_weight)
-                & (render_alpha > 1e-4)
-            )
-            gir.contributor_ids = torch.where(
-                contributor_valid,
-                contributor_ids,
-                torch.full_like(contributor_ids, -1),
-            )
-            gir.contributor_weights = torch.where(
-                contributor_valid,
-                contributor_weights,
-                torch.zeros_like(contributor_weights),
-            )
-
-            safe_contributor_ids = contributor_ids.clamp(
-                min=0, max=max(state.num_gaussians - 1, 0)
-            )
-            k = safe_contributor_ids.shape[1]
-            flat_contributor_ids = safe_contributor_ids.reshape(b, -1)
-
-            def gather_contributor(values: torch.Tensor) -> torch.Tensor:
-                channels = values.shape[-1]
-                gathered = values.gather(
-                    1,
-                    flat_contributor_ids.unsqueeze(-1).expand(-1, -1, channels),
-                )
-                gathered = gathered.reshape(b, k, h, w, channels)
-                gathered = gathered.permute(0, 1, 4, 2, 3)
-                return torch.where(
-                    contributor_valid.unsqueeze(2),
-                    gathered,
-                    torch.zeros_like(gathered),
-                )
-
-            means = state.gaussians.means.detach().float()
-            means_h = torch.cat(
-                [
-                    means,
-                    torch.ones(
-                        (*means.shape[:2], 1),
-                        device=means.device,
-                        dtype=means.dtype,
-                    ),
-                ],
-                dim=-1,
-            )
-            world_to_camera = torch.linalg.inv(camera_to_world.detach().float())
-            camera_depth = torch.einsum(
-                "bij,bnj->bni", world_to_camera, means_h
-            )[..., 2:3]
-            harmonics = state.gaussians.harmonics.detach().reshape(
-                b, state.num_gaussians, -1
-            )
-            rgb = sh_utils.SH2RGB(harmonics[..., :3]).clamp(0.0, 1.0)
-            gir.contributor_rgb = gather_contributor(rgb).to(gir.rgb.dtype)
-            gir.contributor_depth = gather_contributor(camera_depth).to(
-                gir.depth.dtype
-            )
-            camera_points = torch.einsum(
-                "bij,bnj->bni", world_to_camera, means_h
-            )[..., :3]
-            gir.contributor_camera_points = gather_contributor(
-                camera_points
-            ).to(gir.depth.dtype)
-            gir.contributor_opacity = gather_contributor(
-                state.gaussians.opacities.detach().unsqueeze(-1)
-            ).to(gir.opacity.dtype)
-            gir.contributor_scales = gather_contributor(
-                state.gaussians.scales.detach()
-            ).to(gir.scale.dtype)
-            rotations = state.gaussians.rotations.detach()
-            rotations = torch.where(
-                rotations[..., 3:4] < 0,
-                -rotations,
-                rotations,
-            )
-            gir.contributor_rotations = gather_contributor(rotations).to(
-                gir.scale.dtype
-            )
-            gir.contributor_harmonics = gather_contributor(harmonics).to(
-                gir.rgb.dtype
-            )
-            gir.contributor_observation_count = gather_contributor(
-                state.observation_count.detach().unsqueeze(-1)
-            ).to(gir.observation_count.dtype)
 
         if use_dominant_ids:
             ids = render_output.dominant_ids
@@ -645,85 +545,6 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 weights.to(gir.dominant_weight.dtype),
                 torch.zeros_like(gir.dominant_weight),
             )
-
-        if gir.contributor_ids is None:
-            gir.contributor_ids = gir.indices.unsqueeze(1)
-            gir.contributor_weights = gir.dominant_weight.unsqueeze(1)
-            gir.contributor_rgb = gir.rgb.unsqueeze(1)
-            gir.contributor_depth = gir.depth.unsqueeze(1)
-            gir.contributor_opacity = gir.opacity.unsqueeze(1)
-            gir.contributor_scales = state.gaussians.scales.new_zeros(
-                (b, 1, 3, h, w)
-            )
-            safe_ids = gir.indices.clamp(
-                min=0, max=max(state.num_gaussians - 1, 0)
-            ).reshape(b, -1)
-            means = state.gaussians.means.detach().float()
-            means_h = torch.cat(
-                [
-                    means,
-                    torch.ones(
-                        (*means.shape[:2], 1),
-                        device=means.device,
-                        dtype=means.dtype,
-                    ),
-                ],
-                dim=-1,
-            )
-            world_to_camera = torch.linalg.inv(camera_to_world.detach().float())
-            camera_points = torch.einsum(
-                "bij,bnj->bni", world_to_camera, means_h
-            )[..., :3]
-            gathered_camera_points = camera_points.gather(
-                1, safe_ids.unsqueeze(-1).expand(-1, -1, 3)
-            ).reshape(b, h, w, 3).permute(0, 3, 1, 2)
-            gir.contributor_camera_points = torch.where(
-                gir.valid,
-                gathered_camera_points,
-                torch.zeros_like(gathered_camera_points),
-            ).unsqueeze(1)
-            gathered_scales = state.gaussians.scales.detach().gather(
-                1, safe_ids.unsqueeze(-1).expand(-1, -1, 3)
-            )
-            gathered_scales = gathered_scales.reshape(b, h, w, 3).permute(
-                0, 3, 1, 2
-            )
-            gir.contributor_scales[:, 0] = torch.where(
-                gir.valid,
-                gathered_scales,
-                torch.zeros_like(gathered_scales),
-            )
-            rotations = state.gaussians.rotations.detach()
-            rotations = torch.where(
-                rotations[..., 3:4] < 0,
-                -rotations,
-                rotations,
-            )
-            gathered_rotations = rotations.gather(
-                1, safe_ids.unsqueeze(-1).expand(-1, -1, 4)
-            ).reshape(b, h, w, 4).permute(0, 3, 1, 2)
-            gir.contributor_rotations = torch.where(
-                gir.valid,
-                gathered_rotations,
-                torch.zeros_like(gathered_rotations),
-            ).unsqueeze(1)
-            harmonics = state.gaussians.harmonics.detach().reshape(
-                b, state.num_gaussians, -1
-            )
-            harmonic_dim = harmonics.shape[-1]
-            gathered_harmonics = harmonics.gather(
-                1,
-                safe_ids.unsqueeze(-1).expand(-1, -1, harmonic_dim),
-            ).reshape(b, h, w, harmonic_dim).permute(0, 3, 1, 2)
-            gir.contributor_harmonics = torch.where(
-                gir.valid,
-                gathered_harmonics,
-                torch.zeros_like(gathered_harmonics),
-            ).unsqueeze(1)
-            gir.contributor_observation_count = (
-                gir.observation_count.unsqueeze(1)
-            )
-
         return gir
 
     @staticmethod
@@ -751,16 +572,10 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         ctx_img_num: int,
         near: float,
         far: float,
+        global_step: int = 0,
         test_add_gate_prune_threshold: float = 0.0,
         test_top1_confidence_mode: str = "inherit",
         test_top1_confidence_floor: float = 0.25,
-        test_correspondence_diagnostics: bool = False,
-        test_correspondence_topk: int = 8,
-        test_old_gs_final_prune_enabled: bool = False,
-        test_old_gs_prune_min_candidate_views: int = 2,
-        test_old_gs_prune_max_top1_rate: float = 0.0,
-        test_old_gs_prune_max_mean_weight: float = 0.01,
-        test_old_gs_prune_max_opacity: float = 1.0,
     ) -> Gaussians:
         refine_info = None if encoder_output.infos is None else encoder_output.infos.get("gs_refine")
         if refine_info is None:
@@ -775,29 +590,6 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             )
         if self.training and prune_threshold > 0.0:
             raise RuntimeError("GIR add-gate pruning is test-only.")
-        correspondence_diagnostics = bool(test_correspondence_diagnostics)
-        if self.training and correspondence_diagnostics:
-            raise RuntimeError("GIR correspondence diagnostics are test-only.")
-        correspondence_topk = max(2, min(16, int(test_correspondence_topk)))
-        old_gs_final_prune_enabled = bool(test_old_gs_final_prune_enabled)
-        if self.training and old_gs_final_prune_enabled:
-            raise RuntimeError("Historical GS pruning is test-only.")
-        if old_gs_final_prune_enabled and not correspondence_diagnostics:
-            raise RuntimeError(
-                "Historical GS pruning requires correspondence diagnostics."
-            )
-        old_gs_prune_min_candidate_views = max(
-            1, int(test_old_gs_prune_min_candidate_views)
-        )
-        old_gs_prune_max_top1_rate = max(
-            0.0, min(1.0, float(test_old_gs_prune_max_top1_rate))
-        )
-        old_gs_prune_max_mean_weight = max(
-            0.0, float(test_old_gs_prune_max_mean_weight)
-        )
-        old_gs_prune_max_opacity = max(
-            0.0, min(1.0, float(test_old_gs_prune_max_opacity))
-        )
         requested_confidence_mode = str(test_top1_confidence_mode)
         if requested_confidence_mode not in {
             "inherit",
@@ -831,25 +623,47 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             getattr(cfg, "gir_raster_evidence_enabled", False)
         )
         use_dominant_ids = bool(getattr(cfg, "gir_dominant_id_enabled", False))
-        if correspondence_diagnostics and not (
-            use_raster_evidence and use_dominant_ids
-        ):
-            raise RuntimeError(
-                "GIR correspondence diagnostics require raster evidence and "
-                "dominant IDs."
-            )
         min_dominant_weight = float(
             max(0.0, getattr(cfg, "gir_dominant_min_weight", 1e-4))
         )
-        soft_update_topk = max(
-            1, min(16, int(getattr(cfg, "gir_soft_update_topk", 1)))
+        old_delete_enabled = bool(
+            getattr(cfg, "gir_old_delete_enabled", False)
         )
-        if soft_update_topk > 1 and not (
-            use_raster_evidence and use_dominant_ids
-        ):
-            raise RuntimeError(
-                "Soft GIR updates require raster evidence and dominant IDs."
+        old_delete_threshold = float(
+            getattr(cfg, "gir_old_delete_threshold", 0.5)
+        )
+        if not 0.0 <= old_delete_threshold <= 1.0:
+            raise ValueError(
+                "GIR old-delete threshold must be in [0, 1], "
+                f"got {old_delete_threshold}."
             )
+        old_delete_temperature = max(
+            1e-4, float(getattr(cfg, "gir_old_delete_temperature", 1.0))
+        )
+        old_delete_min_observations = max(
+            1, int(getattr(cfg, "gir_old_delete_min_observations", 2))
+        )
+        old_delete_test_prune = bool(
+            getattr(cfg, "gir_old_delete_test_prune_enabled", True)
+        )
+        old_delete_warmup_steps = max(
+            0, int(getattr(cfg, "gir_old_delete_warmup_steps", 1000))
+        )
+        old_delete_target_ratio = max(
+            0.0,
+            min(1.0, float(getattr(cfg, "gir_old_delete_target_ratio", 0.01))),
+        )
+        old_delete_warmup_progress = (
+            1.0
+            if not self.training or old_delete_warmup_steps == 0
+            else min(
+                1.0,
+                max(0.0, float(global_step) / old_delete_warmup_steps),
+            )
+        )
+        scheduled_old_delete_target = (
+            old_delete_target_ratio * old_delete_warmup_progress
+        )
         features = refine_info["features"]
         b, source_views, _, h, w = features.shape
         if source_views != ctx_img_num:
@@ -874,12 +688,20 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         history_preserve_losses = []
         history_before_errors = []
         history_after_errors = []
-        history_mask_strengths = []
         history_past_before_errors = []
         history_past_after_errors = []
         history_past_degradations = []
         add_suppression_losses = []
         regularization_losses = []
+        old_delete_budget_losses = []
+        old_delete_candidate_probabilities = []
+        old_delete_candidate_rates = []
+        old_delete_candidate_counts = []
+        old_delete_hard_ratios = []
+        old_delete_removed_opacity_ratios = []
+        old_delete_map_counts_before = []
+        old_delete_map_counts_after = []
+        old_delete_graph_anchor = features.new_zeros(())
         add_gates = []
         add_targets = []
         covered_add_gates = []
@@ -901,25 +723,6 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         top1_ownership_above_0_25 = []
         top1_ownership_above_0_5 = []
         top1_confidence_means = []
-        soft_update_coverages = []
-        corr_top1_weights = []
-        corr_top2_weights = []
-        corr_top2_to_top1 = []
-        corr_top1_top2_relative_gaps = []
-        corr_top2_over_0_5 = []
-        corr_top2_over_0_8 = []
-        corr_contributor_counts = []
-        corr_multi_contributor_ratios = []
-        corr_contributor_cap_ratios = []
-        corr_matched_old_gs_ratios = []
-        corr_pixels_per_matched_gs = []
-        corr_matched_gs_ge_4_pixels = []
-        corr_match_view_hits = None
-        corr_match_pixel_hits = None
-        corr_match_opportunities = None
-        corr_candidate_view_hits = None
-        corr_candidate_weight_sum = None
-        corr_candidate_weight_samples = None
         historical_gates = []
         visible_ratios = []
         residual_magnitudes = []
@@ -973,12 +776,6 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                         (low_h, low_w),
                         use_dominant_ids,
                         min_dominant_weight,
-                        max(
-                            soft_update_topk,
-                            correspondence_topk
-                            if correspondence_diagnostics
-                            else 1,
-                        ),
                     )
 
             if use_raster_evidence:
@@ -989,145 +786,6 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     (gir.dominant_weight * gir.valid).sum() / valid_count
                 )
 
-            if correspondence_diagnostics and has_history:
-                if (
-                    gir.contributor_ids is None
-                    or gir.contributor_weights is None
-                ):
-                    raise RuntimeError(
-                        "GIR correspondence diagnostics require contributor IDs "
-                        "and weights from the rasterizer."
-                    )
-                contributor_weights = gir.contributor_weights.detach().float()
-                valid_float_corr = gir.valid.detach().float()
-                valid_count_corr = valid_float_corr.sum().clamp_min(1.0)
-                top1_weight = contributor_weights[:, 0:1]
-                top2_weight = contributor_weights[:, 1:2]
-                top2_ratio = top2_weight / top1_weight.clamp_min(1e-8)
-                significant_count = (
-                    contributor_weights >= min_dominant_weight
-                ).sum(dim=1, keepdim=True).float()
-
-                def masked_pixel_mean(values: torch.Tensor) -> torch.Tensor:
-                    return (
-                        values * valid_float_corr
-                    ).sum() / valid_count_corr
-
-                corr_top1_weights.append(masked_pixel_mean(top1_weight))
-                corr_top2_weights.append(masked_pixel_mean(top2_weight))
-                corr_top2_to_top1.append(masked_pixel_mean(top2_ratio))
-                corr_top1_top2_relative_gaps.append(
-                    masked_pixel_mean(1.0 - top2_ratio)
-                )
-                corr_top2_over_0_5.append(
-                    masked_pixel_mean((top2_ratio >= 0.5).float())
-                )
-                corr_top2_over_0_8.append(
-                    masked_pixel_mean((top2_ratio >= 0.8).float())
-                )
-                corr_contributor_counts.append(
-                    masked_pixel_mean(significant_count)
-                )
-                corr_multi_contributor_ratios.append(
-                    masked_pixel_mean((significant_count >= 2).float())
-                )
-                corr_contributor_cap_ratios.append(
-                    masked_pixel_mean(
-                        (significant_count >= correspondence_topk).float()
-                    )
-                )
-
-                if (
-                    corr_match_view_hits is None
-                    or corr_match_pixel_hits is None
-                    or corr_match_opportunities is None
-                    or corr_candidate_view_hits is None
-                    or corr_candidate_weight_sum is None
-                    or corr_candidate_weight_samples is None
-                ):
-                    raise RuntimeError(
-                        "GIR correspondence counters were not initialized."
-                    )
-                corr_match_opportunities = corr_match_opportunities + 1
-                per_gs_pixel_hits = torch.zeros_like(corr_match_pixel_hits)
-                per_gs_candidate_hits = torch.zeros_like(corr_match_pixel_hits)
-                per_gs_candidate_weight_sum = torch.zeros_like(
-                    corr_match_pixel_hits
-                )
-                per_gs_candidate_weight_samples = torch.zeros_like(
-                    corr_match_pixel_hits
-                )
-                for batch_idx in range(b):
-                    valid_ids = gir.indices[batch_idx][
-                        gir.valid[batch_idx, 0]
-                    ]
-                    if valid_ids.numel() > 0:
-                        per_gs_pixel_hits[batch_idx].scatter_add_(
-                            0,
-                            valid_ids,
-                            torch.ones_like(
-                                valid_ids,
-                                dtype=per_gs_pixel_hits.dtype,
-                            ),
-                        )
-                    contributor_ids = gir.contributor_ids[batch_idx].reshape(-1)
-                    contributor_weights = gir.contributor_weights[batch_idx].reshape(
-                        -1
-                    ).float()
-                    contributor_valid = (
-                        contributor_weights >= min_dominant_weight
-                    ) & (contributor_ids >= 0) & (
-                        contributor_ids < state.num_gaussians
-                    )
-                    contributor_ids = contributor_ids[contributor_valid]
-                    contributor_weights = contributor_weights[contributor_valid]
-                    if contributor_ids.numel() > 0:
-                        per_gs_candidate_hits[batch_idx].scatter_add_(
-                            0,
-                            contributor_ids,
-                            torch.ones_like(
-                                contributor_ids,
-                                dtype=per_gs_candidate_hits.dtype,
-                            ),
-                        )
-                        per_gs_candidate_weight_sum[batch_idx].scatter_add_(
-                            0,
-                            contributor_ids,
-                            contributor_weights,
-                        )
-                        per_gs_candidate_weight_samples[batch_idx].scatter_add_(
-                            0,
-                            contributor_ids,
-                            torch.ones_like(contributor_weights),
-                        )
-                matched_old_gs = per_gs_pixel_hits > 0
-                candidate_old_gs = per_gs_candidate_hits > 0
-                matched_count = matched_old_gs.sum().clamp_min(1)
-                corr_match_pixel_hits = (
-                    corr_match_pixel_hits + per_gs_pixel_hits
-                )
-                corr_match_view_hits = corr_match_view_hits + matched_old_gs
-                corr_candidate_view_hits = (
-                    corr_candidate_view_hits + candidate_old_gs
-                )
-                corr_candidate_weight_sum = (
-                    corr_candidate_weight_sum + per_gs_candidate_weight_sum
-                )
-                corr_candidate_weight_samples = (
-                    corr_candidate_weight_samples
-                    + per_gs_candidate_weight_samples
-                )
-                corr_matched_old_gs_ratios.append(
-                    matched_old_gs.float().mean()
-                )
-                corr_pixels_per_matched_gs.append(
-                    per_gs_pixel_hits.sum() / matched_count
-                )
-                corr_matched_gs_ge_4_pixels.append(
-                    ((per_gs_pixel_hits >= 4) & matched_old_gs).sum()
-                    / matched_count
-                )
-
             prediction = self.gir_update_head(
                 current_feature,
                 current_rgb,
@@ -1135,16 +793,10 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 current_depth_confidence,
                 gir,
             )
-            prediction.historical_gate = prediction.historical_gate + float(
-                getattr(cfg, "gir_history_gate_bias", -4.0)
+            old_delete_graph_anchor = (
+                old_delete_graph_anchor + 0.0 * prediction.delete_logit.sum()
             )
-            historical_contributor_valid = prediction.historical_gate.new_zeros(
-                (
-                    prediction.historical_gate.shape[0],
-                    prediction.historical_gate.shape[1],
-                    *prediction.historical_gate.shape[-2:],
-                )
-            )
+            prediction.historical_gate = prediction.historical_gate - 4.0
 
             if has_history:
                 history_interval = max(
@@ -1207,69 +859,40 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 evidence_alpha = (
                     gir.raster_alpha if use_raster_evidence else gir.opacity
                 ).detach().float()
-                valid_float = gir.valid.detach().float()
-                valid_count = valid_float.sum().clamp_min(1.0)
-                top1_ownership = (
+                ownership = (
                     gir.dominant_weight.detach().float()
                     / evidence_alpha.clamp_min(1e-6)
                 ).clamp(0.0, 1.0)
-                if (
-                    soft_update_topk > 1
-                    and gir.contributor_weights is not None
-                ):
-                    correspondence_weight = gir.contributor_weights[
-                        :, :soft_update_topk
-                    ].sum(dim=1, keepdim=True).detach().float()
-                    soft_coverage = (
-                        correspondence_weight
-                        / evidence_alpha.clamp_min(1e-6)
-                    ).clamp(0.0, 1.0)
-                    soft_update_coverages.append(
-                        (soft_coverage * gir.valid.detach().float()).sum()
-                        / valid_count
-                    )
+                valid_float = gir.valid.detach().float()
+                valid_count = valid_float.sum().clamp_min(1.0)
                 top1_ownership_means.append(
-                    (top1_ownership * valid_float).sum() / valid_count
+                    (ownership * valid_float).sum() / valid_count
                 )
                 top1_ownership_above_0_1.append(
-                    ((top1_ownership > 0.1).float() * valid_float).sum()
+                    ((ownership > 0.1).float() * valid_float).sum()
                     / valid_count
                 )
                 top1_ownership_above_0_25.append(
-                    ((top1_ownership > 0.25).float() * valid_float).sum()
+                    ((ownership > 0.25).float() * valid_float).sum()
                     / valid_count
                 )
                 top1_ownership_above_0_5.append(
-                    ((top1_ownership > 0.5).float() * valid_float).sum()
+                    ((ownership > 0.5).float() * valid_float).sum()
                     / valid_count
                 )
                 historical_update_confidence = None
-                contributor_ownership = top1_ownership.unsqueeze(1)
-                if gir.contributor_weights is not None:
-                    contributor_ownership = (
-                        gir.contributor_weights[:, :soft_update_topk].detach().float()
-                        / evidence_alpha.clamp_min(1e-6)
-                    ).clamp(0.0, 1.0)
-                historical_contributor_valid = (contributor_ownership > 0).to(
-                    contributor_ownership.dtype
-                )
                 if top1_confidence_mode == "sqrt":
-                    historical_update_confidence = (
-                        contributor_ownership.sqrt()
-                        * historical_contributor_valid
-                    )
+                    historical_update_confidence = ownership.sqrt()
                 elif top1_confidence_mode == "floor_sqrt":
-                    historical_update_confidence = (
-                        confidence_floor
-                        + (1.0 - confidence_floor)
-                        * contributor_ownership.sqrt()
-                    ) * historical_contributor_valid
+                    historical_update_confidence = confidence_floor + (
+                        1.0 - confidence_floor
+                    ) * ownership.sqrt()
                 if historical_update_confidence is None:
-                    top1_confidence_means.append(top1_ownership.new_ones(()))
+                    top1_confidence_means.append(ownership.new_ones(()))
                 else:
                     top1_confidence_means.append(
-                        historical_update_confidence.sum()
-                        / historical_contributor_valid.sum().clamp_min(1.0)
+                        (historical_update_confidence * valid_float).sum()
+                        / valid_count
                     )
 
                 state = state.update_historical(
@@ -1277,8 +900,50 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     prediction,
                     pred_all_extrinsic[:, view_idx],
                     update_confidence=historical_update_confidence,
-                    num_contributors=soft_update_topk,
                 )
+
+                if old_delete_enabled:
+                    state, delete_stats = state.delete_historical(
+                        gir,
+                        prediction.delete_logit,
+                        min_observations=old_delete_min_observations,
+                        threshold=old_delete_threshold,
+                        temperature=old_delete_temperature,
+                        physical_prune=(
+                            not self.training and old_delete_test_prune
+                        ),
+                    )
+                    old_delete_candidate_probabilities.append(
+                        delete_stats["candidate_probability_mean"]
+                    )
+                    old_delete_candidate_counts.append(
+                        delete_stats["candidate_count"]
+                    )
+                    old_delete_candidate_rates.append(
+                        delete_stats["candidate_delete_rate"]
+                    )
+                    old_delete_hard_ratios.append(
+                        delete_stats["hard_deleted_ratio"]
+                    )
+                    old_delete_removed_opacity_ratios.append(
+                        delete_stats["removed_opacity_mass_ratio"]
+                    )
+                    old_delete_map_counts_before.append(
+                        delete_stats["map_count_before"]
+                    )
+                    old_delete_map_counts_after.append(
+                        delete_stats["map_count_after"]
+                    )
+
+                    if self.training and bool(
+                        delete_stats["candidate_count"] > 0
+                    ):
+                        old_delete_budget_losses.append(
+                            (
+                                delete_stats["candidate_delete_rate"]
+                                - scheduled_old_delete_target
+                            ).abs()
+                        )
 
                 if (
                     self.training
@@ -1306,56 +971,8 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                         mode="bilinear",
                         align_corners=False,
                     ).to(history_after_render.color.dtype)
-                    current_depth_low = F.interpolate(
-                        current_depth.detach().float(),
-                        size=(low_h, low_w),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                    history_depth = (
-                        gir.raster_depth if use_raster_evidence else gir.depth
-                    ).detach().float()
-                    history_alpha = (
-                        gir.raster_alpha if use_raster_evidence else gir.opacity
-                    ).detach().float()
-                    alpha_threshold = min(
-                        0.99,
-                        max(
-                            0.0,
-                            float(
-                                getattr(cfg, "gir_history_alpha_threshold", 0.10)
-                            ),
-                        ),
-                    )
-                    depth_tolerance = max(
-                        1e-3,
-                        float(
-                            getattr(cfg, "gir_history_depth_tolerance", 0.20)
-                        ),
-                    )
-                    alpha_support = (
-                        (history_alpha - alpha_threshold)
-                        / max(1.0 - alpha_threshold, 1e-3)
-                    ).clamp(0.0, 1.0)
-                    relative_depth_error = (
-                        (history_depth - current_depth_low).abs()
-                        / current_depth_low.clamp_min(1e-4)
-                    )
-                    depth_support = torch.exp(
-                        -0.5 * (relative_depth_error / depth_tolerance).square()
-                    )
-                    depth_valid = (
-                        (history_depth > 1e-5) & (current_depth_low > 1e-5)
-                    ).to(depth_support.dtype)
-                    history_valid = gir.valid.detach().float() * depth_valid
-                    history_mask = (
-                        history_valid * alpha_support * depth_support
-                    ).to(history_after_render.color.dtype)
+                    history_mask = gir.valid.to(history_after_render.color.dtype)
                     history_normalizer = history_mask.sum().clamp_min(1.0)
-                    history_mask_strengths.append(
-                        history_mask.sum()
-                        / history_valid.sum().clamp_min(1.0).to(history_mask.dtype)
-                    )
                     before_error = torch.sqrt(
                         (gir.rgb.to(history_target.dtype) - history_target).square()
                         + 1e-6
@@ -1601,33 +1218,21 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                         ratios.append(
                             (effective_opacity_float > threshold).float().mean()
                         )
-            historical_coverage = historical_contributor_valid.to(
-                prediction.historical_gate.dtype
-            )
             historical_gates.append(
-                (
-                    prediction.historical_gate.sigmoid()
-                    * historical_coverage.unsqueeze(2)
-                ).sum()
-                / historical_coverage.sum().clamp_min(1.0)
+                (prediction.historical_gate.sigmoid() * coverage).sum()
+                / coverage.sum().clamp_min(1.0)
             )
+            valid_normalizer = coverage.sum().clamp_min(1.0)
             residual_energy = (
-                prediction.delta_mean_camera.square().sum(dim=2, keepdim=True)
-                + prediction.delta_rotation.square().sum(dim=2, keepdim=True)
-                + prediction.delta_log_scale.square().sum(dim=2, keepdim=True)
+                prediction.delta_mean_camera.square().sum(dim=1, keepdim=True)
+                + prediction.delta_rotation.square().sum(dim=1, keepdim=True)
+                + prediction.delta_log_scale.square().sum(dim=1, keepdim=True)
                 + prediction.delta_opacity_logit.square()
-                + prediction.delta_harmonics.square().mean(dim=2, keepdim=True)
+                + prediction.delta_harmonics.square().mean(dim=1, keepdim=True)
             )
-            historical_coverage = historical_coverage.unsqueeze(2)
-            historical_normalizer = historical_coverage.sum().clamp_min(1.0)
-            residual_magnitudes.append(
-                (
-                    residual_energy * historical_coverage
-                ).sum().div(historical_normalizer).sqrt()
-            )
+            residual_magnitudes.append(residual_energy.mean().sqrt())
             regularization_losses.append(
-                (residual_energy * historical_coverage).sum()
-                / historical_normalizer
+                (residual_energy * coverage).sum() / valid_normalizer
                 + new_residual_energy.mean()
             )
 
@@ -1636,30 +1241,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     current_gaussians,
                     add_gate,
                 )
-                if correspondence_diagnostics:
-                    counter_shape = (b, state.num_gaussians)
-                    corr_match_view_hits = torch.zeros(
-                        counter_shape,
-                        device=features.device,
-                        dtype=torch.float32,
-                    )
-                    corr_match_pixel_hits = torch.zeros_like(
-                        corr_match_view_hits
-                    )
-                    corr_match_opportunities = torch.zeros_like(
-                        corr_match_view_hits
-                    )
-                    corr_candidate_view_hits = torch.zeros_like(
-                        corr_match_view_hits
-                    )
-                    corr_candidate_weight_sum = torch.zeros_like(
-                        corr_match_view_hits
-                    )
-                    corr_candidate_weight_samples = torch.zeros_like(
-                        corr_match_view_hits
-                    )
             else:
-                previous_gaussian_count = state.num_gaussians
                 if not self.training:
                     test_pruned_new_ratios.append(
                         (add_gate < prune_threshold).float().mean()
@@ -1671,40 +1253,6 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     add_gate,
                     prune_threshold=prune_threshold,
                 )
-                if correspondence_diagnostics:
-                    added_gaussians = state.num_gaussians - previous_gaussian_count
-                    if added_gaussians < 0:
-                        raise RuntimeError(
-                            "GIR append unexpectedly reduced the map size."
-                        )
-                    if added_gaussians > 0:
-                        counter_padding = torch.zeros(
-                            (b, added_gaussians),
-                            device=features.device,
-                            dtype=torch.float32,
-                        )
-                        corr_match_view_hits = torch.cat(
-                            [corr_match_view_hits, counter_padding], dim=1
-                        )
-                        corr_match_pixel_hits = torch.cat(
-                            [corr_match_pixel_hits, counter_padding], dim=1
-                        )
-                        corr_match_opportunities = torch.cat(
-                            [corr_match_opportunities, counter_padding], dim=1
-                        )
-                        corr_candidate_view_hits = torch.cat(
-                            [corr_candidate_view_hits, counter_padding], dim=1
-                        )
-                        corr_candidate_weight_sum = torch.cat(
-                            [corr_candidate_weight_sum, counter_padding], dim=1
-                        )
-                        corr_candidate_weight_samples = torch.cat(
-                            [
-                                corr_candidate_weight_samples,
-                                counter_padding,
-                            ],
-                            dim=1,
-                        )
 
             if self.training and cfg.gir_aux_loss_weight > 0:
                 replay_count = max(0, int(cfg.gir_replay_views))
@@ -1757,91 +1305,6 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         if state is None:
             return encoder_output.gaussians
 
-        map_gaussians_before_old_prune = state.num_gaussians
-        old_gs_prune_stats = None
-        if old_gs_final_prune_enabled:
-            if b != 1:
-                raise RuntimeError(
-                    "Test-only historical GS pruning currently requires batch size 1."
-                )
-            if (
-                corr_candidate_view_hits is None
-                or corr_candidate_weight_sum is None
-                or corr_candidate_weight_samples is None
-                or corr_match_view_hits is None
-            ):
-                raise RuntimeError(
-                    "Historical GS pruning requires completed correspondence counters."
-                )
-
-            candidate_views = corr_candidate_view_hits[0]
-            top1_views = corr_match_view_hits[0]
-            mean_candidate_weight = corr_candidate_weight_sum[0] / (
-                corr_candidate_weight_samples[0].clamp_min(1.0)
-            )
-            candidate_eligible = (
-                candidate_views >= old_gs_prune_min_candidate_views
-            )
-            top1_rate = top1_views / candidate_views.clamp_min(1.0)
-            opacity = state.gaussians.opacities[0].detach().float()
-            prune_mask = (
-                candidate_eligible
-                & (top1_rate <= old_gs_prune_max_top1_rate)
-                & (mean_candidate_weight <= old_gs_prune_max_mean_weight)
-                & (opacity <= old_gs_prune_max_opacity)
-            )
-            keep_mask = ~prune_mask
-            safeguard_kept = False
-            if not keep_mask.any():
-                safeguard_index = opacity.argmax()
-                keep_mask[safeguard_index] = True
-                prune_mask[safeguard_index] = False
-                safeguard_kept = True
-
-            map_count_before = state.num_gaussians
-            removed_opacity_mass = opacity[prune_mask].sum()
-            total_opacity_mass = opacity.sum().clamp_min(1e-8)
-            state = state.select(keep_mask)
-            old_gs_prune_stats = {
-                "gir_test_old_gs_prune_enabled": torch.tensor(
-                    1.0, device=features.device
-                ),
-                "gir_test_old_gs_prune_min_candidate_views": torch.tensor(
-                    old_gs_prune_min_candidate_views,
-                    device=features.device,
-                    dtype=torch.float32,
-                ),
-                "gir_test_old_gs_prune_max_top1_rate": torch.tensor(
-                    old_gs_prune_max_top1_rate, device=features.device
-                ),
-                "gir_test_old_gs_prune_max_mean_weight": torch.tensor(
-                    old_gs_prune_max_mean_weight, device=features.device
-                ),
-                "gir_test_old_gs_prune_max_opacity": torch.tensor(
-                    old_gs_prune_max_opacity, device=features.device
-                ),
-                "gir_test_old_gs_prune_map_before": torch.tensor(
-                    map_count_before,
-                    device=features.device,
-                    dtype=torch.float32,
-                ),
-                "gir_test_old_gs_prune_map_after": torch.tensor(
-                    state.num_gaussians,
-                    device=features.device,
-                    dtype=torch.float32,
-                ),
-                "gir_test_old_gs_prune_ratio": prune_mask.float().mean(),
-                "gir_test_old_gs_prune_candidate_eligible_ratio": (
-                    candidate_eligible.float().mean()
-                ),
-                "gir_test_old_gs_prune_removed_opacity_mass_ratio": (
-                    removed_opacity_mass / total_opacity_mass
-                ),
-                "gir_test_old_gs_prune_safeguard_kept": torch.tensor(
-                    float(safeguard_kept), device=features.device
-                ),
-            }
-
         if encoder_output.infos is not None:
             encoder_output.infos.pop("gs_refine", None)
             encoder_output.infos["gir_history_views"] = torch.tensor(
@@ -1850,8 +1313,6 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             encoder_output.infos["gir_map_gaussians"] = torch.tensor(
                 state.num_gaussians, device=features.device
             )
-            if old_gs_prune_stats is not None:
-                encoder_output.infos.update(old_gs_prune_stats)
             if test_pruned_new_ratios:
                 unpruned_map_gaussians = source_views * gaussians_per_view
                 encoder_output.infos["gir_test_prune_threshold"] = torch.tensor(
@@ -1862,9 +1323,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     test_pruned_new_ratios
                 ).mean()
                 encoder_output.infos["gir_test_map_reduction_ratio"] = torch.tensor(
-                    1.0
-                    - map_gaussians_before_old_prune
-                    / max(unpruned_map_gaussians, 1),
+                    1.0 - state.num_gaussians / max(unpruned_map_gaussians, 1),
                     device=features.device,
                 )
             if top1_ownership_means:
@@ -1894,120 +1353,6 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 encoder_output.infos["gir_top1_confidence_mean"] = torch.stack(
                     top1_confidence_means
                 ).mean()
-            if soft_update_coverages:
-                encoder_output.infos["gir_soft_update_topk"] = torch.tensor(
-                    soft_update_topk,
-                    device=features.device,
-                    dtype=torch.float32,
-                )
-                encoder_output.infos[
-                    "gir_soft_update_coverage_mean"
-                ] = torch.stack(soft_update_coverages).mean()
-            if correspondence_diagnostics and corr_top1_weights:
-                encoder_output.infos[
-                    "gir_test_corr_top1_weight_mean"
-                ] = torch.stack(corr_top1_weights).mean()
-                encoder_output.infos[
-                    "gir_test_corr_top2_weight_mean"
-                ] = torch.stack(corr_top2_weights).mean()
-                encoder_output.infos[
-                    "gir_test_corr_top2_to_top1_mean"
-                ] = torch.stack(corr_top2_to_top1).mean()
-                encoder_output.infos[
-                    "gir_test_corr_top1_top2_relative_gap_mean"
-                ] = torch.stack(corr_top1_top2_relative_gaps).mean()
-                encoder_output.infos[
-                    "gir_test_corr_top2_over_0_5_ratio"
-                ] = torch.stack(corr_top2_over_0_5).mean()
-                encoder_output.infos[
-                    "gir_test_corr_top2_over_0_8_ratio"
-                ] = torch.stack(corr_top2_over_0_8).mean()
-                encoder_output.infos[
-                    "gir_test_corr_significant_contributors_mean"
-                ] = torch.stack(corr_contributor_counts).mean()
-                encoder_output.infos[
-                    "gir_test_corr_multi_contributor_pixel_ratio"
-                ] = torch.stack(corr_multi_contributor_ratios).mean()
-                encoder_output.infos[
-                    "gir_test_corr_contributor_cap_ratio"
-                ] = torch.stack(corr_contributor_cap_ratios).mean()
-                encoder_output.infos[
-                    "gir_test_corr_matched_old_gs_per_view_ratio"
-                ] = torch.stack(corr_matched_old_gs_ratios).mean()
-                encoder_output.infos[
-                    "gir_test_corr_pixels_per_matched_gs"
-                ] = torch.stack(corr_pixels_per_matched_gs).mean()
-                encoder_output.infos[
-                    "gir_test_corr_matched_gs_ge_4_pixels_ratio"
-                ] = torch.stack(corr_matched_gs_ge_4_pixels).mean()
-
-                if (
-                    corr_match_view_hits is None
-                    or corr_match_pixel_hits is None
-                    or corr_match_opportunities is None
-                    or corr_candidate_view_hits is None
-                ):
-                    raise RuntimeError(
-                        "GIR correspondence counters are missing at rollout end."
-                    )
-                eligible = corr_match_opportunities > 0
-                eligible_count = eligible.sum().clamp_min(1)
-                long_term = corr_match_opportunities >= 2
-                long_term_count = long_term.sum().clamp_min(1)
-                candidate_visible = corr_candidate_view_hits > 0
-                candidate_visible_count = candidate_visible.sum().clamp_min(1)
-                encoder_output.infos[
-                    "gir_test_corr_old_gs_with_future_view_ratio"
-                ] = eligible.float().mean()
-                encoder_output.infos[
-                    "gir_test_corr_never_top1_after_future_view_ratio"
-                ] = (
-                    ((corr_match_view_hits == 0) & eligible).sum()
-                    / eligible_count
-                )
-                encoder_output.infos[
-                    "gir_test_corr_never_top1_after_2_future_views_ratio"
-                ] = (
-                    ((corr_match_view_hits == 0) & long_term).sum()
-                    / long_term_count
-                )
-                encoder_output.infos[
-                    "gir_test_corr_old_gs_future_view_top1_rate"
-                ] = (
-                    (corr_match_view_hits / corr_match_opportunities.clamp_min(1))
-                    * eligible
-                ).sum() / eligible_count
-                encoder_output.infos[
-                    "gir_test_corr_old_gs_top1_pixels_per_future_view"
-                ] = (
-                    (corr_match_pixel_hits / corr_match_opportunities.clamp_min(1))
-                    * eligible
-                ).sum() / eligible_count
-                encoder_output.infos[
-                    "gir_test_corr_old_gs_candidate_visible_ratio"
-                ] = candidate_visible.sum() / eligible_count
-                encoder_output.infos[
-                    "gir_test_corr_candidate_never_top1_ratio"
-                ] = (
-                    ((corr_match_view_hits == 0) & candidate_visible).sum()
-                    / candidate_visible_count
-                )
-                encoder_output.infos[
-                    "gir_test_corr_top1_given_candidate_view_rate"
-                ] = (
-                    (
-                        corr_match_view_hits
-                        / corr_candidate_view_hits.clamp_min(1)
-                    )
-                    * candidate_visible
-                ).sum() / candidate_visible_count
-                encoder_output.infos[
-                    "gir_test_corr_topk"
-                ] = torch.tensor(
-                    correspondence_topk,
-                    device=features.device,
-                    dtype=torch.float32,
-                )
             encoder_output.infos["gir_add_gate"] = torch.stack(add_gates).mean()
             if add_suppression_losses:
                 encoder_output.infos["gir_add_loss"] = torch.stack(
@@ -2079,9 +1424,6 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 encoder_output.infos["gir_history_after_error"] = torch.stack(
                     history_after_errors
                 ).mean()
-                encoder_output.infos["gir_history_mask_strength"] = torch.stack(
-                    history_mask_strengths
-                ).mean()
             if history_preserve_losses:
                 encoder_output.infos["gir_history_preserve_loss"] = torch.stack(
                     history_preserve_losses
@@ -2101,7 +1443,54 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 ).mean()
             encoder_output.infos["gir_regularization_loss"] = torch.stack(
                 regularization_losses
-            ).mean()
+            ).mean() + old_delete_graph_anchor
+            if old_delete_enabled:
+                if old_delete_budget_losses:
+                    old_delete_budget_loss = torch.stack(
+                        old_delete_budget_losses
+                    ).mean()
+                else:
+                    old_delete_budget_loss = old_delete_graph_anchor
+                encoder_output.infos[
+                    "gir_old_delete_budget_loss"
+                ] = old_delete_budget_loss + old_delete_graph_anchor
+                encoder_output.infos["gir_old_delete_target_ratio"] = torch.tensor(
+                    scheduled_old_delete_target,
+                    device=features.device,
+                )
+                encoder_output.infos["gir_old_delete_threshold"] = torch.tensor(
+                    old_delete_threshold, device=features.device
+                )
+                if old_delete_candidate_probabilities:
+                    candidate_counts = torch.stack(old_delete_candidate_counts)
+                    total_candidates = candidate_counts.sum().clamp_min(1.0)
+                    encoder_output.infos[
+                        "gir_old_delete_candidate_probability"
+                    ] = (
+                        torch.stack(old_delete_candidate_probabilities)
+                        * candidate_counts
+                    ).sum() / total_candidates
+                    encoder_output.infos[
+                        "gir_old_delete_candidate_count"
+                    ] = candidate_counts.mean()
+                    encoder_output.infos[
+                        "gir_old_delete_candidate_rate"
+                    ] = (
+                        torch.stack(old_delete_candidate_rates)
+                        * candidate_counts
+                    ).sum() / total_candidates
+                    encoder_output.infos[
+                        "gir_old_delete_hard_ratio"
+                    ] = torch.stack(old_delete_hard_ratios).mean()
+                    encoder_output.infos[
+                        "gir_old_delete_removed_opacity_mass_ratio"
+                    ] = torch.stack(old_delete_removed_opacity_ratios).mean()
+                    encoder_output.infos[
+                        "gir_old_delete_map_count_before"
+                    ] = torch.stack(old_delete_map_counts_before).mean()
+                    encoder_output.infos[
+                        "gir_old_delete_map_count_after"
+                    ] = torch.stack(old_delete_map_counts_after).mean()
 
         return state.gaussians
 
@@ -2114,16 +1503,10 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         ctx_img_num: int,
         near: float,
         far: float,
+        global_step: int = 0,
         test_add_gate_prune_threshold: float = 0.0,
         test_top1_confidence_mode: str = "inherit",
         test_top1_confidence_floor: float = 0.25,
-        test_correspondence_diagnostics: bool = False,
-        test_correspondence_topk: int = 8,
-        test_old_gs_final_prune_enabled: bool = False,
-        test_old_gs_prune_min_candidate_views: int = 2,
-        test_old_gs_prune_max_top1_rate: float = 0.0,
-        test_old_gs_prune_max_mean_weight: float = 0.01,
-        test_old_gs_prune_max_opacity: float = 1.0,
     ) -> Gaussians:
         if self.gir_update_head is not None:
             return self._update_streaming_gaussians(
@@ -2134,16 +1517,10 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 ctx_img_num,
                 near,
                 far,
+                global_step,
                 test_add_gate_prune_threshold,
                 test_top1_confidence_mode,
                 test_top1_confidence_floor,
-                test_correspondence_diagnostics,
-                test_correspondence_topk,
-                test_old_gs_final_prune_enabled,
-                test_old_gs_prune_min_candidate_views,
-                test_old_gs_prune_max_top1_rate,
-                test_old_gs_prune_max_mean_weight,
-                test_old_gs_prune_max_opacity,
             )
         if self.gs_residual_refiner is None:
             return encoder_output.gaussians
@@ -2807,6 +2184,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             ctx_img_num,
             near,
             far,
+            global_step,
         )
         encoder_output.gaussians = gaussians
 

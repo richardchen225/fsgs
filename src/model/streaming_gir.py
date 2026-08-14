@@ -59,16 +59,6 @@ class DominantGIR:
     raster_depth: torch.Tensor
     raster_alpha: torch.Tensor
     dominant_weight: torch.Tensor
-    contributor_ids: torch.Tensor | None = None
-    contributor_weights: torch.Tensor | None = None
-    contributor_rgb: torch.Tensor | None = None
-    contributor_depth: torch.Tensor | None = None
-    contributor_camera_points: torch.Tensor | None = None
-    contributor_opacity: torch.Tensor | None = None
-    contributor_scales: torch.Tensor | None = None
-    contributor_rotations: torch.Tensor | None = None
-    contributor_harmonics: torch.Tensor | None = None
-    contributor_observation_count: torch.Tensor | None = None
 
     @classmethod
     def empty(
@@ -114,6 +104,7 @@ class GIRPrediction:
     current_delta_opacity_logit: torch.Tensor
     current_delta_harmonics: torch.Tensor
     current_residual_gate: torch.Tensor
+    delete_logit: torch.Tensor
 
 
 def apply_current_gaussian_residual(
@@ -213,31 +204,6 @@ class StreamingGaussianState:
             observation_count=self.observation_count.detach(),
         )
 
-    def select(self, keep: torch.Tensor) -> "StreamingGaussianState":
-        if self.batch_size != 1:
-            raise RuntimeError(
-                "Test-only GIR map selection currently requires batch size 1."
-            )
-        keep = keep.reshape(-1).to(device=self.gaussians.means.device, dtype=torch.bool)
-        if keep.numel() != self.num_gaussians:
-            raise ValueError(
-                "GIR map selection mask has the wrong size: "
-                f"mask={keep.numel()}, gaussians={self.num_gaussians}."
-            )
-        if not keep.any():
-            raise RuntimeError("GIR map selection cannot remove every Gaussian.")
-        return StreamingGaussianState(
-            gaussians=Gaussians(
-                means=self.gaussians.means[:, keep],
-                harmonics=self.gaussians.harmonics[:, keep],
-                opacities=self.gaussians.opacities[:, keep],
-                scales=self.gaussians.scales[:, keep],
-                rotations=self.gaussians.rotations[:, keep],
-            ),
-            stable_ids=self.stable_ids[:, keep],
-            observation_count=self.observation_count[:, keep],
-        )
-
     @classmethod
     def from_current(
         cls,
@@ -317,46 +283,172 @@ class StreamingGaussianState:
             ),
         )
 
+    def select(self, keep: torch.Tensor) -> "StreamingGaussianState":
+        """Physically filter a batch-one streaming map during inference."""
+        if self.batch_size != 1 or keep.dim() != 1:
+            raise RuntimeError(
+                "Physical historical GS pruning requires a 1D mask and batch size 1."
+            )
+        if keep.numel() != self.num_gaussians:
+            raise RuntimeError(
+                "Historical GS pruning mask size does not match the map: "
+                f"mask={keep.numel()}, map={self.num_gaussians}."
+            )
+        return StreamingGaussianState(
+            gaussians=Gaussians(
+                means=self.gaussians.means[:, keep],
+                harmonics=self.gaussians.harmonics[:, keep],
+                opacities=self.gaussians.opacities[:, keep],
+                scales=self.gaussians.scales[:, keep],
+                rotations=self.gaussians.rotations[:, keep],
+            ),
+            stable_ids=self.stable_ids[:, keep],
+            observation_count=self.observation_count[:, keep],
+        )
+
+    def delete_historical(
+        self,
+        gir: DominantGIR,
+        delete_logit: torch.Tensor,
+        min_observations: int,
+        threshold: float,
+        temperature: float,
+        physical_prune: bool,
+    ) -> tuple["StreamingGaussianState", dict[str, torch.Tensor]]:
+        """Aggregate top-1 pixel decisions and suppress matched historical GS."""
+        b, n = self.gaussians.opacities.shape
+        delete_probabilities = []
+        candidate_masks = []
+
+        # Keep scatter reductions in float32. Half-precision 0/0 on unsupported
+        # Gaussians was the source of unstable gradients in earlier experiments.
+        pixel_probability = torch.sigmoid(
+            delete_logit.float() / max(float(temperature), 1e-4)
+        )
+        for batch_idx in range(b):
+            point_indices = gir.indices[batch_idx].reshape(-1)
+            valid = point_indices >= 0
+            safe_indices = point_indices.clamp_min(0)
+            support = (
+                gir.dominant_weight[batch_idx].reshape(-1).detach().float()
+                * valid.float()
+            )
+            weighted_probability = (
+                pixel_probability[batch_idx].reshape(-1) * support
+            )
+            numerator = torch.zeros(
+                n, device=delete_logit.device, dtype=torch.float32
+            ).scatter_add(0, safe_indices, weighted_probability)
+            denominator = torch.zeros_like(numerator).scatter_add(
+                0, safe_indices, support
+            )
+            has_support = denominator > 0
+            probability = torch.where(
+                has_support,
+                numerator / denominator.clamp_min(1e-8),
+                torch.zeros_like(numerator),
+            )
+            candidate = has_support & (
+                self.observation_count[batch_idx].detach()
+                >= float(max(1, min_observations))
+            )
+            delete_probabilities.append(probability)
+            candidate_masks.append(candidate)
+
+        delete_soft = torch.stack(delete_probabilities)
+        candidate_mask = torch.stack(candidate_masks)
+        delete_soft = delete_soft * candidate_mask.to(delete_soft.dtype)
+        delete_hard = candidate_mask & (delete_soft >= float(threshold))
+
+        physical_keep = None
+        if physical_prune:
+            if b != 1:
+                raise RuntimeError(
+                    "Physical historical GS pruning is test-only and requires batch size 1."
+                )
+            if bool(delete_hard.any()):
+                physical_keep = ~delete_hard[0]
+                if not bool(physical_keep.any()):
+                    safeguard_index = (
+                        self.gaussians.opacities[0].detach().float().argmax()
+                    )
+                    delete_hard = delete_hard.clone()
+                    delete_hard[0, safeguard_index] = False
+                    physical_keep = ~delete_hard[0]
+
+        if self.gaussians.opacities.requires_grad or delete_logit.requires_grad:
+            delete_gate = (
+                delete_hard.to(delete_soft.dtype).detach()
+                - delete_soft.detach()
+                + delete_soft
+            )
+        else:
+            delete_gate = delete_hard.to(delete_soft.dtype)
+
+        opacity_before = self.gaussians.opacities
+        opacity_after = opacity_before * (1.0 - delete_gate).to(
+            opacity_before.dtype
+        )
+        state = StreamingGaussianState(
+            gaussians=Gaussians(
+                means=self.gaussians.means,
+                harmonics=self.gaussians.harmonics,
+                opacities=opacity_after,
+                scales=self.gaussians.scales,
+                rotations=self.gaussians.rotations,
+            ),
+            stable_ids=self.stable_ids,
+            observation_count=self.observation_count,
+        )
+
+        pruned_count = delete_hard.sum()
+        removed_opacity = (
+            opacity_before.float() * delete_hard.to(opacity_before.dtype)
+        ).sum()
+        map_count_before = torch.tensor(
+            float(n), device=delete_logit.device, dtype=torch.float32
+        )
+        if physical_keep is not None:
+            state = state.select(physical_keep)
+            pruned_count = (~physical_keep).sum()
+
+        candidate_count = candidate_mask.sum()
+        candidate_probability_sum = (
+            delete_soft * candidate_mask.to(delete_soft.dtype)
+        ).sum()
+        candidate_delete_rate = (
+            delete_gate * candidate_mask.to(delete_gate.dtype)
+        ).sum() / candidate_count.clamp_min(1).float()
+        stats = {
+            "candidate_count": candidate_count.float(),
+            "candidate_probability_sum": candidate_probability_sum,
+            "candidate_probability_mean": candidate_probability_sum
+            / candidate_count.clamp_min(1).float(),
+            "candidate_delete_rate": candidate_delete_rate,
+            "hard_deleted_count": pruned_count.float(),
+            "hard_deleted_ratio": pruned_count.float()
+            / map_count_before.clamp_min(1.0),
+            "removed_opacity_mass_ratio": removed_opacity
+            / opacity_before.detach().float().sum().clamp_min(1e-8),
+            "map_count_before": map_count_before,
+            "map_count_after": torch.tensor(
+                float(state.num_gaussians),
+                device=delete_logit.device,
+                dtype=torch.float32,
+            ),
+        }
+        return state, stats
+
     def update_historical(
         self,
         gir: DominantGIR,
         prediction: GIRPrediction,
         camera_to_world: torch.Tensor,
         update_confidence: torch.Tensor | None = None,
-        num_contributors: int = 1,
     ) -> "StreamingGaussianState":
         b, n = self.gaussians.means.shape[:2]
         harmonics_flat = _flatten_harmonics(self.gaussians.harmonics)
         harmonic_dim = harmonics_flat.shape[-1]
-
-        num_contributors = max(1, int(num_contributors))
-        if (
-            num_contributors > 1
-            and gir.contributor_ids is not None
-            and gir.contributor_weights is not None
-        ):
-            contributor_count = min(
-                num_contributors, gir.contributor_ids.shape[1]
-            )
-            contributor_ids = gir.contributor_ids[:, :contributor_count]
-            contributor_weights = gir.contributor_weights[:, :contributor_count]
-        else:
-            contributor_count = 1
-            contributor_ids = gir.indices.unsqueeze(1)
-            contributor_weights = gir.dominant_weight.unsqueeze(1)
-
-        # The rasterizer is detached, but each contributor still uses its own
-        # camera-space depth when the shared pixel residual updates geometry.
-        with torch.no_grad():
-            means = self.gaussians.means.detach().float()
-            ones = torch.ones((b, n, 1), device=means.device, dtype=means.dtype)
-            means_h = torch.cat([means, ones], dim=-1)
-            world_to_camera = torch.linalg.inv(
-                camera_to_world.detach().float()
-            )
-            contributor_depths = torch.einsum(
-                "bij,bnj->bni", world_to_camera, means_h
-            )[..., 2]
 
         mean_updates = []
         rotation_updates = []
@@ -366,70 +458,35 @@ class StreamingGaussianState:
         observation_increments = []
 
         for batch_idx in range(b):
-            point_indices = contributor_ids[batch_idx].reshape(
-                contributor_count, -1
-            )
-            contribution = contributor_weights[batch_idx].reshape(
-                contributor_count, -1
-            )
-            pixel_valid = gir.valid[batch_idx].reshape(1, -1)
-            valid = (
-                (point_indices >= 0)
-                & (point_indices < n)
-                & pixel_valid
-                & (contribution > 0)
-            )
-            safe_indices = point_indices.clamp_min(0).clamp_max(max(n - 1, 0))
-            depth = contributor_depths[batch_idx].gather(
-                0, safe_indices.reshape(-1)
-            ).reshape_as(safe_indices)
-            valid = valid & (depth > 1e-5)
-            depth = depth.clamp_min(1e-4)
+            point_indices = gir.indices[batch_idx].reshape(-1)
+            valid = point_indices >= 0
+            safe_indices = point_indices.clamp_min(0)
+            visible = valid.to(self.gaussians.means.dtype)
 
-            gate = prediction.historical_gate[
-                batch_idx, :contributor_count, 0
-            ].reshape(contributor_count, -1).sigmoid()
-            old_count = self.observation_count[batch_idx].gather(
-                0, safe_indices.reshape(-1)
-            ).reshape_as(safe_indices)
+            gate = prediction.historical_gate[batch_idx].reshape(-1).sigmoid()
+            old_count = self.observation_count[batch_idx].gather(0, safe_indices)
             damping = old_count.add(1.0).rsqrt()
-            support_weight = torch.where(
-                valid,
-                contribution.clamp_min(0.0),
-                torch.zeros_like(contribution),
-            )
-            assignment_weight = support_weight / support_weight.sum(
-                dim=0, keepdim=True
-            ).clamp_min(1e-8)
+            contribution = gir.dominant_weight[batch_idx].reshape(-1).clamp_min(0.0)
+            support_weight = visible * contribution
             update_weight = support_weight * gate * damping
             if update_confidence is not None:
-                confidence = update_confidence[batch_idx].to(update_weight.dtype)
-                if confidence.dim() == 4:
-                    confidence = confidence[:, 0]
-                confidence = confidence.reshape(contributor_count, -1)
+                confidence = update_confidence[batch_idx].reshape(-1).to(
+                    update_weight.dtype
+                )
                 update_weight = update_weight * confidence
 
-            def flatten_contributors(values: torch.Tensor) -> torch.Tensor:
-                values = values[:contributor_count]
-                channels = values.shape[1]
-                return values.permute(0, 2, 3, 1).reshape(-1, channels)
-
+            depth = gir.depth[batch_idx].reshape(-1).clamp_min(1e-4)
             delta_mean_camera = prediction.delta_mean_camera[batch_idx]
-            delta_mean_camera = flatten_contributors(delta_mean_camera).tanh()
-            delta_mean_camera = delta_mean_camera * depth.reshape(-1, 1).to(
-                delta_mean_camera.dtype
-            )
+            delta_mean_camera = delta_mean_camera.permute(1, 2, 0).reshape(-1, 3)
+            delta_mean_camera = delta_mean_camera.tanh() * depth.unsqueeze(-1)
             rotation_c2w = camera_to_world[batch_idx, :3, :3].to(
                 delta_mean_camera.dtype
             )
             delta_mean_world = delta_mean_camera @ rotation_c2w.transpose(0, 1)
 
             def aggregate(values: torch.Tensor) -> torch.Tensor:
-                flat_update_weight = update_weight.reshape(-1).to(values.dtype)
-                flat_support_weight = support_weight.reshape(-1).to(values.dtype)
-                flat_indices = safe_indices.reshape(-1)
-                weighted = values * flat_update_weight.unsqueeze(-1)
-                index = flat_indices.unsqueeze(-1).expand(-1, values.shape[-1])
+                weighted = values * update_weight.unsqueeze(-1)
+                index = safe_indices.unsqueeze(-1).expand(-1, values.shape[-1])
                 numerator = torch.zeros(
                     (n, values.shape[-1]),
                     device=values.device,
@@ -439,40 +496,36 @@ class StreamingGaussianState:
                     n,
                     device=values.device,
                     dtype=values.dtype,
-                ).scatter_add(0, flat_indices, flat_support_weight)
+                ).scatter_add(0, safe_indices, support_weight)
                 return numerator / denominator.clamp_min(1e-8).unsqueeze(-1)
 
             mean_updates.append(aggregate(delta_mean_world))
 
             delta_rotation = prediction.delta_rotation[batch_idx]
-            delta_rotation = flatten_contributors(delta_rotation).tanh()
+            delta_rotation = delta_rotation.permute(1, 2, 0).reshape(-1, 3).tanh()
             rotation_updates.append(aggregate(delta_rotation))
 
             delta_scale = prediction.delta_log_scale[batch_idx]
-            delta_scale = flatten_contributors(delta_scale).tanh()
+            delta_scale = delta_scale.permute(1, 2, 0).reshape(-1, 3).tanh()
             scale_updates.append(aggregate(delta_scale))
 
             delta_opacity = prediction.delta_opacity_logit[batch_idx]
-            delta_opacity = flatten_contributors(delta_opacity).tanh()
+            delta_opacity = delta_opacity.permute(1, 2, 0).reshape(-1, 1).tanh()
             opacity_updates.append(aggregate(delta_opacity))
 
             delta_harmonics = prediction.delta_harmonics[batch_idx]
-            delta_harmonics = flatten_contributors(delta_harmonics).tanh()
+            delta_harmonics = delta_harmonics.permute(1, 2, 0).reshape(
+                -1, harmonic_dim
+            ).tanh()
             harmonic_updates.append(aggregate(delta_harmonics))
 
             observation_increments.append(
                 torch.zeros(
                     n,
-                    device=valid.device,
+                    device=visible.device,
                     dtype=self.observation_count.dtype,
                 )
-                .scatter_add(
-                    0,
-                    safe_indices.reshape(-1),
-                    assignment_weight.reshape(-1).to(
-                        self.observation_count.dtype
-                    ),
-                )
+                .scatter_add(0, safe_indices, visible)
                 .clamp_max(1.0)
             )
 
@@ -636,20 +689,12 @@ class GIRUpdateHead(nn.Module):
         harmonic_dim: int,
         hidden_dim: int = 64,
         use_raster_evidence: bool = False,
-        num_contributors: int = 1,
     ) -> None:
         super().__init__()
         self.harmonic_dim = harmonic_dim
         self.use_raster_evidence = use_raster_evidence
-        self.num_contributors = max(1, int(num_contributors))
-        base_evidence_dim = feature_dim + 11 + int(use_raster_evidence)
-        contributor_evidence_dim = 23 + harmonic_dim
-        evidence_dim = (
-            base_evidence_dim
-            + self.num_contributors * contributor_evidence_dim
-        )
-        self.historical_output_dim = 3 + 3 + 3 + 1 + harmonic_dim + 1
-        output_dim = self.num_contributors * self.historical_output_dim + 1
+        evidence_dim = feature_dim + 15 + int(use_raster_evidence)
+        output_dim = 3 + 3 + 3 + 1 + harmonic_dim + 1 + 1
         current_output_dim = 3 + 3 + 3 + 1 + harmonic_dim + 1
         groups = _group_count(hidden_dim)
         self.encoder = nn.Sequential(
@@ -669,10 +714,13 @@ class GIRUpdateHead(nn.Module):
             current_output_dim,
             kernel_size=1,
         )
+        self.delete_prediction = nn.Conv2d(hidden_dim, 1, kernel_size=1)
         nn.init.zeros_(self.prediction.weight)
         nn.init.zeros_(self.prediction.bias)
         nn.init.zeros_(self.current_prediction.weight)
         nn.init.zeros_(self.current_prediction.bias)
+        nn.init.zeros_(self.delete_prediction.weight)
+        nn.init.constant_(self.delete_prediction.bias, -4.0)
 
     def forward(
         self,
@@ -701,6 +749,12 @@ class GIRUpdateHead(nn.Module):
 
         valid = gir.valid.to(current_feature.dtype)
         historical_rgb = gir.rgb.to(current_feature.dtype)
+        historical_depth = (
+            gir.raster_depth if self.use_raster_evidence else gir.depth
+        ).to(current_feature.dtype)
+        relative_depth = (
+            (historical_depth - current_depth) / current_depth.clamp_min(1e-4)
+        ).clamp(-2.0, 2.0)
         log_depth = current_depth.clamp_min(1e-4).log().clamp(-8.0, 8.0)
         evidence_parts = [
             current_feature,
@@ -708,114 +762,22 @@ class GIRUpdateHead(nn.Module):
             historical_rgb,
             current_rgb - historical_rgb,
             log_depth,
+            relative_depth,
+            gir.opacity.to(current_feature.dtype),
+            gir.scale.to(current_feature.dtype),
             current_depth_confidence,
+            valid,
         ]
         if self.use_raster_evidence:
             evidence_parts.append(gir.raster_alpha.to(current_feature.dtype))
-
-        contributor_shape = (
-            current_feature.shape[0],
-            self.num_contributors,
-            1,
-            *size,
-        )
-
-        def contributor_or_zeros(
-            values: torch.Tensor | None,
-            channels: int,
-        ) -> torch.Tensor:
-            if values is None:
-                return current_feature.new_zeros(
-                    contributor_shape[:2] + (channels,) + contributor_shape[3:]
-                )
-            if values.shape[1] < self.num_contributors:
-                raise RuntimeError(
-                    "GIR has fewer contributor evidence maps than the head: "
-                    f"head={self.num_contributors}, evidence={values.shape[1]}."
-                )
-            return values[:, : self.num_contributors].to(current_feature.dtype)
-
-        contributor_rgb = contributor_or_zeros(gir.contributor_rgb, 3)
-        contributor_depth = contributor_or_zeros(gir.contributor_depth, 1)
-        contributor_camera_points = contributor_or_zeros(
-            gir.contributor_camera_points, 3
-        )
-        contributor_opacity = contributor_or_zeros(gir.contributor_opacity, 1)
-        contributor_scales = contributor_or_zeros(gir.contributor_scales, 3)
-        contributor_rotations = contributor_or_zeros(
-            gir.contributor_rotations, 4
-        )
-        contributor_harmonics = contributor_or_zeros(
-            gir.contributor_harmonics, self.harmonic_dim
-        )
-        contributor_count = contributor_or_zeros(
-            gir.contributor_observation_count, 1
-        )
-        contributor_weight = contributor_or_zeros(
-            None
-            if gir.contributor_weights is None
-            else gir.contributor_weights.unsqueeze(2),
-            1,
-        )
-        contributor_valid = (
-            contributor_weight > 0
-        ).to(current_feature.dtype)
-        current_rgb_per_contributor = current_rgb.unsqueeze(1)
-        current_depth_per_contributor = current_depth.unsqueeze(1)
-        relative_depth = (
-            (contributor_depth - current_depth_per_contributor)
-            / current_depth_per_contributor.clamp_min(1e-4)
-        ).clamp(-2.0, 2.0)
-        normalized_log_scale = (
-            contributor_scales.clamp_min(1e-8).log()
-            - current_depth_per_contributor.clamp_min(1e-4).log()
-        ).clamp(-12.0, 4.0)
-        log_contributor_depth = contributor_depth.clamp_min(1e-4).log().clamp(
-            -8.0, 8.0
-        )
-        normalized_camera_points = contributor_camera_points / (
-            current_depth_per_contributor.clamp_min(1e-4)
-        )
-        raster_alpha = gir.raster_alpha.to(current_feature.dtype).unsqueeze(1)
-        ownership = (
-            contributor_weight / raster_alpha.clamp_min(1e-6)
-        ).clamp(0.0, 1.0)
-        contributor_evidence = torch.cat(
-            [
-                contributor_rgb,
-                current_rgb_per_contributor - contributor_rgb,
-                relative_depth,
-                log_contributor_depth,
-                normalized_camera_points.clamp(-4.0, 4.0),
-                contributor_opacity,
-                normalized_log_scale,
-                contributor_rotations,
-                contributor_harmonics,
-                contributor_count.clamp_min(0.0).log1p().clamp_max(8.0),
-                contributor_weight,
-                ownership,
-                contributor_valid,
-            ],
-            dim=2,
-        )
-        evidence_parts.append(
-            contributor_evidence.flatten(1, 2)
-        )
         evidence = torch.cat(evidence_parts, dim=1)
         encoded = self.encoder(evidence)
         prediction = self.prediction(encoded)
-        historical_prediction = prediction[:, :-1].reshape(
-            prediction.shape[0],
-            self.num_contributors,
-            self.historical_output_dim,
-            *prediction.shape[-2:],
-        )
         splits = torch.split(
-            historical_prediction,
-            [3, 3, 3, 1, self.harmonic_dim, 1],
-            dim=2,
+            prediction,
+            [3, 3, 3, 1, self.harmonic_dim, 1, 1],
+            dim=1,
         )
-        add_logit = prediction[:, -1:]
         dominant_weight = gir.dominant_weight.to(encoded.dtype)
         current_prediction = self.current_prediction(
             torch.cat([encoded, dominant_weight], dim=1)
@@ -825,4 +787,5 @@ class GIRUpdateHead(nn.Module):
             [3, 3, 3, 1, self.harmonic_dim, 1],
             dim=1,
         )
-        return GIRPrediction(*splits, add_logit, *current_splits)
+        delete_logit = self.delete_prediction(encoded)
+        return GIRPrediction(*splits, *current_splits, delete_logit)

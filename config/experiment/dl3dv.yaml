@@ -25,19 +25,23 @@ model:
     gir_raster_evidence_enabled: true
     gir_dominant_id_enabled: true
     gir_dominant_min_weight: 1e-4
-    gir_soft_update_topk: 4
     gir_top1_confidence_mode: floor_sqrt
     gir_top1_confidence_floor: 0.25
+    gir_old_delete_enabled: true
+    gir_old_delete_warmup_steps: 1000
+    gir_old_delete_target_ratio: 0.01
+    gir_old_delete_budget_weight: 0.01
+    gir_old_delete_threshold: 0.5
+    gir_old_delete_temperature: 1.0
+    gir_old_delete_min_observations: 2
+    gir_old_delete_test_prune_enabled: true
     gir_hidden_dim: 64
     gir_tbptt_chunk: 4
     gir_replay_views: 1
     gir_aux_loss_weight: 0.25
-    gir_history_gate_bias: -4.0
     gir_history_adapt_weight: 0.0
     gir_history_preserve_weight: 0.0
     gir_history_loss_interval: 4
-    gir_history_alpha_threshold: 0.10
-    gir_history_depth_tolerance: 0.20
     gir_history_preserve_margin: 0.002
     gir_history_replay_views: 1
     gir_add_loss_weight: 0.01

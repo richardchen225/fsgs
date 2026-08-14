@@ -26,14 +26,6 @@ test:
   gir_add_gate_prune_threshold: 0.0
   gir_test_top1_confidence_mode: inherit
   gir_test_top1_confidence_floor: 0.25
-  gir_test_correspondence_diagnostics: true
-  gir_test_correspondence_topk: 8
-  # Test-only final-map pruning; training and the causal rollout are unchanged.
-  gir_test_old_gs_final_prune_enabled: false
-  gir_test_old_gs_prune_min_candidate_views: 2
-  gir_test_old_gs_prune_max_top1_rate: 0.0
-  gir_test_old_gs_prune_max_mean_weight: 0.01
-  gir_test_old_gs_prune_max_opacity: 1.0
   
 data_loader:
   # Avoid having to spin up new processes to print out visualizations.
