@@ -127,6 +127,10 @@ class EncoderAnySplatCfg:
     gir_old_delete_temperature: float = 1.0
     gir_old_delete_min_observations: int = 2
     gir_old_delete_test_prune_enabled: bool = True
+    gir_old_decay_enabled: bool = False
+    gir_old_decay_topk: int = 4
+    gir_old_decay_strength: float = 0.02
+    gir_old_decay_prune_threshold: float = 0.005
     gir_hidden_dim: int = 64
     gir_tbptt_chunk: int = 2
     gir_replay_views: int = 1

@@ -59,6 +59,8 @@ class DominantGIR:
     raster_depth: torch.Tensor
     raster_alpha: torch.Tensor
     dominant_weight: torch.Tensor
+    contributor_ids: torch.Tensor | None = None
+    contributor_weights: torch.Tensor | None = None
 
     @classmethod
     def empty(
@@ -438,6 +440,208 @@ class StreamingGaussianState:
             ),
         }
         return state, stats
+
+    def decay_historical_opacity(
+        self,
+        gir: DominantGIR,
+        delete_logit: torch.Tensor,
+        min_observations: int,
+        temperature: float,
+        decay_strength: float,
+        decay_schedule: float,
+        min_contributor_weight: float,
+        physical_prune: bool,
+        prune_threshold: float,
+    ) -> tuple["StreamingGaussianState", dict[str, torch.Tensor]]:
+        """Apply a soft, contributor-weighted opacity decay to old GS.
+
+        The pixel-level delete prediction is shared by all contributors of that
+        pixel. Contributor weights decide how much evidence each historical GS
+        receives; no historical geometry or appearance residual is written here.
+        """
+        b, n = self.gaussians.opacities.shape
+        pixel_probability = torch.sigmoid(
+            delete_logit.float() / max(float(temperature), 1e-4)
+        )
+        if pixel_probability.shape[1] != 1:
+            raise RuntimeError(
+                "Old-GS decay expects one pixel-level delete logit channel, "
+                f"got {tuple(pixel_probability.shape)}."
+            )
+
+        if gir.contributor_ids is not None and gir.contributor_weights is not None:
+            contributor_ids = gir.contributor_ids
+            contributor_weights = gir.contributor_weights
+        else:
+            contributor_ids = gir.indices.unsqueeze(1)
+            contributor_weights = gir.dominant_weight.unsqueeze(1)
+
+        contributor_count = contributor_ids.shape[1]
+        if contributor_weights.shape[:2] != contributor_ids.shape[:2]:
+            raise RuntimeError(
+                "Old-GS decay contributor ID/weight shape mismatch: "
+                f"ids={tuple(contributor_ids.shape)}, "
+                f"weights={tuple(contributor_weights.shape)}."
+            )
+
+        decay_probabilities = []
+        candidate_masks = []
+        decay_mass_ratios = []
+        pruned_counts = []
+        map_counts_before = []
+        map_counts_after = []
+
+        decay_scale = max(0.0, min(1.0, float(decay_schedule)))
+        decay_strength = max(0.0, float(decay_strength)) * decay_scale
+        prune_threshold = max(0.0, float(prune_threshold))
+
+        for batch_idx in range(b):
+            point_indices = contributor_ids[batch_idx].reshape(
+                contributor_count, -1
+            ).long()
+            weights = torch.nan_to_num(
+                contributor_weights[batch_idx].float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_min(0.0).reshape(contributor_count, -1)
+            pixel_valid = gir.valid[batch_idx, 0].reshape(1, -1)
+            valid = (
+                (point_indices >= 0)
+                & (point_indices < n)
+                & pixel_valid
+                & (weights >= float(min_contributor_weight))
+            )
+            support = torch.where(valid, weights, torch.zeros_like(weights))
+            safe_indices = point_indices.clamp_min(0).clamp_max(max(n - 1, 0))
+            pixel_probability_flat = pixel_probability[batch_idx, 0].reshape(1, -1)
+            pixel_probability_flat = pixel_probability_flat.expand_as(support)
+
+            flat_indices = safe_indices.reshape(-1)
+            flat_support = support.reshape(-1)
+            flat_probability = pixel_probability_flat.reshape(-1)
+            numerator = torch.zeros(
+                n, device=delete_logit.device, dtype=torch.float32
+            ).scatter_add(0, flat_indices, flat_support * flat_probability)
+            denominator = torch.zeros_like(numerator).scatter_add(
+                0, flat_indices, flat_support
+            )
+            has_support = denominator > 0
+            probability = torch.where(
+                has_support,
+                numerator / denominator.clamp_min(1e-8),
+                torch.zeros_like(numerator),
+            )
+            candidate = has_support & (
+                self.observation_count[batch_idx].detach()
+                >= float(max(1, min_observations))
+            )
+            candidate = candidate.detach()
+            probability = probability * candidate.to(probability.dtype)
+
+            opacity_before = self.gaussians.opacities[batch_idx]
+            decay_amount = (decay_strength * probability).clamp_min(0.0)
+            opacity_after = opacity_before * torch.exp(-decay_amount).to(
+                opacity_before.dtype
+            )
+            decay_mass = (opacity_before.float() - opacity_after.float()).sum()
+            decay_mass_ratios.append(
+                decay_mass / opacity_before.detach().float().sum().clamp_min(1e-8)
+            )
+
+            physical_keep = None
+            if physical_prune:
+                if b != 1:
+                    raise RuntimeError(
+                        "Physical old-GS decay pruning is test-only and requires "
+                        "batch size 1."
+                    )
+                physical_keep = opacity_after.detach().float() > prune_threshold
+                if not bool(physical_keep.any()):
+                    safeguard_index = opacity_after.detach().float().argmax()
+                    physical_keep = physical_keep.clone()
+                    physical_keep[safeguard_index] = True
+
+            state = StreamingGaussianState(
+                gaussians=Gaussians(
+                    means=self.gaussians.means,
+                    harmonics=self.gaussians.harmonics,
+                    opacities=torch.cat(
+                        [
+                            self.gaussians.opacities[:batch_idx],
+                            opacity_after.unsqueeze(0),
+                            self.gaussians.opacities[batch_idx + 1 :],
+                        ],
+                        dim=0,
+                    ),
+                    scales=self.gaussians.scales,
+                    rotations=self.gaussians.rotations,
+                ),
+                stable_ids=self.stable_ids,
+                observation_count=self.observation_count,
+            )
+            if physical_keep is not None:
+                state = state.select(physical_keep)
+                pruned_count = (~physical_keep).sum().float()
+            else:
+                pruned_count = torch.zeros(
+                    (), device=delete_logit.device, dtype=torch.float32
+                )
+
+            decay_probabilities.append(probability)
+            candidate_masks.append(candidate)
+            pruned_counts.append(pruned_count)
+            map_counts_before.append(
+                torch.tensor(float(n), device=delete_logit.device)
+            )
+            map_counts_after.append(
+                torch.tensor(
+                    float(state.num_gaussians),
+                    device=delete_logit.device,
+                )
+            )
+
+        if b != 1:
+            # Training normally uses batch one for streaming state. For a
+            # general batch, preserve the differentiable opacity updates from
+            # every sample without physical filtering.
+            opacity_after_all = []
+            for batch_idx, probability in enumerate(decay_probabilities):
+                opacity_after_all.append(
+                    self.gaussians.opacities[batch_idx]
+                    * torch.exp(-decay_strength * probability).to(
+                        self.gaussians.opacities.dtype
+                    )
+                )
+            state = StreamingGaussianState(
+                gaussians=Gaussians(
+                    means=self.gaussians.means,
+                    harmonics=self.gaussians.harmonics,
+                    opacities=torch.stack(opacity_after_all),
+                    scales=self.gaussians.scales,
+                    rotations=self.gaussians.rotations,
+                ),
+                stable_ids=self.stable_ids,
+                observation_count=self.observation_count,
+            )
+
+        decay_soft = torch.stack(decay_probabilities)
+        candidate_mask = torch.stack(candidate_masks)
+        candidate_count = candidate_mask.sum().float()
+        candidate_probability_sum = (
+            decay_soft * candidate_mask.to(decay_soft.dtype)
+        ).sum()
+        return state, {
+            "candidate_count": candidate_count,
+            "candidate_probability_mean": candidate_probability_sum
+            / candidate_count.clamp_min(1.0),
+            "decay_opacity_mass_ratio": torch.stack(decay_mass_ratios).mean(),
+            "hard_pruned_count": torch.stack(pruned_counts).mean(),
+            "hard_pruned_ratio": torch.stack(pruned_counts).mean()
+            / torch.stack(map_counts_before).mean().clamp_min(1.0),
+            "map_count_before": torch.stack(map_counts_before).mean(),
+            "map_count_after": torch.stack(map_counts_after).mean(),
+        }
 
     def update_historical(
         self,

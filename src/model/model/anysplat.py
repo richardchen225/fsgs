@@ -455,6 +455,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         image_shape: tuple[int, int],
         use_dominant_ids: bool,
         min_dominant_weight: float,
+        num_top_contributors: int = 1,
     ) -> DominantGIR:
         b = state.batch_size
         h, w = image_shape
@@ -463,6 +464,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             camera_to_world.detach(),
             intrinsics.detach(),
             image_shape,
+            num_top_contributors=num_top_contributors,
         )
 
         render_alpha = torch.nan_to_num(
@@ -484,6 +486,36 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         gir.rgb = render_color.clamp_(0.0, 1.0).to(gir.rgb.dtype)
         gir.raster_depth = render_depth.to(gir.depth.dtype)
         gir.raster_alpha = render_alpha.to(gir.opacity.dtype)
+
+        if (
+            render_output.contributor_ids is not None
+            and render_output.contributor_weights is not None
+        ):
+            contributor_ids = render_output.contributor_ids.long()
+            contributor_weights = torch.nan_to_num(
+                render_output.contributor_weights.float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_min_(0.0)
+            contributor_valid = (
+                (contributor_ids >= 0)
+                & (contributor_ids < state.num_gaussians)
+                & (contributor_weights >= min_dominant_weight)
+                & (render_alpha > 1e-4)
+            )
+            gir.contributor_ids = torch.where(
+                contributor_valid,
+                contributor_ids,
+                torch.full_like(contributor_ids, -1),
+            )
+            gir.contributor_weights = torch.where(
+                contributor_valid,
+                contributor_weights.to(gir.dominant_weight.dtype),
+                torch.zeros_like(contributor_weights).to(
+                    gir.dominant_weight.dtype
+                ),
+            )
 
         if use_dominant_ids:
             ids = render_output.dominant_ids
@@ -622,6 +654,23 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         use_raster_evidence = bool(
             getattr(cfg, "gir_raster_evidence_enabled", False)
         )
+        old_decay_enabled = bool(
+            getattr(cfg, "gir_old_decay_enabled", False)
+        )
+        old_decay_topk = max(
+            1, int(getattr(cfg, "gir_old_decay_topk", 4))
+        )
+        old_decay_strength = max(
+            0.0, float(getattr(cfg, "gir_old_decay_strength", 0.02))
+        )
+        old_decay_prune_threshold = max(
+            0.0,
+            float(getattr(cfg, "gir_old_decay_prune_threshold", 0.005)),
+        )
+        if old_decay_enabled and old_decay_topk > 1 and not use_raster_evidence:
+            raise ValueError(
+                "Top-k old-GS decay requires gir_raster_evidence_enabled=true."
+            )
         use_dominant_ids = bool(getattr(cfg, "gir_dominant_id_enabled", False))
         min_dominant_weight = float(
             max(0.0, getattr(cfg, "gir_dominant_min_weight", 1e-4))
@@ -629,6 +678,11 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         old_delete_enabled = bool(
             getattr(cfg, "gir_old_delete_enabled", False)
         )
+        if old_delete_enabled and old_decay_enabled:
+            raise ValueError(
+                "gir_old_delete_enabled and gir_old_decay_enabled are "
+                "mutually exclusive."
+            )
         old_delete_threshold = float(
             getattr(cfg, "gir_old_delete_threshold", 0.5)
         )
@@ -701,6 +755,13 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         old_delete_removed_opacity_ratios = []
         old_delete_map_counts_before = []
         old_delete_map_counts_after = []
+        old_decay_budget_losses = []
+        old_decay_candidate_probabilities = []
+        old_decay_candidate_counts = []
+        old_decay_opacity_mass_ratios = []
+        old_decay_hard_ratios = []
+        old_decay_map_counts_before = []
+        old_decay_map_counts_after = []
         old_delete_graph_anchor = features.new_zeros(())
         add_gates = []
         add_targets = []
@@ -776,6 +837,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                         (low_h, low_w),
                         use_dominant_ids,
                         min_dominant_weight,
+                        old_decay_topk if old_decay_enabled else 1,
                     )
 
             if use_raster_evidence:
@@ -902,7 +964,54 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     update_confidence=historical_update_confidence,
                 )
 
-                if old_delete_enabled:
+                if old_decay_enabled:
+                    state, decay_stats = state.decay_historical_opacity(
+                        gir,
+                        prediction.delete_logit,
+                        min_observations=old_delete_min_observations,
+                        temperature=old_delete_temperature,
+                        decay_strength=old_decay_strength,
+                        decay_schedule=old_delete_warmup_progress,
+                        min_contributor_weight=min_dominant_weight,
+                        physical_prune=(
+                            not self.training and old_delete_test_prune
+                        ),
+                        prune_threshold=old_decay_prune_threshold,
+                    )
+                    old_decay_candidate_probabilities.append(
+                        decay_stats["candidate_probability_mean"]
+                    )
+                    old_decay_candidate_counts.append(
+                        decay_stats["candidate_count"]
+                    )
+                    old_decay_opacity_mass_ratios.append(
+                        decay_stats["decay_opacity_mass_ratio"]
+                    )
+                    old_decay_hard_ratios.append(
+                        decay_stats["hard_pruned_ratio"]
+                    )
+                    old_decay_map_counts_before.append(
+                        decay_stats["map_count_before"]
+                    )
+                    old_decay_map_counts_after.append(
+                        decay_stats["map_count_after"]
+                    )
+                    if self.training:
+                        # Keep the loss graph identical across DDP ranks. A
+                        # sample with no eligible historical contributors only
+                        # contributes zero through the detached candidate mask.
+                        candidate_gate = (
+                            decay_stats["candidate_count"] > 0
+                        ).to(features.dtype).detach()
+                        old_decay_budget_losses.append(
+                            (
+                                decay_stats["decay_opacity_mass_ratio"]
+                                - scheduled_old_delete_target
+                            ).abs()
+                            * candidate_gate
+                        )
+
+                elif old_delete_enabled:
                     state, delete_stats = state.delete_historical(
                         gir,
                         prediction.delete_logit,
@@ -1491,6 +1600,51 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     encoder_output.infos[
                         "gir_old_delete_map_count_after"
                     ] = torch.stack(old_delete_map_counts_after).mean()
+            if old_decay_enabled:
+                if old_decay_budget_losses:
+                    old_decay_budget_loss = torch.stack(
+                        old_decay_budget_losses
+                    ).mean()
+                else:
+                    old_decay_budget_loss = old_delete_graph_anchor
+                encoder_output.infos[
+                    "gir_old_decay_budget_loss"
+                ] = old_decay_budget_loss + old_delete_graph_anchor
+                encoder_output.infos["gir_old_decay_topk"] = torch.tensor(
+                    float(old_decay_topk), device=features.device
+                )
+                encoder_output.infos["gir_old_decay_strength"] = torch.tensor(
+                    old_decay_strength, device=features.device
+                )
+                encoder_output.infos[
+                    "gir_old_decay_prune_threshold"
+                ] = torch.tensor(
+                    old_decay_prune_threshold, device=features.device
+                )
+                if old_decay_candidate_probabilities:
+                    candidate_counts = torch.stack(old_decay_candidate_counts)
+                    total_candidates = candidate_counts.sum().clamp_min(1.0)
+                    encoder_output.infos[
+                        "gir_old_decay_candidate_probability"
+                    ] = (
+                        torch.stack(old_decay_candidate_probabilities)
+                        * candidate_counts
+                    ).sum() / total_candidates
+                    encoder_output.infos[
+                        "gir_old_decay_candidate_count"
+                    ] = candidate_counts.mean()
+                    encoder_output.infos[
+                        "gir_old_decay_opacity_mass_ratio"
+                    ] = torch.stack(old_decay_opacity_mass_ratios).mean()
+                    encoder_output.infos[
+                        "gir_old_decay_hard_pruned_ratio"
+                    ] = torch.stack(old_decay_hard_ratios).mean()
+                    encoder_output.infos[
+                        "gir_old_decay_map_count_before"
+                    ] = torch.stack(old_decay_map_counts_before).mean()
+                    encoder_output.infos[
+                        "gir_old_decay_map_count_after"
+                    ] = torch.stack(old_decay_map_counts_after).mean()
 
         return state.gaussians
 

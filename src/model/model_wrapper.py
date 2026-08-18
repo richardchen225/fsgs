@@ -385,6 +385,15 @@ class ModelWrapper(LightningModule):
                 "gir_old_delete_removed_opacity_mass_ratio",
                 "gir_old_delete_map_count_before",
                 "gir_old_delete_map_count_after",
+                "gir_old_decay_topk",
+                "gir_old_decay_strength",
+                "gir_old_decay_prune_threshold",
+                "gir_old_decay_candidate_probability",
+                "gir_old_decay_candidate_count",
+                "gir_old_decay_opacity_mass_ratio",
+                "gir_old_decay_hard_pruned_ratio",
+                "gir_old_decay_map_count_before",
+                "gir_old_decay_map_count_after",
             ):
                 if metric_name in encoder_output.infos:
                     self.log(
@@ -426,6 +435,20 @@ class ModelWrapper(LightningModule):
             total_loss = (
                 total_loss
                 + old_delete_budget_weight * old_delete_budget_loss
+            )
+        if (
+            encoder_output.infos is not None
+            and "gir_old_decay_budget_loss" in encoder_output.infos
+        ):
+            old_decay_budget_loss = encoder_output.infos[
+                "gir_old_decay_budget_loss"
+            ]
+            old_decay_budget_weight = float(
+                self.model.encoder.cfg.gir_old_delete_budget_weight
+            )
+            self.log("loss/gir_old_decay_budget", old_decay_budget_loss.item())
+            total_loss = total_loss + (
+                old_decay_budget_weight * old_decay_budget_loss
             )
         if (
             encoder_output.infos is not None
@@ -834,6 +857,15 @@ class ModelWrapper(LightningModule):
                 "gir_old_delete_removed_opacity_mass_ratio",
                 "gir_old_delete_map_count_before",
                 "gir_old_delete_map_count_after",
+                "gir_old_decay_topk",
+                "gir_old_decay_strength",
+                "gir_old_decay_prune_threshold",
+                "gir_old_decay_candidate_probability",
+                "gir_old_decay_candidate_count",
+                "gir_old_decay_opacity_mass_ratio",
+                "gir_old_decay_hard_pruned_ratio",
+                "gir_old_decay_map_count_before",
+                "gir_old_decay_map_count_after",
             )
             for key in info_keys:
                 if key in encoder_output.infos:

@@ -260,7 +260,11 @@ def train(cfg_dict: DictConfig):
             for key in model_state
             if any(key.startswith(prefix) for prefix in required_prefixes)
         }
-        if not getattr(cfg.model.encoder, "gir_old_delete_enabled", False):
+        delete_head_enabled = bool(
+            getattr(cfg.model.encoder, "gir_old_delete_enabled", False)
+            or getattr(cfg.model.encoder, "gir_old_decay_enabled", False)
+        )
+        if not delete_head_enabled:
             required_keys = {
                 key
                 for key in required_keys
