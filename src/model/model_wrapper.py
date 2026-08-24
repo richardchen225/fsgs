@@ -69,6 +69,8 @@ class OptimizerCfg:
     backbone_lr_multiplier: float
     pretrained_lr: float | None = None
     scratch_lr: float | None = None
+    train_base_heads: bool = True
+    train_gir: bool = False
 
 
 @dataclass
@@ -150,6 +152,7 @@ class ModelWrapper(LightningModule):
         # Set up the model.
         self.encoder_visualizer = None
         self.model = model
+        self._configure_training_stage()
         self.data_shim = get_data_shim(self.model.encoder)
         self.losses = nn.ModuleList(losses)
 
@@ -158,6 +161,40 @@ class ModelWrapper(LightningModule):
         self._bad_grad_name = None
         self._val_comparison_images: list[np.ndarray] = []
         self._val_comparison_captions: list[str] = []
+
+    def _configure_training_stage(self) -> None:
+        train_base_heads = bool(self.optimizer_cfg.train_base_heads)
+        train_gir = bool(self.optimizer_cfg.train_gir)
+
+        for module_name in ("gaussian_param_head", "gs_head"):
+            module = getattr(self.model.encoder, module_name, None)
+            if module is None:
+                raise RuntimeError(
+                    f"Base training module model.encoder.{module_name} is missing."
+                )
+            module.requires_grad_(train_base_heads)
+
+        gir_head = getattr(self.model, "gir_update_head", None)
+        gir_enabled = bool(getattr(self.model.encoder.cfg, "gir_enabled", False))
+        if train_gir and (not gir_enabled or gir_head is None):
+            raise ValueError(
+                "optimizer.train_gir=true requires model.encoder.gir_enabled=true."
+            )
+        if gir_head is not None:
+            gir_head.requires_grad_(train_gir)
+
+        if not train_base_heads and not train_gir:
+            raise ValueError(
+                "The training stage disables both base GS heads and GIR; "
+                "there would be no selected trainable model branch."
+            )
+
+        print(
+            "Training stage: "
+            f"gir_enabled={gir_enabled}, "
+            f"train_base_heads={train_base_heads}, train_gir={train_gir}"
+        )
+
     def on_train_epoch_start(self) -> None:
         # our custom dataset and sampler has to have epoch set by calling set_epoch
         print(f"Train epoch start on rank {self.trainer.global_rank}")

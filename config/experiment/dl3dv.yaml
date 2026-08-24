@@ -20,7 +20,7 @@ model:
     depth_refine_downsample_factor: 4
     depth_refine_enabled: false
     gs_refine_enabled: false
-    gir_enabled: true
+    gir_enabled: false
     gir_render_scale: 0.5
     gir_raster_evidence_enabled: true
     gir_dominant_id_enabled: true
@@ -35,7 +35,7 @@ model:
     gir_old_delete_temperature: 1.0
     gir_old_delete_min_observations: 2
     gir_old_delete_test_prune_enabled: true
-    gir_old_decay_enabled: true
+    gir_old_decay_enabled: false
     gir_old_decay_topk: 4
     gir_old_decay_strength: 0.02
     gir_old_decay_prune_threshold: 0.005
@@ -80,6 +80,8 @@ optimizer:
   scratch_lr: 5e-5
   warm_up_steps: 1000
   backbone_lr_multiplier: 0.1
+  train_base_heads: true
+  train_gir: false
 
 data_loader:
   train:

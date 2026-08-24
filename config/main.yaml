@@ -48,6 +48,8 @@ optimizer:
   lr: 1.5e-4
   warm_up_steps: 2000
   backbone_lr_multiplier: 0.1
+  train_base_heads: true
+  train_gir: false
 
 checkpointing:
   load: null
