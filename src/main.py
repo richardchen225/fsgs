@@ -110,6 +110,17 @@ def train(cfg_dict: DictConfig):
     model = get_model(cfg.model.encoder, cfg.model.decoder)
 
     if cfg.mode == 'train':
+        if (
+            cfg.checkpointing.load is None
+            and not cfg.optimizer.train_base_heads
+            and cfg.checkpointing.train_pretrained_weights is None
+        ):
+            raise ValueError(
+                "The GIR-only stage freezes the base GS heads, so "
+                "checkpointing.train_pretrained_weights must point to the "
+                "stage-1 checkpoint. Use checkpointing.load only when "
+                "resuming an existing stage-2 run."
+            )
         if cfg.checkpointing.load is not None:
             print(f"Resuming full training state from {cfg.checkpointing.load}")
             ckpt = None
@@ -167,6 +178,24 @@ def train(cfg_dict: DictConfig):
                 and value.shape == model_state[key].shape
                 and key.startswith(load_prefixes)
             }
+            if not cfg.optimizer.train_base_heads:
+                required_base_prefixes = (
+                    "encoder.gaussian_param_head.",
+                    "encoder.gs_head.",
+                )
+                missing_base_keys = sorted(
+                    key
+                    for key in model_state
+                    if key.startswith(required_base_prefixes)
+                    and key not in compatible_ckpt
+                )
+                if missing_base_keys:
+                    preview = ", ".join(missing_base_keys[:4])
+                    raise RuntimeError(
+                        "The GIR stage requires a complete stage-1 base "
+                        "checkpoint, but base keys are missing or incompatible. "
+                        f"Missing keys include: {preview}"
+                    )
             model.load_state_dict(compatible_ckpt, strict=False)
             print(
                 "Loaded "

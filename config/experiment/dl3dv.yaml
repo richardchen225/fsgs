@@ -20,7 +20,7 @@ model:
     depth_refine_downsample_factor: 4
     depth_refine_enabled: false
     gs_refine_enabled: false
-    gir_enabled: false
+    gir_enabled: true
     gir_render_scale: 0.5
     gir_raster_evidence_enabled: true
     gir_dominant_id_enabled: true
@@ -80,8 +80,8 @@ optimizer:
   scratch_lr: 5e-5
   warm_up_steps: 1000
   backbone_lr_multiplier: 0.1
-  train_base_heads: true
-  train_gir: false
+  train_base_heads: false
+  train_gir: true
 
 data_loader:
   train:
@@ -99,7 +99,8 @@ trainer:
 
 checkpointing:
   load: null
-  train_pretrained_weights: weights/pre_wm.safetensors
+  # Set this to the stage-1 checkpoint that achieved the base PSNR.
+  train_pretrained_weights: null
   every_n_train_steps: 500
   save_weights_only: false
   save_top_k: 10
