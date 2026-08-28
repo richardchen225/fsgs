@@ -119,6 +119,7 @@ class EncoderAnySplatCfg:
     gir_dominant_min_weight: float = 1e-4
     gir_top1_confidence_mode: Literal["none", "floor_sqrt", "sqrt"] = "none"
     gir_top1_confidence_floor: float = 0.25
+    gir_old_residual_enabled: bool = True
     gir_old_delete_enabled: bool = False
     gir_old_delete_warmup_steps: int = 1000
     gir_old_delete_target_ratio: float = 0.01
@@ -140,10 +141,8 @@ class EncoderAnySplatCfg:
     gir_history_loss_interval: int = 4
     gir_history_preserve_margin: float = 0.002
     gir_history_replay_views: int = 1
-    gir_add_loss_weight: float = 0.01
-    gir_add_depth_tolerance: float = 0.15
-    gir_add_alpha_threshold: float = 0.5
-    gir_add_prior_floor: float = 0.02
+    gir_add_gate_warmup_steps: int = 1000
+    gir_add_rate_loss_weight: float = 0.01
     gir_regularization_weight: float = 1e-4
 
 class CameraDec(nn.Module):

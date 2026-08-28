@@ -314,31 +314,17 @@ class ModelWrapper(LightningModule):
                 "train/gir_add_gate",
                 encoder_output.infos["gir_add_gate"].float(),
             )
-            if "gir_add_target" in encoder_output.infos:
-                self.log(
-                    "train/gir_add_target",
-                    encoder_output.infos["gir_add_target"].float(),
-                )
-                self.log(
-                    "train/gir_add_gate_covered",
-                    encoder_output.infos["gir_add_gate_covered"].float(),
-                )
-                self.log(
-                    "train/gir_add_gate_uncovered",
-                    encoder_output.infos["gir_add_gate_uncovered"].float(),
-                )
-                self.log(
-                    "train/gir_add_gate_supported",
-                    encoder_output.infos["gir_add_gate_supported"].float(),
-                )
-                self.log(
-                    "train/gir_add_gate_unsupported",
-                    encoder_output.infos["gir_add_gate_unsupported"].float(),
-                )
-                self.log(
-                    "train/gir_effective_new_ratio",
-                    encoder_output.infos["gir_effective_new_ratio"].float(),
-                )
+            for metric_name in (
+                "gir_add_gate_learned",
+                "gir_add_gate_warmup_progress",
+                "gir_add_rate",
+                "gir_effective_new_ratio",
+            ):
+                if metric_name in encoder_output.infos:
+                    self.log(
+                        f"train/{metric_name}",
+                        encoder_output.infos[metric_name].float(),
+                    )
             self.log(
                 "train/gir_historical_gate",
                 encoder_output.infos["gir_historical_gate"].float(),
@@ -414,6 +400,7 @@ class ModelWrapper(LightningModule):
                     encoder_output.infos["gir_history_past_degradation"].float(),
                 )
             for metric_name in (
+                "gir_old_residual_enabled",
                 "gir_old_delete_target_ratio",
                 "gir_old_delete_candidate_probability",
                 "gir_old_delete_candidate_count",
@@ -514,12 +501,16 @@ class ModelWrapper(LightningModule):
             total_loss = total_loss + preserve_weight * gir_history_preserve
         if (
             encoder_output.infos is not None
-            and "gir_add_loss" in encoder_output.infos
+            and "gir_add_rate_loss" in encoder_output.infos
         ):
-            gir_add_loss = encoder_output.infos["gir_add_loss"]
-            gir_add_weight = float(self.model.encoder.cfg.gir_add_loss_weight)
-            self.log("loss/gir_add", gir_add_loss.item())
-            total_loss = total_loss + gir_add_weight * gir_add_loss
+            gir_add_rate_loss = encoder_output.infos["gir_add_rate_loss"]
+            gir_add_rate_weight = float(
+                self.model.encoder.cfg.gir_add_rate_loss_weight
+            )
+            self.log("loss/gir_add_rate", gir_add_rate_loss.item())
+            total_loss = (
+                total_loss + gir_add_rate_weight * gir_add_rate_loss
+            )
         if (
             encoder_output.infos is not None
             and "gir_regularization_loss" in encoder_output.infos
@@ -864,10 +855,11 @@ class ModelWrapper(LightningModule):
                 )
 
             info_keys = (
+                "gir_old_residual_enabled",
                 "gir_add_gate",
-                "gir_add_target",
-                "gir_add_gate_supported",
-                "gir_add_gate_unsupported",
+                "gir_add_gate_learned",
+                "gir_add_gate_warmup_progress",
+                "gir_add_rate",
                 "gir_new_opacity_mass_ratio",
                 "gir_add_gate_below_0_1_ratio",
                 "gir_add_gate_below_0_2_ratio",
@@ -925,6 +917,8 @@ class ModelWrapper(LightningModule):
             print(
                 "[GIR TEST] "
                 f"scene={scene_name} "
+                f"old_residual="
+                f"{gir_diagnostics.get('old_residual_enabled', float('nan')):.0f} "
                 f"top1_mode_code="
                 f"{gir_diagnostics.get('top1_confidence_mode_code', float('nan')):.0f} "
                 f"old_delete_p="

@@ -654,6 +654,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         use_raster_evidence = bool(
             getattr(cfg, "gir_raster_evidence_enabled", False)
         )
+        old_residual_enabled = bool(
+            getattr(cfg, "gir_old_residual_enabled", True)
+        )
         old_decay_enabled = bool(
             getattr(cfg, "gir_old_decay_enabled", False)
         )
@@ -718,6 +721,18 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         scheduled_old_delete_target = (
             old_delete_target_ratio * old_delete_warmup_progress
         )
+        add_gate_warmup_steps = max(
+            0, int(getattr(cfg, "gir_add_gate_warmup_steps", 1000))
+        )
+        training_run = str(getattr(cfg, "mode", "train")) == "train"
+        add_gate_warmup_progress = (
+            1.0
+            if not training_run or add_gate_warmup_steps == 0
+            else min(
+                1.0,
+                max(0.0, float(global_step) / add_gate_warmup_steps),
+            )
+        )
         features = refine_info["features"]
         b, source_views, _, h, w = features.shape
         if source_views != ctx_img_num:
@@ -745,7 +760,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         history_past_before_errors = []
         history_past_after_errors = []
         history_past_degradations = []
-        add_suppression_losses = []
+        add_rate_ratios = []
         regularization_losses = []
         old_delete_budget_losses = []
         old_delete_candidate_probabilities = []
@@ -764,11 +779,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         old_decay_map_counts_after = []
         old_delete_graph_anchor = features.new_zeros(())
         add_gates = []
-        add_targets = []
-        covered_add_gates = []
-        uncovered_add_gates = []
-        supported_add_gates = []
-        unsupported_add_gates = []
+        learned_add_gates = []
         effective_new_ratios = []
         new_opacity_mass_ratios = []
         low_add_gate_ratios = {0.1: [], 0.2: []}
@@ -957,12 +968,13 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                         / valid_count
                     )
 
-                state = state.update_historical(
-                    gir,
-                    prediction,
-                    pred_all_extrinsic[:, view_idx],
-                    update_confidence=historical_update_confidence,
-                )
+                if old_residual_enabled:
+                    state = state.update_historical(
+                        gir,
+                        prediction,
+                        pred_all_extrinsic[:, view_idx],
+                        update_confidence=historical_update_confidence,
+                    )
 
                 if old_decay_enabled:
                     state, decay_stats = state.decay_historical_opacity(
@@ -1218,88 +1230,16 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             visible_ratios.append(coverage.mean())
             if state is None:
                 # Keep frame zero identical to the base GS prediction.
+                learned_add_gate_low = torch.ones_like(prediction.add_logit)
                 add_gate_low = torch.ones_like(prediction.add_logit) + (
                     0.0 * prediction.add_logit
                 )
             else:
-                with torch.no_grad():
-                    current_depth_low = F.interpolate(
-                        current_depth.detach().float(),
-                        size=(low_h, low_w),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                    historical_depth = (
-                        gir.raster_depth if use_raster_evidence else gir.depth
-                    ).detach().float()
-                    historical_alpha = (
-                        gir.raster_alpha if use_raster_evidence else gir.opacity
-                    ).detach().float()
-
-                    depth_tolerance = max(
-                        1e-3,
-                        float(getattr(cfg, "gir_add_depth_tolerance", 0.15)),
-                    )
-                    alpha_threshold = max(
-                        1e-3,
-                        float(getattr(cfg, "gir_add_alpha_threshold", 0.5)),
-                    )
-                    prior_floor = min(
-                        0.49,
-                        max(
-                            1e-4,
-                            float(getattr(cfg, "gir_add_prior_floor", 0.02)),
-                        ),
-                    )
-                    relative_depth_error = (
-                        (historical_depth - current_depth_low).abs()
-                        / current_depth_low.clamp_min(1e-4)
-                    )
-                    depth_support = torch.exp(
-                        -0.5 * (relative_depth_error / depth_tolerance).square()
-                    )
-                    alpha_support = (
-                        historical_alpha / alpha_threshold
-                    ).clamp(0.0, 1.0)
-                    valid_depth = (
-                        (historical_depth > 1e-5)
-                        & (current_depth_low > 1e-5)
-                    ).to(alpha_support.dtype)
-                    history_support = (
-                        coverage.float()
-                        * valid_depth
-                        * alpha_support
-                        * depth_support
-                    ).clamp(0.0, 1.0)
-                    add_target = (1.0 - history_support).clamp(
-                        prior_floor, 1.0 - prior_floor
-                    )
-                    add_prior = torch.logit(add_target).to(
-                        prediction.add_logit.dtype
-                    )
-
-                add_gate_low = torch.sigmoid(prediction.add_logit + add_prior)
-                add_suppression_losses.append(
-                    (add_gate_low.float() - add_target).square().mean()
+                learned_add_gate_low = torch.sigmoid(prediction.add_logit)
+                add_gate_low = 1.0 - add_gate_warmup_progress * (
+                    1.0 - learned_add_gate_low
                 )
-                add_targets.append(add_target.mean())
-
-                def masked_mean(
-                    values: torch.Tensor, mask: torch.Tensor
-                ) -> torch.Tensor:
-                    mask = mask.to(values.dtype)
-                    return (values * mask).sum() / mask.sum().clamp_min(1.0)
-
-                supported = (history_support >= 0.5).to(add_gate_low.dtype)
-                unsupported = coverage * (1.0 - supported)
-                covered_add_gates.append(masked_mean(add_gate_low, coverage))
-                uncovered_add_gates.append(
-                    masked_mean(add_gate_low, 1.0 - coverage)
-                )
-                supported_add_gates.append(masked_mean(add_gate_low, supported))
-                unsupported_add_gates.append(
-                    masked_mean(add_gate_low, unsupported)
-                )
+                learned_add_gates.append(learned_add_gate_low.mean())
             add_gate = F.interpolate(
                 add_gate_low,
                 size=(h, w),
@@ -1308,6 +1248,18 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             )
             add_gates.append(add_gate_low.mean())
             if has_history:
+                learned_add_gate = F.interpolate(
+                    learned_add_gate_low,
+                    size=(h, w),
+                    mode="bilinear",
+                    align_corners=False,
+                ).reshape(b, gaussians_per_view)
+                opacity_weight = current_gaussians.opacities.detach().float()
+                add_rate_ratios.append(
+                    (
+                        learned_add_gate.float() * opacity_weight
+                    ).sum() / opacity_weight.sum().clamp_min(1e-8)
+                )
                 effective_opacity = current_gaussians.opacities * add_gate.reshape(
                     b, gaussians_per_view
                 ).to(current_gaussians.opacities.dtype)
@@ -1340,9 +1292,13 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 + prediction.delta_harmonics.square().mean(dim=1, keepdim=True)
             )
             residual_magnitudes.append(residual_energy.mean().sqrt())
-            regularization_losses.append(
+            old_residual_regularization = (
                 (residual_energy * coverage).sum() / valid_normalizer
-                + new_residual_energy.mean()
+                if old_residual_enabled
+                else residual_energy.sum() * 0.0
+            )
+            regularization_losses.append(
+                old_residual_regularization + new_residual_energy.mean()
             )
 
             if state is None:
@@ -1422,6 +1378,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             encoder_output.infos["gir_map_gaussians"] = torch.tensor(
                 state.num_gaussians, device=features.device
             )
+            encoder_output.infos["gir_old_residual_enabled"] = torch.tensor(
+                float(old_residual_enabled), device=features.device
+            )
             if test_pruned_new_ratios:
                 unpruned_map_gaussians = source_views * gaussians_per_view
                 encoder_output.infos["gir_test_prune_threshold"] = torch.tensor(
@@ -1463,25 +1422,19 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     top1_confidence_means
                 ).mean()
             encoder_output.infos["gir_add_gate"] = torch.stack(add_gates).mean()
-            if add_suppression_losses:
-                encoder_output.infos["gir_add_loss"] = torch.stack(
-                    add_suppression_losses
+            encoder_output.infos["gir_add_gate_warmup_progress"] = torch.tensor(
+                add_gate_warmup_progress, device=features.device
+            )
+            if add_rate_ratios:
+                add_rate_ratio = torch.stack(add_rate_ratios).mean()
+                encoder_output.infos["gir_add_gate_learned"] = torch.stack(
+                    learned_add_gates
                 ).mean()
-                encoder_output.infos["gir_add_target"] = torch.stack(
-                    add_targets
-                ).mean()
-                encoder_output.infos["gir_add_gate_covered"] = torch.stack(
-                    covered_add_gates
-                ).mean()
-                encoder_output.infos["gir_add_gate_uncovered"] = torch.stack(
-                    uncovered_add_gates
-                ).mean()
-                encoder_output.infos["gir_add_gate_supported"] = torch.stack(
-                    supported_add_gates
-                ).mean()
-                encoder_output.infos["gir_add_gate_unsupported"] = torch.stack(
-                    unsupported_add_gates
-                ).mean()
+                encoder_output.infos["gir_add_rate"] = add_rate_ratio
+                encoder_output.infos["gir_add_rate_loss"] = (
+                    add_rate_ratio * add_gate_warmup_progress
+                )
+            if effective_new_ratios:
                 encoder_output.infos["gir_effective_new_ratio"] = torch.stack(
                     effective_new_ratios
                 ).mean()

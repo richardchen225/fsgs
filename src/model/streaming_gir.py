@@ -921,6 +921,10 @@ class GIRUpdateHead(nn.Module):
         self.delete_prediction = nn.Conv2d(hidden_dim, 1, kernel_size=1)
         nn.init.zeros_(self.prediction.weight)
         nn.init.zeros_(self.prediction.bias)
+        with torch.no_grad():
+            # The final prediction channel is add_logit. Start near identity so
+            # a newly initialized GIR does not suppress the stage-1 GS map.
+            self.prediction.bias[-1] = 4.0
         nn.init.zeros_(self.current_prediction.weight)
         nn.init.zeros_(self.current_prediction.bias)
         nn.init.zeros_(self.delete_prediction.weight)
