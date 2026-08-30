@@ -141,6 +141,7 @@ class EncoderAnySplatCfg:
     gir_history_loss_interval: int = 4
     gir_history_preserve_margin: float = 0.002
     gir_history_replay_views: int = 1
+    gir_add_gate_enabled: bool = True
     gir_add_gate_warmup_steps: int = 1000
     gir_add_rate_loss_weight: float = 0.01
     gir_regularization_weight: float = 1e-4

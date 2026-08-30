@@ -166,6 +166,10 @@ class ModelWrapper(LightningModule):
         train_base_heads = bool(self.optimizer_cfg.train_base_heads)
         train_gir = bool(self.optimizer_cfg.train_gir)
 
+        if not train_base_heads:
+            # Stage 2 starts from a fixed stage-1 model and only learns GIR.
+            self.model.requires_grad_(False)
+
         for module_name in ("gaussian_param_head", "gs_head"):
             module = getattr(self.model.encoder, module_name, None)
             if module is None:
@@ -315,6 +319,7 @@ class ModelWrapper(LightningModule):
                 encoder_output.infos["gir_add_gate"].float(),
             )
             for metric_name in (
+                "gir_add_gate_enabled",
                 "gir_add_gate_learned",
                 "gir_add_gate_warmup_progress",
                 "gir_add_rate",

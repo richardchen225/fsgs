@@ -721,6 +721,13 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         scheduled_old_delete_target = (
             old_delete_target_ratio * old_delete_warmup_progress
         )
+        add_gate_enabled = bool(
+            getattr(cfg, "gir_add_gate_enabled", True)
+        )
+        if not add_gate_enabled and prune_threshold > 0.0:
+            raise ValueError(
+                "GIR test pruning requires gir_add_gate_enabled=true."
+            )
         add_gate_warmup_steps = max(
             0, int(getattr(cfg, "gir_add_gate_warmup_steps", 1000))
         )
@@ -1228,12 +1235,14 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
 
             coverage = gir.valid.to(prediction.add_logit.dtype)
             visible_ratios.append(coverage.mean())
-            if state is None:
-                # Keep frame zero identical to the base GS prediction.
+            if state is None or not add_gate_enabled:
+                # Frame zero and residual-only experiments keep every new GS.
                 learned_add_gate_low = torch.ones_like(prediction.add_logit)
                 add_gate_low = torch.ones_like(prediction.add_logit) + (
                     0.0 * prediction.add_logit
                 )
+                if state is not None:
+                    learned_add_gates.append(learned_add_gate_low.mean())
             else:
                 learned_add_gate_low = torch.sigmoid(prediction.add_logit)
                 add_gate_low = 1.0 - add_gate_warmup_progress * (
@@ -1422,6 +1431,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     top1_confidence_means
                 ).mean()
             encoder_output.infos["gir_add_gate"] = torch.stack(add_gates).mean()
+            encoder_output.infos["gir_add_gate_enabled"] = torch.tensor(
+                float(add_gate_enabled), device=features.device
+            )
             encoder_output.infos["gir_add_gate_warmup_progress"] = torch.tensor(
                 add_gate_warmup_progress, device=features.device
             )

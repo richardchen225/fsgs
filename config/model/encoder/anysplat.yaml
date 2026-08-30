@@ -54,5 +54,6 @@ gir_old_decay_enabled: false
 gir_old_decay_topk: 4
 gir_old_decay_strength: 0.02
 gir_old_decay_prune_threshold: 0.005
+gir_add_gate_enabled: true
 gir_add_gate_warmup_steps: 1000
 gir_add_rate_loss_weight: 0.01

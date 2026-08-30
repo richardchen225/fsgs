@@ -49,8 +49,9 @@ model:
     gir_history_loss_interval: 4
     gir_history_preserve_margin: 0.002
     gir_history_replay_views: 1
+    gir_add_gate_enabled: false
     gir_add_gate_warmup_steps: 1000
-    gir_add_rate_loss_weight: 0.01
+    gir_add_rate_loss_weight: 0.0
     gir_regularization_weight: 1e-4
     
 dataset:
