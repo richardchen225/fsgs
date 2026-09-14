@@ -178,6 +178,12 @@ def train(cfg_dict: DictConfig):
                 and value.shape == model_state[key].shape
                 and key.startswith(load_prefixes)
             }
+            if not compatible_ckpt:
+                raise RuntimeError(
+                    "No compatible GS/GIR head weights were found in "
+                    f"{cfg.checkpointing.train_pretrained_weights}. "
+                    "Check the pretrained checkpoint and its key names."
+                )
             if not cfg.optimizer.train_base_heads:
                 required_base_prefixes = (
                     "encoder.gaussian_param_head.",
@@ -201,6 +207,16 @@ def train(cfg_dict: DictConfig):
                 "Loaded "
                 f"{len(compatible_ckpt)} compatible pretrained head tensors."
             )
+            for prefix in load_prefixes:
+                head_keys = [key for key in model_state if key.startswith(prefix)]
+                if not head_keys:
+                    continue
+                loaded_count = sum(key in compatible_ckpt for key in head_keys)
+                print(
+                    f"Pretrained head {prefix.removesuffix('.')}: "
+                    f"loaded={loaded_count}/{len(head_keys)} tensors; "
+                    f"kept_initialized={len(head_keys) - loaded_count}"
+                )
                 
     else:
         if cfg.checkpointing.load is None:

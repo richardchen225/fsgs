@@ -76,11 +76,12 @@ dataset:
 
 optimizer:
   lr: 5e-5
+  # Jointly train the stage-1 GS heads and GIR, keeping ZipMap/MoGe frozen.
   pretrained_lr: 1e-5
   scratch_lr: 5e-5
   warm_up_steps: 1000
   backbone_lr_multiplier: 0.1
-  train_base_heads: false
+  train_base_heads: true
   train_gir: true
 
 data_loader:
@@ -99,8 +100,8 @@ trainer:
 
 checkpointing:
   load: null
-  # Set this to the stage-1 checkpoint that achieved the base PSNR.
-  train_pretrained_weights: null
+  # Initialize compatible heads from WorldMirror; start a new optimizer/schedule.
+  train_pretrained_weights: weights/pre_wm.safetensors
   every_n_train_steps: 500
   save_weights_only: false
   save_top_k: 10
