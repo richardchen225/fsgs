@@ -162,6 +162,20 @@ class ModelWrapper(LightningModule):
         self._val_comparison_images: list[np.ndarray] = []
         self._val_comparison_captions: list[str] = []
 
+    def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        # Fixed loss networks are initialized from their own pretrained weights.
+        state_dict = checkpoint["state_dict"]
+        for key in list(state_dict):
+            if key.startswith("losses."):
+                del state_dict[key]
+
+    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        # Fill omitted loss weights for strict Lightning resume. Preserve any
+        # loss weights stored by older checkpoints and keep model checks strict.
+        state_dict = checkpoint["state_dict"]
+        for key, value in self.losses.state_dict(prefix="losses.").items():
+            state_dict.setdefault(key, value)
+
     def _configure_training_stage(self) -> None:
         train_base_heads = bool(self.optimizer_cfg.train_base_heads)
         train_gir = bool(self.optimizer_cfg.train_gir)
