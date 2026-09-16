@@ -13,6 +13,8 @@ from safetensors.torch import load_file
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.model.model import get_model
+from src.evaluation.benchmark_io import write_json
+from src.misc.backbone_checkpoint import validate_backbone_checkpoint
 import torch.nn.init as init
 import warnings
 import torch.nn.functional as F
@@ -133,7 +135,11 @@ def train(cfg_dict: DictConfig):
                 ckpt = load_file(cfg.checkpointing.train_pretrained_weights)
             else:
                 ckpt = torch.load(cfg.checkpointing.train_pretrained_weights, map_location='cpu')
-                ckpt = ckpt.get("state_dict", ckpt)
+            validate_backbone_checkpoint(
+                ckpt, cfg.model.encoder,
+                allow_transfer=cfg.optimizer.train_base_heads,
+            )
+            ckpt = ckpt.get("state_dict", ckpt)
         def rename_key(key: str) -> str:
             if key.startswith("gs_head"):
                 key = key.replace("gs_head", "encoder.gaussian_param_head", 1)
@@ -227,6 +233,7 @@ def train(cfg_dict: DictConfig):
             ckpt = load_file(test_checkpoint)
         else:
             ckpt = torch.load(test_checkpoint, map_location='cpu')
+        validate_backbone_checkpoint(ckpt, cfg.model.encoder)
         ckpt = ckpt.get("state_dict", ckpt)
         ckpt = {key.replace('model.', ''): value for key, value in ckpt.items()}
         ckpt = {
@@ -346,6 +353,19 @@ def train(cfg_dict: DictConfig):
             datamodule=data_module,
             ckpt_path=cfg.checkpointing.load,
         )
+        if cfg.checkpointing.save_final:
+            if trainer.interrupted or (
+                cfg.trainer.max_steps > 0 and trainer.global_step != cfg.trainer.max_steps
+            ):
+                raise RuntimeError("Training did not reach max_steps; refusing to publish final checkpoint.")
+            final_checkpoint = output_dir / "checkpoints" / "final.ckpt"
+            trainer.save_checkpoint(final_checkpoint, weights_only=cfg.checkpointing.save_weights_only)
+            if trainer.is_global_zero:
+                write_json(output_dir / "final_checkpoint.json", {
+                    "checkpoint": str(final_checkpoint.resolve()),
+                    "global_step": trainer.global_step,
+                    "config": str((output_dir / ".hydra" / "config.yaml").resolve()),
+                })
     else:
         trainer.test(
             model_wrapper,

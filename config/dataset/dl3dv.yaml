@@ -3,6 +3,8 @@ defaults:
   - view_sampler: bounded
 
 name: dl3dv
+test_scan_scenes: false
+test_expected_scenes: null
 # Previous OpenBayes path:
 # roots: [/openbayes/input/input0/dl3dv, /openbayes/input/input0/dl3dv/train_index.json]
 roots: [datasets/dl3dv]

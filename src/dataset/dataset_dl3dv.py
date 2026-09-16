@@ -22,6 +22,7 @@ from .shims.crop_shim import apply_crop_shim
 from .types import Stage
 from .view_sampler import ViewSampler
 from ..misc.cam_utils import camera_normalization
+from ..evaluation.benchmark_io import discover_scenes, image_8_path
 
 
 @dataclass
@@ -42,6 +43,8 @@ class DatasetDl3dvCfg(DatasetCfgCommon):
     mode: Optional[Literal["train", "test"]] = None
     ctx_list: list | None = None   
     tgt_list: list | None = None   
+    test_scan_scenes: bool = False
+    test_expected_scenes: int | None = None
 
 
 @dataclass
@@ -75,16 +78,20 @@ class DatasetDL3DV(Dataset):
         self.data_list = []
 
         index_path = Path(self.data_root) / f"{self.data_stage}_index.json"
-        if not index_path.exists():
+        scan_scenes = self.stage == "test" and cfg.test_scan_scenes
+        if scan_scenes:
+            self.data_list = discover_scenes(self.data_root, cfg.test_expected_scenes)
+        elif not index_path.exists():
             raise FileNotFoundError(
                 f"DL3DV {self.data_stage} index not found: {index_path}. "
                 f"Expected train_index.json/test_index.json under dataset root."
             )
 
-        with index_path.open("r", encoding="utf-8") as file:
-            data_index = json.load(file)
-        if not isinstance(data_index, list):
-            raise TypeError(f"{index_path} must be a JSON array.")
+        if not scan_scenes:
+            with index_path.open("r", encoding="utf-8") as file:
+                data_index = json.load(file)
+            if not isinstance(data_index, list):
+                raise TypeError(f"{index_path} must be a JSON array.")
 
         def resolve_scene_dir(data_root, item):
             item_path = os.path.join(data_root, item)
@@ -130,7 +137,8 @@ class DatasetDL3DV(Dataset):
                             data_list.append((scene_path, scene_id))
             return data_list
 
-        self.data_list = filter_data_list(data_index, self.data_root)
+        if not scan_scenes:
+            self.data_list = filter_data_list(data_index, self.data_root)
         self.scene_ids = {}
         self.scenes = {}
         index = 0
@@ -213,7 +221,7 @@ class DatasetDL3DV(Dataset):
             futures_with_idx = []
             for idx, file_path in enumerate(frames):
                 # file_path = file_path["file_path"]
-                file_path = file_path["file_path"].replace("images", "images_8")
+                file_path = str(image_8_path(file_path["file_path"]))
                 futures_with_idx.append(
                     (
                         idx,
@@ -377,6 +385,11 @@ class DatasetDL3DV(Dataset):
         try:
             return self.getitem(index, num_context_views, (patchsize_h, patchsize_w))
         except Exception as e:
+            if self.stage == "test":
+                raise RuntimeError(
+                    f"DL3DV test scene {self.scene_ids[index]} failed; "
+                    "test scenes must not be replaced with random samples."
+                ) from e
             print(f"Error: {e}")
             traceback.print_exc()
             index = np.random.randint(len(self))
@@ -400,6 +413,8 @@ class DatasetDL3DV(Dataset):
 
     @cached_property
     def index(self) -> dict[str, Path]:
+        if self.stage == "test" and self.cfg.test_scan_scenes:
+            return {scene_id: Path(path) for path, scene_id in self.data_list}
         merged_index = {}
         data_stages = [self.data_stage]
         if self.cfg.overfit_to_scene is not None:

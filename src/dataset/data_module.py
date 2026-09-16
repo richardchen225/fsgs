@@ -179,8 +179,8 @@ class DataModule(LightningDataModule):
         
         sampler = DistributedSampler(
             dataset,
-            num_replicas=torch.distributed.get_world_size(), 
-            rank=torch.distributed.get_rank(),  
+            num_replicas=get_world_size(),
+            rank=get_rank(),
             shuffle=False  
         )
         sampler.set_epoch(0)

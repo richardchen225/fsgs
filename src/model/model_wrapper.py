@@ -30,6 +30,7 @@ from ..evaluation.metrics import (
     compute_psnr,
     compute_ssim,
 )
+from ..evaluation.benchmark_io import summarize_scenes, write_results
 from ..global_cfg import get_cfg
 from ..loss import Loss
 from ..misc.benchmarker import Benchmarker
@@ -87,6 +88,7 @@ class TestCfg:
     generate_video: bool
     mode: Literal["inference", "evaluation"]
     image_folder: str
+    save_metrics: bool = True
     gir_add_gate_prune_threshold: float = 0.0
     gir_test_top1_confidence_mode: Literal[
         "inherit", "none", "floor_sqrt", "sqrt"
@@ -163,6 +165,10 @@ class ModelWrapper(LightningModule):
         self._val_comparison_captions: list[str] = []
 
     def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        if self is not None and hasattr(self.model, "encoder"):
+            from src.misc.backbone_checkpoint import backbone_signature
+
+            checkpoint["reconstruction_backbone"] = backbone_signature(self.model.encoder.cfg)
         # Fixed loss networks are initialized from their own pretrained weights.
         state_dict = checkpoint["state_dict"]
         for key in list(state_dict):
@@ -170,6 +176,10 @@ class ModelWrapper(LightningModule):
                 del state_dict[key]
 
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        if hasattr(self, "model") and hasattr(self.model, "encoder"):
+            from src.misc.backbone_checkpoint import validate_backbone_checkpoint
+
+            validate_backbone_checkpoint(checkpoint, self.model.encoder.cfg)
         # Fill omitted loss weights for strict Lightning resume. Preserve any
         # loss weights stored by older checkpoints and keep model checks strict.
         state_dict = checkpoint["state_dict"]
@@ -768,6 +778,14 @@ class ModelWrapper(LightningModule):
                 f"step={self.global_step}, batch={batch_idx}, index={i}, scene={scenes[i]}"
             )
 
+    def on_test_epoch_start(self) -> None:
+        self._test_scene_rows = []
+        self._test_result_summary = None
+        self.running_metrics = None
+        for name in ("_test_gir_diagnostic_sums", "_test_gir_diagnostic_count"):
+            if hasattr(self, name):
+                delattr(self, name)
+
     def test_step(self, batch, batch_idx):
         batch: BatchedExample = self.data_shim(batch)
         b, v, _, h, w = batch["target"]["image"].shape
@@ -857,6 +875,7 @@ class ModelWrapper(LightningModule):
                             f"history={final_history}, expected={ctx_img_num - 1}."
                         )
 
+        gir_diagnostics = {}
         if (
             encoder_output.infos is not None
             and "gir_map_gaussians" in encoder_output.infos
@@ -921,15 +940,16 @@ class ModelWrapper(LightningModule):
                         encoder_output.infos[key].detach().float().item()
                     )
 
-            self.log_dict(
-                {
-                    f"test/gir_{key}": torch.tensor(value, device=opacity.device)
-                    for key, value in gir_diagnostics.items()
-                },
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-            )
+            if not self.test_cfg.compute_scores:
+                self.log_dict(
+                    {
+                        f"test/gir_{key}": torch.tensor(value, device=opacity.device)
+                        for key, value in gir_diagnostics.items()
+                    },
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
             self._record_test_gir_diagnostics(gir_diagnostics)
 
             scene_name = str(batch["scene"][0])
@@ -1100,7 +1120,14 @@ class ModelWrapper(LightningModule):
                     f"psnr_ours": psnr,
                 }
                 methods = ["ours"]
-                self.log_dict(all_metrics, prog_bar=True, sync_dist=True, on_epoch=True)
+                self._test_scene_rows.append({
+                    "scene": str(batch["scene"][0]),
+                    "source_indices": context_indices[0, :ctx_img_num].tolist(),
+                    "target_indices": target_indices[0].tolist(),
+                    "image_shape": [h, w],
+                    **all_metrics,
+                    "gir": gir_diagnostics,
+                })
                 self.print_preview_metrics(all_metrics, methods)
 
         # Save images.
@@ -1190,9 +1217,45 @@ class ModelWrapper(LightningModule):
 #             comparison = hcat(*compare_items)
 #             save_image(comparison, path / f"{psnr}_{scene}.png")
 
+    def on_test_epoch_end(self) -> None:
+        if not self.test_cfg.compute_scores:
+            return
+        from omegaconf import OmegaConf
+
+        rank_rows = [self._test_scene_rows]
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank_rows = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(rank_rows, self._test_scene_rows)
+        loader = self.trainer.test_dataloaders
+        if isinstance(loader, (list, tuple)):
+            (loader,) = loader
+        rows, summary = summarize_scenes(rank_rows, len(loader.dataset))
+        summary["checkpoint"] = str(Path(get_cfg().checkpointing.load).resolve())
+        summary["world_size"] = self.trainer.world_size
+        summary["config"] = OmegaConf.to_container(get_cfg(), resolve=True)
+        self._test_result_summary = summary
+        # All ranks have the same de-duplicated aggregate; do not average it again.
+        self.log_dict(summary["metrics"], on_epoch=True, sync_dist=False)
+        self.log_dict({f"test/gir_{k}": v for k, v in summary["gir"].items()},
+                      on_epoch=True, sync_dist=False)
+        if self.global_rank == 0:
+            if self.test_cfg.save_metrics:
+                write_results(self.test_cfg.output_path, rows, summary)
+            print(f"\n[BENCHMARK RESULT] scenes={summary['scene_count']} "
+                  f"duplicates_removed={summary['duplicate_rows_removed']}")
+            for key, value in summary["metrics"].items():
+                print(f"{key}={value:.6f}")
+            if self.test_cfg.save_metrics:
+                print(f"Results: {self.test_cfg.output_path / 'metrics.json'}")
+
     def on_test_end(self) -> None:
         self.benchmarker.summarize()
-        self._print_test_gir_diagnostics()
+        if self._test_result_summary is None:
+            self._print_test_gir_diagnostics()
+        elif self.global_rank == 0:
+            print("\n[GIR TEST SUMMARY]")
+            for key, value in self._test_result_summary["gir"].items():
+                print(f"{key}={value:.6f}")
 
     def _record_test_gir_diagnostics(
         self,

@@ -13,6 +13,8 @@ wandb:
 model:
   encoder:
     mode: ${mode}
+    reconstruction_backbone: abot
+    abot_weights_path: weights/abot_recon.safetensors
     moge_weights_path: weights/model.pt
     zipmap_weights_path: weights/pre_zipmap.pt
     gs_refine_detach_evidence: false
@@ -20,7 +22,7 @@ model:
     depth_refine_downsample_factor: 4
     depth_refine_enabled: false
     gs_refine_enabled: false
-    gir_enabled: true
+    gir_enabled: false
     gir_render_scale: 0.5
     gir_raster_evidence_enabled: true
     gir_dominant_id_enabled: true
@@ -76,13 +78,13 @@ dataset:
 
 optimizer:
   lr: 5e-5
-  # Jointly train the stage-1 GS heads and GIR, keeping ZipMap/MoGe frozen.
+  # Train only the DPT depth/features and GS parameter heads; backbone/cameras/MoGe stay frozen.
   pretrained_lr: 1e-5
   scratch_lr: 5e-5
   warm_up_steps: 1000
   backbone_lr_multiplier: 0.1
   train_base_heads: true
-  train_gir: true
+  train_gir: false
 
 data_loader:
   train:

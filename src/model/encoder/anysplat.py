@@ -3,7 +3,7 @@ import numpy as np
 import os
 from pathlib import Path
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 from einops import rearrange
 import torch
@@ -21,7 +21,10 @@ from src.model.encoder.vggt.utils.geometry import (
     batchify_sparse_unproject_depth_to_point
 )
 import matplotlib.pyplot as plt
-from src.model.encoder.vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from src.model.encoder.vggt.utils.pose_enc import (
+    pose_encoding_to_extri_intri,
+    extri_intri_to_pose_encoding,
+)
 from torch import nn, Tensor
 from torch_scatter import scatter_add, scatter_max
 from ..types import Gaussians
@@ -41,7 +44,6 @@ root_path = os.path.abspath(".")
 sys.path.append(root_path)
 from src.model.encoder.vggt.models.vggt import VGGT
 from moge.model.v2 import MoGeModel
-from src.model.encoder.zipmap.models.ZipMap_AR import ZipMap
 # from src.model.encoder.lingbot_map.models.gct_stream import GCTStream
 
 inf = float("inf")
@@ -87,6 +89,9 @@ class EncoderAnySplatCfg:
     gs_keep_ratio: float = 1.0
     opacity_conf: bool = False
     # Model weights paths
+    reconstruction_backbone: Literal["zipmap", "abot"] = "zipmap"
+    abot_weights_path: Optional[str] = None
+    abot_feature_layers: list[int] = field(default_factory=lambda: [7, 17, 25, 35])
     streamvggt_weights_path: Optional[str] = None
     zipmap_weights_path: Optional[str] = None
     zipmap_use_ema: bool = False
@@ -670,8 +675,8 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
     backbone: nn.Module
     gaussian_adapter: GaussianAdapter
 
-    def __init__(self, cfg: EncoderAnySplatCfg) -> None:
-        super().__init__(cfg)
+    def _init_zipmap(self, cfg: EncoderAnySplatCfg) -> None:
+        from src.model.encoder.zipmap.models.ZipMap_AR import ZipMap
 
         zipmap_config = {
             "img_size": 518,
@@ -766,6 +771,24 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             model_full.camera_mlp_head,
         )
 
+    def __init__(self, cfg: EncoderAnySplatCfg) -> None:
+        super().__init__(cfg)
+        if cfg.reconstruction_backbone == "zipmap":
+            self._init_zipmap(cfg)
+        elif cfg.reconstruction_backbone == "abot":
+            from .abot_adapter import ABotBackboneAdapter
+
+            if cfg.abot_weights_path is None:
+                raise ValueError("model.encoder.abot_weights_path must be set for ABot.")
+            self.aggregator = ABotBackboneAdapter(
+                cfg.abot_weights_path, tuple(cfg.abot_feature_layers)
+            )
+            # ABot's native camera decoder/head live inside the adapter.
+            self.camera_head = nn.Identity()
+        else:
+            raise ValueError(f"Unknown reconstruction backbone: {cfg.reconstruction_backbone}")
+        print(f"Reconstruction backbone: {cfg.reconstruction_backbone} (frozen)")
+
         if cfg.moge_weights_path is None:
             raise ValueError("model.encoder.moge_weights_path must be set before using EncoderAnySplat.")
         print("Loading MoGe-2 model for intrinsics...")
@@ -776,7 +799,6 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         for module in [self.aggregator, self.camera_head]:
             for param in module.parameters():
                 param.requires_grad = False
-        del model_full
 
         head_params = GSHeadParams()
         self.gaussian_param_head = VGGT_DPT_GS_Head(
@@ -848,16 +870,33 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         distill_infos = {}
         pred_all_extrinsic = None
         
+        abot_cameras = None
         with torch.no_grad():
-            with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
-                aggregated_tokens_list, patch_start_idx = self.aggregator(
-                    image.to(torch.float16)
+            if self.cfg.reconstruction_backbone == "abot":
+                aggregated_tokens_list, patch_start_idx, abot_cameras = self.aggregator(
+                    image, num_feature_views=ctx_img_num
                 )
+                # ABot runs bf16; the existing DPT runs in float32 below.
+                aggregated_tokens_list = [tokens.float() for tokens in aggregated_tokens_list]
+            else:
+                with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
+                    aggregated_tokens_list, patch_start_idx = self.aggregator(
+                        image.to(torch.float16)
+                    )
 
         with torch.amp.autocast("cuda", enabled=False):
-            pred_pose_enc_list = self.camera_head(aggregated_tokens_list)
-            last_pred_pose_enc = pred_pose_enc_list[-1]
-            distill_infos["pred_pose_enc_list"] = last_pred_pose_enc
+            if abot_cameras is None:
+                pred_pose_enc_list = self.camera_head(aggregated_tokens_list)
+                last_pred_pose_enc = pred_pose_enc_list[-1]
+                pred_all_extrinsic, _ = pose_encoding_to_extri_intri(
+                    last_pred_pose_enc, image.shape[-2:]
+                )
+            else:
+                # ABot returns camera-to-world; this part of the encoder uses
+                # world-to-camera until the common conversion below.
+                pred_all_extrinsic = closed_form_inverse_se3(
+                    abot_cameras.flatten(0, 1)
+                ).reshape(b, v, 4, 4)[..., :3, :]
             
             # moge 
             moge_out = self.moge_model.infer(
@@ -871,15 +910,11 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 K_norm = K_norm.unsqueeze(0)
            
             
-            pred_all_extrinsic, _ = pose_encoding_to_extri_intri(
-                last_pred_pose_enc, image.shape[-2:]
-            )
-
             gt_ex = closed_form_inverse_se3(
                 pred_all_extrinsic[:, :ctx_img_num, ...].flatten(0, 1)
             )
 
-            K_px = K_norm.to(device=device, dtype=last_pred_pose_enc.dtype).clone()
+            K_px = K_norm.to(device=device, dtype=pred_all_extrinsic.dtype).clone()
 
             K_px[:, 0, 0] = K_px[:, 0, 0] * w   # fx
             K_px[:, 1, 1] = K_px[:, 1, 1] * h   # fy
@@ -887,6 +922,18 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             K_px[:, 1, 2] = K_px[:, 1, 2] * h   # cy
             # 把 fy 改成 fx
             K_px[:, 1, 1] = K_px[:, 0, 0]
+
+            if abot_cameras is not None:
+                normalized_k = K_px.clone()
+                normalized_k[:, 0] /= w
+                normalized_k[:, 1] /= h
+                last_pred_pose_enc = extri_intri_to_pose_encoding(
+                    pred_all_extrinsic,
+                    normalized_k[:, None].expand(b, v, 3, 3),
+                    image_size_hw=(h, w),
+                )
+                pred_pose_enc_list = [last_pred_pose_enc]
+            distill_infos["pred_pose_enc_list"] = last_pred_pose_enc
 
             # 复制成 [b, ctx_img_num, 3, 3]
             K = K_px[:, None, :, :].expand(b, ctx_img_num, 3, 3).clone()

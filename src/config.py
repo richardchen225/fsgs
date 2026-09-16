@@ -20,6 +20,7 @@ class CheckpointingCfg:
     every_n_train_steps: int
     save_top_k: int
     save_weights_only: bool
+    save_final: bool = False
 
 
 @dataclass
