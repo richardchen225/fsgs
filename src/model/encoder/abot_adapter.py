@@ -17,6 +17,79 @@ ABOT_REVISION = "edbe7e153bc2a5e35e2d4cb76fb02c90d14fade8"
 DEFAULT_FEATURE_LAYERS = (7, 17, 25, 35)
 
 
+def _gather_views(tensor, indices):
+    batch = torch.arange(tensor.shape[0], device=tensor.device)[:, None]
+    return tensor[batch, indices]
+
+
+def _proper_rotation(matrix):
+    u, singular, vh = torch.linalg.svd(matrix)
+    correction = torch.ones_like(singular)
+    correction[..., -1] = torch.linalg.det(u @ vh)
+    return (u * correction.unsqueeze(-2)) @ vh, singular
+
+
+@torch.no_grad()
+def align_source_cameras(reference, moving, cameras):
+    """Fit moving -> reference Sim(3) on matched source c2w poses only.
+
+    Non-collinear camera centers use Umeyama. For a line/point trajectory,
+    camera orientations resolve the otherwise unobservable rotation. A single
+    source or stationary trajectory cannot determine scale; use 1 in that case.
+    """
+    if (reference.ndim != 4 or reference.shape != moving.shape
+            or reference.shape[1] < 1 or reference.shape[-2:] != (4, 4)
+            or cameras.ndim != 4 or cameras.shape[0] != reference.shape[0]
+            or cameras.shape[-2:] != (4, 4)):
+        raise ValueError("Alignment expects matched [B,S,4,4] and full [B,V,4,4] c2w poses.")
+    if not all(torch.isfinite(x).all() for x in (reference, moving, cameras)):
+        raise ValueError("ABot produced non-finite camera poses before alignment.")
+    dtype = cameras.dtype
+    # Small 3x3 fits in float64 avoid half-precision SVD and baseline cancellation.
+    with torch.autocast(cameras.device.type, enabled=False):
+        reference, moving, cameras = (x.double() for x in (reference, moving, cameras))
+        x, y = moving[..., :3, 3], reference[..., :3, 3]
+        x_mean, y_mean = x.mean(1), y.mean(1)
+        xc, yc = x - x_mean[:, None], y - y_mean[:, None]
+        covariance = yc.transpose(1, 2) @ xc / x.shape[1]
+        center_rotation, singular = _proper_rotation(covariance)
+        orientation_rotation, _ = _proper_rotation(
+            (reference[..., :3, :3] @ moving[..., :3, :3].transpose(-1, -2)).mean(1)
+        )
+        use_orientation = (singular[:, 0] <= 1e-12) | (singular[:, 1] <= singular[:, 0] * 1e-4)
+        rotation = torch.where(use_orientation[:, None, None], orientation_rotation, center_rotation)
+        rotated_xc = xc @ rotation.transpose(-1, -2)
+        variance = xc.square().sum((1, 2))
+        scale = (rotated_xc * yc).sum((1, 2)) / variance.clamp_min(1e-12)
+        scale_fallback = (variance <= 1e-12) | (yc.square().sum((1, 2)) <= 1e-12) | (scale <= 0)
+        scale = torch.where(scale_fallback, torch.ones_like(scale), scale)
+        translation = y_mean - scale[:, None] * (rotation @ x_mean.unsqueeze(-1)).squeeze(-1)
+        aligned = cameras.clone()
+        # Scale camera centers, NEVER the camera rotation basis.
+        aligned[..., :3, :3] = rotation[:, None] @ cameras[..., :3, :3]
+        aligned[..., :3, 3] = (
+            scale[:, None, None] * (cameras[..., :3, 3] @ rotation.transpose(-1, -2))
+            + translation[:, None]
+        )
+        center_error = scale[:, None, None] * rotated_xc - yc
+        rmse = center_error.square().sum(-1).mean(1).sqrt()
+        radius = yc.square().sum(-1).mean(1).sqrt()
+        relative_rotation = (
+            (rotation[:, None] @ moving[..., :3, :3])
+            @ reference[..., :3, :3].transpose(-1, -2)
+        )
+        angle = ((relative_rotation.diagonal(dim1=-2, dim2=-1).sum(-1) - 1) / 2).clamp(-1, 1).acos()
+        diagnostics = {
+            "scale": scale,
+            "source_center_rmse": rmse,
+            "source_center_relative_rmse": rmse / radius.clamp_min(1e-6),
+            "source_rotation_error_deg": angle.mean(1) * (180 / torch.pi),
+            "orientation_fallback": use_orientation,
+            "scale_fallback": scale_fallback,
+        }
+    return aligned.to(dtype), {key: value.float() for key, value in diagnostics.items()}
+
+
 class ABotBackboneAdapter(nn.Module):
     def __init__(
         self,
@@ -114,8 +187,48 @@ class ABotBackboneAdapter(nn.Module):
         return fused, positions, carry, features
 
     @torch.no_grad()
+    def forward_two_pass(self, images, num_source_views, frame_indices):
+        """Source-only geometry, then chronological full-clip target localization.
+
+        Return features/cameras in the caller's original source-prefix order.
+        Each forward invocation owns a fresh KV/camera state, including pass 2.
+        Duplicate frame IDs retain their input-slot ordering and correspondence.
+        """
+        if images.ndim != 5 or images.shape[2] != 3:
+            raise ValueError("ABot expects images [B,V,3,H,W].")
+        batch, views = images.shape[:2]
+        if not 0 < num_source_views <= views:
+            raise ValueError("num_source_views must be in [1, V].")
+        if frame_indices is None:
+            raise ValueError("ABot two_pass requires real frame indices to sort source + target.")
+        indices = torch.as_tensor(frame_indices, device=images.device)
+        if indices.ndim == 1 and batch == 1:
+            indices = indices.unsqueeze(0)
+        if indices.shape != (batch, views) or not torch.isfinite(indices).all():
+            raise ValueError("ABot frame indices must be finite [B,V] values.")
+
+        source_order = indices[:, :num_source_views].argsort(dim=1, stable=True)
+        features, start, source_cameras = self(
+            _gather_views(images[:, :num_source_views], source_order), num_source_views
+        )
+        source_inverse = source_order.argsort(dim=1)
+        features = [_gather_views(feature, source_inverse) for feature in features]
+        source_cameras = _gather_views(source_cameras, source_inverse)
+        if views == num_source_views:
+            return features, start, source_cameras, {}
+
+        full_order = indices.argsort(dim=1, stable=True)
+        _, _, full_cameras = self(_gather_views(images, full_order), num_feature_views=0)
+        full_cameras = _gather_views(full_cameras, full_order.argsort(dim=1))
+        aligned, diagnostics = align_source_cameras(
+            source_cameras, full_cameras[:, :num_source_views], full_cameras
+        )
+        cameras = torch.cat([source_cameras, aligned[:, num_source_views:]], dim=1)
+        return features, start, cameras, diagnostics
+
+    @torch.no_grad()
     def forward(self, images: torch.Tensor, num_feature_views: int):
-        """Input is RGB [0, 1], in source-then-target order; no sorting/reset.
+        """One fresh stream in supplied order; zero feature views is camera-only.
 
         State is local to this invocation and batched along B, so scenes and
         separate train/validation/test calls cannot share historical state.
@@ -123,8 +236,8 @@ class ABotBackboneAdapter(nn.Module):
         if images.ndim != 5 or images.shape[2] != 3:
             raise ValueError("ABot expects images [B,V,3,H,W].")
         batch, views, _, height, width = images.shape
-        if not 0 < num_feature_views <= views:
-            raise ValueError("num_feature_views must be in [1, V].")
+        if views < 1 or not 0 <= num_feature_views <= views:
+            raise ValueError("num_feature_views must be in [0, V], with V >= 1.")
         patch_size = self.network.patch_size
         if height % patch_size or width % patch_size:
             raise ValueError("ABot/DPT image height and width must be divisible by 14.")
@@ -167,5 +280,5 @@ class ABotBackboneAdapter(nn.Module):
 
         # These are ordinary no_grad tensors, not inference_mode tensors, so
         # the trainable DPT can save them for its parameter-gradient backward.
-        features = [torch.stack(frames, dim=1) for frames in feature_frames]
+        features = [torch.stack(frames, dim=1) for frames in feature_frames] if num_feature_views else []
         return features, self.network.patch_start_idx, torch.cat(camera_frames, dim=1)

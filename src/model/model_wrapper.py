@@ -321,6 +321,9 @@ class ModelWrapper(LightningModule):
         )
         
         distill_infos = encoder_output.distill_infos
+        for metric, value in (encoder_output.infos or {}).items():
+            if metric.startswith("abot_alignment_"):
+                self.log(f"train/{metric}", value.float())
         if (
             encoder_output.infos is not None
             and "gs_refine_history_views" in encoder_output.infos

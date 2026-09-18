@@ -44,6 +44,7 @@ Start a new ABot experiment with WM initialization of the trainable GS heads:
 ```bash
 python -m src.main +experiment=dl3dv wandb.mode=offline \
   model.encoder.reconstruction_backbone=abot \
+  model.encoder.abot_pose_mode=two_pass \
   model.encoder.abot_weights_path=weights/abot_recon.safetensors \
   checkpointing.load=null \
   checkpointing.train_pretrained_weights=weights/pre_wm.safetensors \
@@ -60,7 +61,7 @@ remain frozen. WM head weights are initialization, not an ABot-trained model.
 
 Switch back with `model.encoder.reconstruction_backbone=zipmap` and a matching
 ZipMap checkpoint. A true resume must use `checkpointing.load=/path/to/abot.ckpt`
-with the same backbone and `abot_feature_layers`; Lightning restores optimizer,
+with the same backbone, `abot_feature_layers`, and `abot_pose_mode`; Lightning restores optimizer,
 scheduler, and step state normally. Do not resume a ZipMap run as an ABot run.
 
 ## Features and view order
@@ -75,12 +76,54 @@ The input image tensor stays RGB [0,1] and keeps the project's existing spatial
 preprocessing. ABot's ImageNet normalization is applied internally. There is no
 extra resize to the upstream demo's 504x280; H and W must be multiples of 14.
 
-Input order remains **source prefix, then target suffix**. Training keeps the
-existing source-count rule; test keeps the existing explicit target-count rule.
-There is no chronological re-sort, second inference pass, or Sim(3) alignment.
-All views get native cumulative cameras; only source views get DPT/GS features.
-Target transitions can therefore still affect target pose quality. No future
-target can affect an earlier source in this causal pass.
+The external input/output order remains **source prefix, then target suffix**.
+Training keeps the existing source-count rule; test keeps the existing explicit
+target-count rule. The dataset and loss image order do not change.
+
+`model.encoder.abot_pose_mode=two_pass` is now the default for ABot in train,
+validation, and test:
+
+1. Sort the source prefix by its actual frame indices, independently per scene.
+   Run ABot on source only to obtain source cameras and four feature pairs.
+   Restore source outputs to their original slots for DPT/GS generation.
+2. Start a fresh ABot KV/camera state and process source + target in chronological
+   order. Only cameras are exported; no intermediate DPT feature pairs are kept.
+3. Match the shared source slots and fit a Sim(3) from pass 2 to pass 1. Transform
+   target camera centers as `s * Q * c + b` and rotations as `Q * R` (no scale).
+   Return first-pass source cameras and aligned second-pass target cameras in
+   the original source-prefix / target-suffix order.
+
+Both passes and the alignment are under `no_grad`. Target images are used only
+to localize target cameras; they cannot change source features, source cameras,
+or generated GS. This is evaluation with image-estimated target poses, not a
+protocol that reconstructs from held-out target images. Real frame indices are
+required; missing indices raise an error rather than assuming concatenated order
+is chronological. Source-only calls skip pass 2. Duplicate IDs preserve stable
+slot order, so they do not overwrite another slot's correspondence.
+
+Non-collinear source centers use Umeyama alignment. Collinear or stationary
+centers use shared camera orientations to estimate rotation. Single-source or
+stationary baselines cannot identify scale; scale defaults to 1 and a diagnostic
+is set. A single Sim(3) cannot remove non-rigid pose drift between the two runs.
+Training logs `train/abot_alignment_scale`, `source_center_rmse`,
+`source_center_relative_rmse`, `source_rotation_error_deg`, `orientation_fallback`,
+and `scale_fallback` (all with the `train/abot_alignment_` prefix). Relative RMSE
+is normalized by the first-pass source trajectory RMS radius; fallback metrics
+are batch fractions. Watch for large alignment errors or frequent scale fallback.
+
+For a controlled comparison with the old source-then-target pass, set
+`model.encoder.abot_pose_mode=single_pass` in both train and test. Checkpoints
+record the pose mode; changing it, including loading an old checkpoint without
+this metadata into two-pass mode, prints a warning. Tensor shapes remain
+compatible, but the target poses and supervision have changed. Start a new run
+for the two-pass experiment instead of treating it as an identical continuation.
+
+No additional package or weights are required. ABot processes `S + (S+T)` frames
+instead of `S+T`; its frame-processing work grows by about `1 + S/(S+T)` before
+accounting for sequence-length/cache costs. Total training slowdown depends on
+the DPT, rendering, and losses. The passes run sequentially and release their
+caches between calls; first-pass source features stay resident during pass 2.
+Peak memory and throughput still need measurement on the training server.
 
 The adapter follows official per-frame SDPA decode and KV pruning, with batch
 dimension preserved. KV and camera states are local to one call and released
@@ -101,8 +144,8 @@ python -m src.main +experiment=dl3dv mode=test wandb.mode=offline \
   checkpointing.load=/path/to/abot_run.ckpt
 ```
 
-The train-then-benchmark script copies the backbone selection into its generated
-test configuration. Checkpoints record backbone and feature-layer metadata;
+The train-then-benchmark script copies the backbone selection and pose mode into
+its generated test configuration. Checkpoints record backbone and feature-layer metadata;
 test/resume rejects incompatible selections. The external ABot checkpoint is
 still required at model construction, as ZipMap's pretrained file is today.
 
@@ -114,8 +157,10 @@ ABOT_RECON_CHECKPOINT=weights/abot_recon.safetensors \
 ```
 
 These checks compare the adapter with official camera-only SDPA inference,
-source-only vs source+target prefixes, batch 2 vs independent scenes, and
-downstream head backward. Without the checkpoint/CUDA, only CPU contract tests
+source-only vs source+target prefixes, two-pass source isolation, batch 2 vs
+independent scenes, and downstream head backward. CPU checks also exercise known
+Sim(3) recovery, degenerate trajectories, and per-scene sorting/restoration.
+Without the checkpoint/CUDA, only CPU contract tests
 run and the real-network check is explicitly skipped. Follow this with a short
 training/validation run on the actual data and then a multi-GPU run; CPU tests
 do not validate gsplat, full DPT training, or DDP on the server.

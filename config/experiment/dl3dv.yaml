@@ -14,6 +14,7 @@ model:
   encoder:
     mode: ${mode}
     reconstruction_backbone: abot
+    abot_pose_mode: two_pass
     abot_weights_path: weights/abot_recon.safetensors
     moge_weights_path: weights/model.pt
     zipmap_weights_path: weights/pre_zipmap.pt

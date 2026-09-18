@@ -7,6 +7,7 @@ mode: ${mode}
 # Both branches use the same DPT, GS heads, MoGe intrinsics, and view order.
 reconstruction_backbone: zipmap
 abot_weights_path: weights/abot_recon.safetensors
+abot_pose_mode: two_pass
 abot_feature_layers: [7, 17, 25, 35]
 
 opacity_mapping:

@@ -8,6 +8,7 @@ import sys
 from types import SimpleNamespace
 import types
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -195,6 +196,126 @@ class ABotAdapterTests(unittest.TestCase):
                             for block in self.model.network.decoder))
 
 
+class ABotTwoPassTests(unittest.TestCase):
+    def test_known_sim3_noncollinear_collinear_and_stationary(self):
+        align = adapter_module.align_source_cameras
+        rotation = torch.tensor([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
+        moving = torch.eye(4).repeat(3, 5, 1, 1)
+        moving[0, :, :3, 3] = torch.tensor([
+            [0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.], [2., 3., 4.]
+        ])
+        moving[1, :, 0, 3] = torch.arange(5.)
+        scales = torch.tensor([2.5, 0.2, 1.])
+        reference = moving.clone()
+        reference[..., :3, :3] = rotation @ moving[..., :3, :3]
+        reference[..., :3, 3] = (
+            scales[:, None, None] * (moving[..., :3, 3] @ rotation.T)
+            + torch.tensor([5., -2., 3.])
+        )
+        # The last camera is held out of the fit.
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            aligned, diagnostics = align(reference[:, :4], moving[:, :4], moving)
+        torch.testing.assert_close(aligned, reference, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(diagnostics["scale"], scales)
+        torch.testing.assert_close(diagnostics["orientation_fallback"], torch.tensor([0., 1., 1.]))
+        torch.testing.assert_close(diagnostics["scale_fallback"], torch.tensor([0., 0., 1.]))
+        torch.testing.assert_close(torch.linalg.det(aligned[..., :3, :3]), torch.ones(3, 5))
+        # One source has no baseline: scale=1, orientation and translation work.
+        aligned, diagnostics = align(reference[2:, :1], moving[2:, :1], moving[2:])
+        torch.testing.assert_close(aligned, reference[2:])
+        self.assertEqual(diagnostics["scale_fallback"].item(), 1)
+        bad = moving.clone()
+        bad[0, 0, 0, 3] = float("nan")
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            align(reference, bad, moving)
+
+    def test_sort_restore_target_alignment_and_camera_only_second_pass(self):
+        model = make_adapter()
+        ids = torch.tensor([[6, 0, 4, 1, 3], [8, 2, 5, 7, 1]])
+        images = ids[:, :, None, None, None].float().expand(-1, -1, 3, 14, 14)
+        rotation = torch.tensor([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
+        scale = torch.tensor([2., 3.])
+        translation = torch.tensor([[2., 3., 1.], [-1., 2., 5.]])
+
+        def canonical(frame_ids):
+            poses = torch.eye(4).repeat(2, frame_ids.shape[1], 1, 1)
+            poses[..., 0, 3] = frame_ids
+            poses[..., 1, 3] = frame_ids.square()
+            return poses
+
+        calls = []
+        def stream(frames, num_feature_views):
+            frame_ids = frames[:, :, 0, 0, 0]
+            calls.append((frame_ids, num_feature_views))
+            poses = canonical(frame_ids)
+            if num_feature_views:
+                features = [frame_ids[:, :, None, None].clone() for _ in range(4)]
+            else:
+                features = []
+                poses[..., :3, :3] = rotation.T
+                poses[..., :3, 3] = (
+                    (poses[..., :3, 3] - translation[:, None]) @ rotation
+                ) / scale[:, None, None]
+            return features, 5, poses
+
+        with patch.object(model, "forward", side_effect=stream):
+            features, start, poses, diagnostics = model.forward_two_pass(images, 3, ids)
+        self.assertEqual([call[1] for call in calls], [3, 0])
+        torch.testing.assert_close(calls[0][0], ids[:, :3].sort(1).values.float())
+        torch.testing.assert_close(calls[1][0], ids.sort(1).values.float())
+        self.assertEqual(start, 5)
+        for feature in features:
+            torch.testing.assert_close(feature[:, :, 0, 0], ids[:, :3].float())
+        torch.testing.assert_close(poses, canonical(ids.float()), atol=2e-5, rtol=1e-5)
+        torch.testing.assert_close(diagnostics["scale"], scale)
+
+    def test_targets_cannot_change_source_and_batch_state_is_independent(self):
+        model = make_adapter()
+        torch.manual_seed(11)
+        images = torch.rand(2, 5, 3, 14, 14, requires_grad=True)
+        ids = torch.tensor([[6, 0, 4, 1, 3], [8, 2, 5, 7, 1]])
+        features, _, cameras, _ = model.forward_two_pass(images, 3, ids)
+        changed = images.detach().clone()
+        changed[:, 3:] = 20
+        other_features, _, other_cameras, _ = model.forward_two_pass(changed, 3, ids)
+        torch.testing.assert_close(cameras[:, :3], other_cameras[:, :3], rtol=0, atol=0)
+        for feature, other in zip(features, other_features):
+            torch.testing.assert_close(feature, other, rtol=0, atol=0)
+        for b in range(2):
+            single_features, _, single_cameras, _ = model.forward_two_pass(
+                images[b:b+1], 3, ids[b:b+1]
+            )
+            torch.testing.assert_close(cameras[b:b+1], single_cameras)
+            for feature, single in zip(features, single_features):
+                torch.testing.assert_close(feature[b:b+1], single)
+        head = nn.Linear(2048, 2)
+        sum(head(feature).square().mean() for feature in features).backward()
+        self.assertTrue(torch.isfinite(head.weight.grad).all())
+        self.assertIsNone(images.grad)
+        self.assertFalse(cameras.requires_grad)
+        self.assertTrue(all(p.grad is None for p in model.parameters()))
+
+    def test_no_targets_missing_indices_and_zero_feature_pass(self):
+        model = make_adapter()
+        images = torch.rand(1, 3, 3, 14, 14)
+        ids = torch.tensor([0, 2, 4])
+        with patch.object(model, "forward", wraps=model.forward) as stream:
+            features, _, cameras, diagnostics = model.forward_two_pass(images, 3, ids)
+        self.assertEqual(stream.call_count, 1)
+        self.assertEqual(diagnostics, {})
+        plain_features, _, plain_cameras = model(images, 3)
+        torch.testing.assert_close(cameras, plain_cameras)
+        for feature, plain in zip(features, plain_features):
+            torch.testing.assert_close(feature, plain)
+        empty, _, camera_only = model(images, 0)
+        self.assertEqual(empty, [])
+        torch.testing.assert_close(cameras, camera_only)
+        with self.assertRaisesRegex(ValueError, "real frame indices"):
+            model.forward_two_pass(images, 2, None)
+        with self.assertRaisesRegex(ValueError, "frame indices"):
+            model.forward_two_pass(images, 2, ids[:2])
+
+
 class BackboneCheckpointTests(unittest.TestCase):
     def setUp(self):
         self.abot = SimpleNamespace(reconstruction_backbone="abot", abot_feature_layers=[7, 17, 25, 35])
@@ -214,6 +335,15 @@ class BackboneCheckpointTests(unittest.TestCase):
             validate_backbone_checkpoint(checkpoint, self.abot)
         with self.assertRaises(RuntimeError):
             validate_backbone_checkpoint({"encoder.gs_head.weight": 1}, self.abot)
+
+    def test_pose_protocol_metadata_and_legacy_warning(self):
+        self.assertEqual(backbone_signature(self.abot)["pose_mode"], "two_pass")
+        checkpoint = {"reconstruction_backbone": {
+            "name": "abot", "feature_layers": [7, 17, 25, 35]
+        }}
+        with patch("builtins.print") as output:
+            validate_backbone_checkpoint(checkpoint, self.abot)
+        self.assertIn("camera protocol changed", output.call_args[0][0])
 
 
 @unittest.skipUnless(os.environ.get("ABOT_RECON_CHECKPOINT") and torch.cuda.is_available(),
@@ -252,8 +382,15 @@ class ABotRealNetworkTests(unittest.TestCase):
                 camera_state = pred["camera_state"]
                 reference.append(pred["camera_poses"])
         torch.testing.assert_close(cameras[:1], torch.cat(reference, dim=1), atol=5e-3, rtol=5e-3)
+        indices = torch.tensor([[0, 4, 1, 3], [0, 6, 2, 4]], device="cuda")
+        two_features, _, two_cameras, diagnostics = adapter.forward_two_pass(images, 2, indices)
+        torch.testing.assert_close(two_cameras[:, :2], prefix_cameras)
+        for feature, prefix in zip(two_features, prefix_features):
+            torch.testing.assert_close(feature, prefix)
+        self.assertTrue(torch.isfinite(two_cameras).all())
+        self.assertTrue(all(torch.isfinite(value).all() for value in diagnostics.values()))
         head = nn.Linear(2048, 2).cuda()
-        sum(head(feature.float()).square().mean() for feature in features).backward()
+        sum(head(feature.float()).square().mean() for feature in two_features).backward()
         self.assertTrue(torch.isfinite(head.weight.grad).all())
 
 

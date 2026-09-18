@@ -91,6 +91,7 @@ class EncoderAnySplatCfg:
     # Model weights paths
     reconstruction_backbone: Literal["zipmap", "abot"] = "zipmap"
     abot_weights_path: Optional[str] = None
+    abot_pose_mode: Literal["single_pass", "two_pass"] = "two_pass"
     abot_feature_layers: list[int] = field(default_factory=lambda: [7, 17, 25, 35])
     streamvggt_weights_path: Optional[str] = None
     zipmap_weights_path: Optional[str] = None
@@ -778,6 +779,9 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         elif cfg.reconstruction_backbone == "abot":
             from .abot_adapter import ABotBackboneAdapter
 
+            if cfg.abot_pose_mode not in ("single_pass", "two_pass"):
+                raise ValueError(f"Unknown ABot pose mode: {cfg.abot_pose_mode}")
+            print(f"ABot pose mode: {cfg.abot_pose_mode}")
             if cfg.abot_weights_path is None:
                 raise ValueError("model.encoder.abot_weights_path must be set for ABot.")
             self.aggregator = ABotBackboneAdapter(
@@ -871,11 +875,17 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         pred_all_extrinsic = None
         
         abot_cameras = None
+        abot_alignment = {}
         with torch.no_grad():
             if self.cfg.reconstruction_backbone == "abot":
-                aggregated_tokens_list, patch_start_idx, abot_cameras = self.aggregator(
-                    image, num_feature_views=ctx_img_num
-                )
+                if self.cfg.abot_pose_mode == "two_pass":
+                    aggregated_tokens_list, patch_start_idx, abot_cameras, abot_alignment = (
+                        self.aggregator.forward_two_pass(image, ctx_img_num, ctx_index)
+                    )
+                else:
+                    aggregated_tokens_list, patch_start_idx, abot_cameras = self.aggregator(
+                        image, num_feature_views=ctx_img_num
+                    )
                 # ABot runs bf16; the existing DPT runs in float32 below.
                 aggregated_tokens_list = [tokens.float() for tokens in aggregated_tokens_list]
             else:
@@ -1037,7 +1047,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         gaussians = {key_mapping.get(k, k): v for k, v in splats.items()}
         gaussians = Gaussians(**gaussians)
 
-        infos = {}
+        infos = {f"abot_alignment_{key}": value.mean() for key, value in abot_alignment.items()}
         if self.cfg.gs_refine_enabled or self.cfg.gir_enabled:
             infos["gs_refine"] = {
                 "features": out,
