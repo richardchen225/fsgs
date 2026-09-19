@@ -8,7 +8,7 @@ from src.dataset.types import BatchedExample
 from src.model.decoder.decoder import DecoderOutput
 from src.model.types import Gaussians
 from .loss import Loss
-from typing import TypeVar
+from typing import Literal, TypeVar
 from dataclasses import fields
 import torch.nn.functional as F
 import sys
@@ -27,6 +27,7 @@ class LossDepthCfg:
     sigma_image: float | None
     use_second_derivative: bool
     dav3_weights_path: str | None = None
+    teacher: Literal["dav3", "abot"] = "dav3"
 
 
 @dataclass
@@ -42,6 +43,15 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
         (field,) = fields(type(cfg))
         self.cfg = getattr(cfg, field.name)
         self.name = field.name
+
+        if self.cfg.teacher not in ("dav3", "abot"):
+            raise ValueError(f"Unknown depth teacher: {self.cfg.teacher}")
+        loss_kind = "log-depth L1 (no scale/shift alignment)" if self.cfg.teacher == "abot" else "per-image scale+shift aligned MSE"
+        print(f"Depth supervision: teacher={self.cfg.teacher}, {loss_kind}")
+        if self.cfg.teacher == "abot":
+            # Teacher Z arrives from the frozen source-only ABot forward.
+            # In particular, do not import/load/run Depth Anything 3 here.
+            return
 
         from .dav3.src.depth_anything_3.api import DepthAnything3
 
@@ -105,13 +115,38 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
         depth_map: torch.Tensor,  # [B, V, H, W, C]
         batch,
         cxt_depth_weight: float = 0.01,
+        teacher_depth: torch.Tensor | None = None,
     ):
+        if self.cfg.teacher == "abot":
+            if teacher_depth is None:
+                raise RuntimeError("ABot depth supervision requires source teacher_depth from the encoder.")
+            if teacher_depth.shape != depth_map.shape:
+                raise ValueError(
+                    "ABot teacher/student depth shapes must match [B,S,H,W,1]: "
+                    f"teacher={tuple(teacher_depth.shape)}, student={tuple(depth_map.shape)}"
+                )
+            prediction = depth_map.float().flatten(0, 1).squeeze(-1)
+            target = teacher_depth.detach().to(device=depth_map.device, dtype=torch.float32).flatten(0, 1).squeeze(-1)
+            return cxt_depth_weight * self._masked_log_depth_l1(prediction, target)
+
         da_output = self._context_depth_target(depth_map, batch)
         pred_depth = depth_map.flatten(0, 1).squeeze(-1)
         aligned_pred1 = self._align_depth(pred_depth, da_output)
         loss_local = F.mse_loss(aligned_pred1, da_output, reduction="none").mean()
 
         return cxt_depth_weight * torch.nan_to_num(loss_local, nan=0.0)
+
+    @staticmethod
+    def _masked_log_depth_l1(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # Keep the native teacher scale; sanitize invalid targets BEFORE log
+        # so masked NaNs cannot contaminate backward.
+        valid = torch.isfinite(target) & (target > 0)
+        p = torch.where(valid, prediction, 1).clamp_min(1e-6)
+        t = torch.where(valid, target, 1).clamp_min(1e-6)
+        error = (p.log() - t.log()).abs()
+        # An all-invalid teacher returns graph-connected zero, not a detached
+        # scalar; this keeps the student branch in DDP's backward graph.
+        return error.sum() / valid.sum().clamp_min(1)
 
     def ctx_depth_sequence_loss(
         self,
@@ -122,6 +157,8 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
         aux_weight: float = 0.5,
         final_weight: float = 1.0,
     ):
+        if self.cfg.teacher != "dav3":
+            raise RuntimeError("ABot teacher supervises the initial DPT depth via ctx_depth_loss only.")
         if depth_iters.numel() == 0:
             return depth_iters.new_tensor(0.0)
 
@@ -163,6 +200,8 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
         gaussians: Gaussians,
         global_step: int,
     ) -> Float[Tensor, ""]:
+        if self.cfg.teacher != "dav3":
+            raise RuntimeError("Use ctx_depth_loss with encoder teacher_depth for ABot supervision.")
         # Scale the depth between the near and far planes.
         target_imgs = batch["target"]["image"]
         B, V, _, H, W = target_imgs.shape

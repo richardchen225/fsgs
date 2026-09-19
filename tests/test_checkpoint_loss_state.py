@@ -98,6 +98,34 @@ class CheckpointLossStateTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             wrapper.load_state_dict(checkpoint["state_dict"], strict=True)
 
+    def test_abot_teacher_is_omitted_and_restored_for_strict_resume(self):
+        import torch
+
+        wrapper = torch.nn.Module()
+        wrapper.model = torch.nn.Module()
+        wrapper.model.encoder = torch.nn.Module()
+        encoder = wrapper.model.encoder
+        encoder.cfg = SimpleNamespace(reconstruction_backbone="abot", abot_feature_layers=[7, 17, 25, 35])
+        encoder.aggregator = torch.nn.Module()
+        encoder.aggregator.network = torch.nn.Module()
+        network = encoder.aggregator.network
+        network.point_decoder = torch.nn.Linear(2, 2).requires_grad_(False)
+        network.point_head = torch.nn.Linear(2, 1).requires_grad_(False)
+        encoder.gs_head = torch.nn.Linear(2, 2)
+        wrapper.losses = torch.nn.ModuleList()
+        checkpoint = {"state_dict": wrapper.state_dict(), "optimizer_states": [object()]}
+        SAVE(wrapper, checkpoint)
+        self.assertTrue(all(".point_decoder." not in k and ".point_head." not in k for k in checkpoint["state_dict"]))
+        self.assertIn("model.encoder.gs_head.weight", checkpoint["state_dict"])
+        LOAD(wrapper, checkpoint)
+        wrapper.load_state_dict(checkpoint["state_dict"], strict=True)
+        # The new teacher can be filled from pretrained weights even for an old
+        # ABot checkpoint; missing student weights must still fail strict load.
+        del checkpoint["state_dict"]["model.encoder.gs_head.weight"]
+        LOAD(wrapper, checkpoint)
+        with self.assertRaises(RuntimeError):
+            wrapper.load_state_dict(checkpoint["state_dict"], strict=True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -95,6 +95,7 @@ class ABotBackboneAdapter(nn.Module):
         self,
         weights_path: str,
         feature_layers: tuple[int, ...] = DEFAULT_FEATURE_LAYERS,
+        enable_depth_teacher: bool = False,
     ) -> None:
         super().__init__()
         path = Path(weights_path).expanduser()
@@ -110,16 +111,20 @@ class ABotBackboneAdapter(nn.Module):
             ) from exc
 
         # Load the complete official checkpoint strictly before discarding the
-        # unused point/confidence branches. No loop closure or image resizing.
+        # unused branches. The optional point branch is a frozen depth teacher.
         runtime = build_model(InferenceConfig(
             checkpoint=path.resolve(), device="cpu", attention_backend="sdpa",
             loop_closure=False, output_confidence=False,
         ))
         self.network = runtime.network
-        for name in (
-            "point_decoder", "point_head", "conf_decoder", "conf_head",
-            "global_points_decoder", "global_point_head",
-        ):
+        unused = ["conf_decoder", "conf_head", "global_points_decoder", "global_point_head"]
+        if enable_depth_teacher:
+            from abot_recon.modeling.pi3.models.depth_utils import depth_from_log_z
+
+            self._depth_from_log_z = depth_from_log_z
+        else:
+            unused.extend(["point_decoder", "point_head"])
+        for name in unused:
             if hasattr(self.network, name):
                 delattr(self.network, name)
         self.feature_layers = tuple(feature_layers)
@@ -187,7 +192,7 @@ class ABotBackboneAdapter(nn.Module):
         return fused, positions, carry, features
 
     @torch.no_grad()
-    def forward_two_pass(self, images, num_source_views, frame_indices):
+    def forward_two_pass(self, images, num_source_views, frame_indices, return_depth: bool = False):
         """Source-only geometry, then chronological full-clip target localization.
 
         Return features/cameras in the caller's original source-prefix order.
@@ -208,14 +213,19 @@ class ABotBackboneAdapter(nn.Module):
             raise ValueError("ABot frame indices must be finite [B,V] values.")
 
         source_order = indices[:, :num_source_views].argsort(dim=1, stable=True)
-        features, start, source_cameras = self(
-            _gather_views(images[:, :num_source_views], source_order), num_source_views
+        source_images = _gather_views(images[:, :num_source_views], source_order)
+        source_output = self(source_images, num_source_views, return_depth=True) if return_depth else self(
+            source_images, num_source_views
         )
+        features, start, source_cameras = source_output[:3]
         source_inverse = source_order.argsort(dim=1)
         features = [_gather_views(feature, source_inverse) for feature in features]
         source_cameras = _gather_views(source_cameras, source_inverse)
+        teacher_depth = _gather_views(source_output[3], source_inverse) if return_depth else None
+        del source_output, source_images
         if views == num_source_views:
-            return features, start, source_cameras, {}
+            result = (features, start, source_cameras, {})
+            return (*result, teacher_depth) if return_depth else result
 
         full_order = indices.argsort(dim=1, stable=True)
         _, _, full_cameras = self(_gather_views(images, full_order), num_feature_views=0)
@@ -224,10 +234,22 @@ class ABotBackboneAdapter(nn.Module):
             source_cameras, full_cameras[:, :num_source_views], full_cameras
         )
         cameras = torch.cat([source_cameras, aligned[:, num_source_views:]], dim=1)
-        return features, start, cameras, diagnostics
+        result = (features, start, cameras, diagnostics)
+        return (*result, teacher_depth) if return_depth else result
+
+    def _predict_local_depth(self, fused, positions, height, width):
+        # Same point branch and depth activation as official ABot. Do not use
+        # point confidence, project with MoGe, or run a second geometry stream.
+        hidden = self.network.point_decoder(fused, xpos=positions)
+        with torch.autocast(fused.device.type, enabled=False):
+            raw_points = self.network.point_head(
+                [hidden.float()[:, self.network.patch_start_idx:]], (height, width)
+            )
+            depth = self._depth_from_log_z(raw_points[..., 2:3], self.network.point_z_log_max)
+        return depth.float().detach()
 
     @torch.no_grad()
-    def forward(self, images: torch.Tensor, num_feature_views: int):
+    def forward(self, images: torch.Tensor, num_feature_views: int, return_depth: bool = False):
         """One fresh stream in supplied order; zero feature views is camera-only.
 
         State is local to this invocation and batched along B, so scenes and
@@ -238,6 +260,8 @@ class ABotBackboneAdapter(nn.Module):
         batch, views, _, height, width = images.shape
         if views < 1 or not 0 <= num_feature_views <= views:
             raise ValueError("num_feature_views must be in [0, V], with V >= 1.")
+        if return_depth and (num_feature_views == 0 or not hasattr(self.network, "point_head")):
+            raise ValueError("Depth export requires source views and enable_depth_teacher=True.")
         patch_size = self.network.patch_size
         if height % patch_size or width % patch_size:
             raise ValueError("ABot/DPT image height and width must be divisible by 14.")
@@ -245,6 +269,7 @@ class ABotBackboneAdapter(nn.Module):
         carry, camera_state = None, None
         feature_frames = [[] for _ in self.feature_layers]
         camera_frames = []
+        depth_frames = []
         amp = (
             torch.autocast("cuda", dtype=torch.bfloat16)
             if images.is_cuda else nullcontext()
@@ -266,6 +291,8 @@ class ABotBackboneAdapter(nn.Module):
                 if features is not None:
                     for destination, feature in zip(feature_frames, features):
                         destination.append(feature)
+                    if return_depth:
+                        depth_frames.append(self._predict_local_depth(fused, positions, height, width))
 
                 camera_hidden = self.network.camera_decoder(fused, xpos=positions)
                 # Match the official forward: pose prediction is float32,
@@ -281,4 +308,5 @@ class ABotBackboneAdapter(nn.Module):
         # These are ordinary no_grad tensors, not inference_mode tensors, so
         # the trainable DPT can save them for its parameter-gradient backward.
         features = [torch.stack(frames, dim=1) for frames in feature_frames] if num_feature_views else []
-        return features, self.network.patch_start_idx, torch.cat(camera_frames, dim=1)
+        result = (features, self.network.patch_start_idx, torch.cat(camera_frames, dim=1))
+        return (*result, torch.stack(depth_frames, dim=1)) if return_depth else result

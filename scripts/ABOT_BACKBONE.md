@@ -4,10 +4,11 @@ The DL3DV experiment (`+experiment=dl3dv`) defaults to
 `model.encoder.reconstruction_backbone=abot`. The shared encoder default remains
 `zipmap` for other experiments. `abot` replaces only the frozen feature backbone
 and camera prediction. The
-existing trainable DPT (`gaussian_param_head`), `gs_head`, DA3 depth loss, MoGe
-intrinsics, and GIR switches are retained. ABot's point/confidence heads are
-strictly loaded with the official checkpoint, then discarded; they do not
-generate our geometry.
+existing trainable DPT (`gaussian_param_head`), `gs_head`, MoGe intrinsics, and
+GIR switches are retained. DL3DV now uses frozen ABot point Z as its depth
+teacher, with log-depth L1 and the same outer weight as the old DA3 loss. The original
+point branch only supplies training targets; DPT still predicts GS geometry.
+Confidence and unused global-point branches are discarded.
 
 ## Installation
 
@@ -45,6 +46,7 @@ Start a new ABot experiment with WM initialization of the trainable GS heads:
 python -m src.main +experiment=dl3dv wandb.mode=offline \
   model.encoder.reconstruction_backbone=abot \
   model.encoder.abot_pose_mode=two_pass \
+  loss.depth.teacher=abot \
   model.encoder.abot_weights_path=weights/abot_recon.safetensors \
   checkpointing.load=null \
   checkpointing.train_pretrained_weights=weights/pre_wm.safetensors \
@@ -59,10 +61,46 @@ also pass `model.encoder.gir_enabled=false optimizer.train_gir=false`.
 The backbone and native camera decoder/head, including its rotation refiner,
 remain frozen. WM head weights are initialization, not an ABot-trained model.
 
-Switch back with `model.encoder.reconstruction_backbone=zipmap` and a matching
-ZipMap checkpoint. A true resume must use `checkpointing.load=/path/to/abot.ckpt`
+Switch back with `model.encoder.reconstruction_backbone=zipmap
+loss.depth.teacher=dav3` and a matching ZipMap checkpoint. A true resume must use `checkpointing.load=/path/to/abot.ckpt`
 with the same backbone, `abot_feature_layers`, and `abot_pose_mode`; Lightning restores optimizer,
 scheduler, and step state normally. Do not resume a ZipMap run as an ABot run.
+
+## Depth teacher
+
+`loss.depth.teacher=abot` retains the pretrained point decoder/head in training
+mode. The encoder's `depth_teacher` config follows this loss option automatically.
+Only source frames in the first, source-only pass run the point branch. Teacher
+depth is the native local point Z, with the official `depth_from_log_z` activation;
+it is restored to the original source order and detached. There is no confidence
+weighting, MoGe reprojection, target-frame supervision, or extra backbone pass.
+
+The ABot loss is `mean_valid(abs(log(clamp(D, 1e-6)) - log(clamp(Z, 1e-6))))`,
+weighted by the unchanged `train.cxt_depth_weight` (currently 1.0). It does NOT
+fit scale or shift, subtract a mean log error, or normalize depths per image.
+It therefore penalizes differences from the native ABot depth scale; that scale
+is not necessarily metric ground truth. Non-finite/non-positive teacher pixels
+are replaced before log and excluded from reduction. An entirely invalid target
+gives graph-connected zero loss, keeping the student in backward without adding
+an unused trainable branch. The loss supervises the initial DPT depth, not
+rendered depth or intermediate refiner steps. RGB losses are unchanged.
+
+The existing `loss/loss_depth_ctx` metric now reports weighted log-depth L1.
+Although its outer weight is unchanged, its values are not numerically comparable
+to the old affine-aligned DA3 MSE, nor do equal weights imply equal gradient size.
+
+DA3 is not imported, instantiated, or run with this option, and its weights are
+not required. No extra model download is needed: point weights already exist in
+the official ABot checkpoint. There are no new trainable parameters. Training
+adds frozen source point-head computation; validation/test skip that computation,
+and `mode=test` discards the point modules after the official weight load. The
+frozen teacher modules are omitted from training checkpoints and restored from
+the external ABot weights for strict resume, like fixed loss networks.
+
+Use `loss.depth.teacher=dav3` for the previous supervision, including when using
+ABot. Keep steps, initialization, learning rates, and view sampling identical
+for a controlled comparison. DL3DV still trains 20000 steps, batch 2 with
+accumulation 1, at the existing head learning rate, with GIR/refiners disabled.
 
 ## Features and view order
 
@@ -159,7 +197,10 @@ ABOT_RECON_CHECKPOINT=weights/abot_recon.safetensors \
 These checks compare the adapter with official camera-only SDPA inference,
 source-only vs source+target prefixes, two-pass source isolation, batch 2 vs
 independent scenes, and downstream head backward. CPU checks also exercise known
-Sim(3) recovery, degenerate trajectories, and per-scene sorting/restoration.
+Sim(3) recovery, degenerate trajectories, source-only depth export, and per-scene
+sorting/restoration. `tests/test_abot_depth_loss.py` checks log-depth L1, scale/shift
+sensitivity, teacher detachment, invalid-pixel masking, and student backward with
+empty targets, while preserving the optional DA3 branch's original loss.
 Without the checkpoint/CUDA, only CPU contract tests
 run and the real-network check is explicitly skipped. Follow this with a short
 training/validation run on the actual data and then a multi-GPU run; CPU tests

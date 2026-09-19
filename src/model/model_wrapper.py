@@ -157,6 +157,9 @@ class ModelWrapper(LightningModule):
         self._configure_training_stage()
         self.data_shim = get_data_shim(self.model.encoder)
         self.losses = nn.ModuleList(losses)
+        for loss in self.losses:
+            if loss.name == "depth" and loss.cfg.teacher != self.model.encoder.cfg.depth_teacher:
+                raise ValueError("Encoder depth_teacher must match loss.depth.teacher.")
 
         self.benchmarker = Benchmarker()
         self._skip_optimizer_step = False
@@ -172,7 +175,11 @@ class ModelWrapper(LightningModule):
         # Fixed loss networks are initialized from their own pretrained weights.
         state_dict = checkpoint["state_dict"]
         for key in list(state_dict):
-            if key.startswith("losses."):
+            if key.startswith((
+                "losses.",
+                "model.encoder.aggregator.network.point_decoder.",
+                "model.encoder.aggregator.network.point_head.",
+            )):
                 del state_dict[key]
 
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
@@ -185,6 +192,17 @@ class ModelWrapper(LightningModule):
         state_dict = checkpoint["state_dict"]
         for key, value in self.losses.state_dict(prefix="losses.").items():
             state_dict.setdefault(key, value)
+        # Like loss networks, the frozen ABot teacher is reconstructed from
+        # official pretrained weights; never fill missing trainable head keys.
+        encoder = getattr(getattr(self, "model", None), "encoder", None)
+        if encoder is not None and getattr(encoder.cfg, "reconstruction_backbone", None) == "abot":
+            network = encoder.aggregator.network
+            for name in ("point_decoder", "point_head"):
+                module = getattr(network, name, None)
+                if module is not None:
+                    prefix = f"model.encoder.aggregator.network.{name}."
+                    for key, value in module.state_dict(prefix=prefix).items():
+                        state_dict.setdefault(key, value)
 
     def _configure_training_stage(self) -> None:
         train_base_heads = bool(self.optimizer_cfg.train_base_heads)
@@ -561,6 +579,7 @@ class ModelWrapper(LightningModule):
                 depth_dict["depth"],
                 batch,
                 cxt_depth_weight=self.train_cfg.cxt_depth_weight,
+                teacher_depth=depth_dict.get("teacher_depth"),
             )
 
             self.log(

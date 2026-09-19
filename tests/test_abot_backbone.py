@@ -96,6 +96,74 @@ def make_adapter():
     return model
 
 
+class PointHead(nn.Module):
+    def forward(self, features, image_shape):
+        height, width = image_shape
+        log_z = features[0][..., 0].mean(1) / 1000
+        xyz = log_z[:, None, None, None].expand(-1, height, width, 3).clone()
+        xyz[..., :2] = -100
+        return xyz
+
+
+def make_teacher_adapter():
+    model = make_adapter()
+    model.network.point_decoder = CameraDecoder()
+    model.network.point_head = PointHead()
+    model.network.point_z_log_max = 10.0
+    model._depth_from_log_z = lambda z, cap: torch.exp(z.clamp(max=cap))
+    model.requires_grad_(False)
+    return model
+
+
+class ABotDepthTeacherTests(unittest.TestCase):
+    def test_source_only_z_export_does_not_change_features_or_cameras(self):
+        model = make_teacher_adapter()
+        images = torch.rand(2, 5, 3, 14, 14, requires_grad=True)
+        plain = model(images, 3)
+        with patch.object(model.network.point_decoder, "forward", wraps=model.network.point_decoder.forward) as decoder:
+            features, start, cameras, depth = model(images, 3, return_depth=True)
+        self.assertEqual(decoder.call_count, 3)
+        self.assertEqual(depth.shape, (2, 3, 14, 14, 1))
+        self.assertFalse(depth.requires_grad)
+        self.assertTrue((depth > 0).all())
+        self.assertEqual(start, plain[1])
+        torch.testing.assert_close(cameras, plain[2], rtol=0, atol=0)
+        for feature, original in zip(features, plain[0]):
+            torch.testing.assert_close(feature, original, rtol=0, atol=0)
+        expected = model.network.expected_pairs[-5][35][..., :1024][:, 5:, 0].mean(1) / 1000
+        torch.testing.assert_close(depth[:, 0, 0, 0, 0], expected.exp())
+        with patch.object(model.network.point_head, "forward", side_effect=AssertionError("teacher ran at test")):
+            model(images, 3)
+        with self.assertRaisesRegex(ValueError, "enable_depth_teacher"):
+            make_adapter()(images, 3, return_depth=True)
+
+    def test_two_pass_teacher_restores_source_order_and_ignores_targets(self):
+        model = make_teacher_adapter()
+        images = torch.rand(2, 5, 3, 14, 14)
+        ids = torch.tensor([[6, 0, 4, 1, 3], [8, 2, 5, 7, 1]])
+        with patch.object(model.network.point_decoder, "forward", wraps=model.network.point_decoder.forward) as decoder:
+            features, _, cameras, _, depth = model.forward_two_pass(images, 3, ids, return_depth=True)
+        self.assertEqual(decoder.call_count, 3)  # No teacher in the full-clip pass.
+        changed = images.clone()
+        changed[:, 3:] = 50
+        other = model.forward_two_pass(changed, 3, ids, return_depth=True)
+        torch.testing.assert_close(depth, other[-1], rtol=0, atol=0)
+        for b in range(2):
+            order = ids[b, :3].argsort()
+            source = model(images[b:b+1, :3][:, order], 3, return_depth=True)
+            torch.testing.assert_close(depth[b:b+1], source[-1][:, order.argsort()])
+            single = model.forward_two_pass(images[b:b+1], 3, ids[b:b+1], return_depth=True)
+            torch.testing.assert_close(single[-1], depth[b:b+1])
+            torch.testing.assert_close(single[2], cameras[b:b+1])
+        # With no targets, the same source Z is returned without a second pass.
+        source_only = model.forward_two_pass(images[:, :3], 3, ids[:, :3], return_depth=True)
+        torch.testing.assert_close(source_only[-1], depth)
+        head = nn.Linear(2048, 1)
+        sum(head(feature).square().mean() for feature in features).backward()
+        self.assertTrue(torch.isfinite(head.weight.grad).all())
+        self.assertTrue(all(not p.requires_grad and p.grad is None for p in model.parameters()))
+
+
 class ABotAdapterTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(7)
@@ -354,7 +422,7 @@ class ABotRealNetworkTests(unittest.TestCase):
         # uses the exact same pretrained network retained by our adapter.
         from abot_recon.modeling.streaming.core.cache_utils import detach_carry
 
-        adapter = ABotBackboneAdapter(os.environ["ABOT_RECON_CHECKPOINT"]).cuda()
+        adapter = ABotBackboneAdapter(os.environ["ABOT_RECON_CHECKPOINT"], enable_depth_teacher=True).cuda()
         torch.manual_seed(3)
         images = torch.rand(2, 4, 3, 56, 56, device="cuda")
         features, _, cameras = adapter(images, 2)
@@ -389,6 +457,14 @@ class ABotRealNetworkTests(unittest.TestCase):
             torch.testing.assert_close(feature, prefix)
         self.assertTrue(torch.isfinite(two_cameras).all())
         self.assertTrue(all(torch.isfinite(value).all() for value in diagnostics.values()))
+        teacher_output = adapter.forward_two_pass(images, 2, indices, return_depth=True)
+        torch.testing.assert_close(teacher_output[2], two_cameras)
+        self.assertEqual(teacher_output[-1].shape, (2, 2, 56, 56, 1))
+        self.assertFalse(teacher_output[-1].requires_grad)
+        source_teacher = adapter(images[:, :2], 2, return_depth=True)[-1]
+        torch.testing.assert_close(teacher_output[-1], source_teacher)
+        self.assertTrue(torch.isfinite(source_teacher).all())
+        self.assertTrue((source_teacher > 0).all())
         head = nn.Linear(2048, 2).cuda()
         sum(head(feature.float()).square().mean() for feature in two_features).backward()
         self.assertTrue(torch.isfinite(head.weight.grad).all())

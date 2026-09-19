@@ -92,6 +92,7 @@ class EncoderAnySplatCfg:
     reconstruction_backbone: Literal["zipmap", "abot"] = "zipmap"
     abot_weights_path: Optional[str] = None
     abot_pose_mode: Literal["single_pass", "two_pass"] = "two_pass"
+    depth_teacher: Literal["dav3", "abot"] = "dav3"
     abot_feature_layers: list[int] = field(default_factory=lambda: [7, 17, 25, 35])
     streamvggt_weights_path: Optional[str] = None
     zipmap_weights_path: Optional[str] = None
@@ -774,6 +775,10 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
 
     def __init__(self, cfg: EncoderAnySplatCfg) -> None:
         super().__init__(cfg)
+        if cfg.depth_teacher not in ("dav3", "abot"):
+            raise ValueError(f"Unknown depth teacher: {cfg.depth_teacher}")
+        if cfg.depth_teacher == "abot" and cfg.reconstruction_backbone != "abot":
+            raise ValueError("loss.depth.teacher=abot requires reconstruction_backbone=abot.")
         if cfg.reconstruction_backbone == "zipmap":
             self._init_zipmap(cfg)
         elif cfg.reconstruction_backbone == "abot":
@@ -785,7 +790,8 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             if cfg.abot_weights_path is None:
                 raise ValueError("model.encoder.abot_weights_path must be set for ABot.")
             self.aggregator = ABotBackboneAdapter(
-                cfg.abot_weights_path, tuple(cfg.abot_feature_layers)
+                cfg.abot_weights_path, tuple(cfg.abot_feature_layers),
+                enable_depth_teacher=cfg.depth_teacher == "abot" and cfg.mode == "train",
             )
             # ABot's native camera decoder/head live inside the adapter.
             self.camera_head = nn.Identity()
@@ -876,16 +882,26 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         
         abot_cameras = None
         abot_alignment = {}
+        teacher_depth = None
+        collect_teacher_depth = (
+            self.cfg.depth_teacher == "abot" and self.cfg.mode == "train"
+            and self.training and torch.is_grad_enabled()
+        )
         with torch.no_grad():
             if self.cfg.reconstruction_backbone == "abot":
                 if self.cfg.abot_pose_mode == "two_pass":
-                    aggregated_tokens_list, patch_start_idx, abot_cameras, abot_alignment = (
-                        self.aggregator.forward_two_pass(image, ctx_img_num, ctx_index)
+                    abot_output = self.aggregator.forward_two_pass(
+                        image, ctx_img_num, ctx_index, return_depth=collect_teacher_depth
                     )
+                    aggregated_tokens_list, patch_start_idx, abot_cameras, abot_alignment = abot_output[:4]
                 else:
-                    aggregated_tokens_list, patch_start_idx, abot_cameras = self.aggregator(
-                        image, num_feature_views=ctx_img_num
+                    abot_output = self.aggregator(
+                        image, num_feature_views=ctx_img_num, return_depth=collect_teacher_depth
                     )
+                    aggregated_tokens_list, patch_start_idx, abot_cameras = abot_output[:3]
+                if collect_teacher_depth:
+                    teacher_depth = abot_output[-1]
+                del abot_output
                 # ABot runs bf16; the existing DPT runs in float32 below.
                 aggregated_tokens_list = [tokens.float() for tokens in aggregated_tokens_list]
             else:
@@ -1065,6 +1081,8 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 "sh_degree": self.sh_degree,
             }
         depth_dict = dict(depth=depth_for_loss)
+        if teacher_depth is not None:
+            depth_dict["teacher_depth"] = teacher_depth.detach()
         if depth_uncertainty is not None:
             depth_dict["depth_uncertainty"] = depth_uncertainty
 

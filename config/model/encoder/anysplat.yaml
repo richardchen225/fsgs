@@ -9,6 +9,7 @@ reconstruction_backbone: zipmap
 abot_weights_path: weights/abot_recon.safetensors
 abot_pose_mode: two_pass
 abot_feature_layers: [7, 17, 25, 35]
+depth_teacher: ${oc.select:loss.depth.teacher,dav3}
 
 opacity_mapping:
   initial: 0.0
