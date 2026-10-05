@@ -1,3 +1,4 @@
+import copy
 from dataclasses import dataclass
 
 import torch
@@ -107,6 +108,12 @@ class GIRPrediction:
     current_delta_harmonics: torch.Tensor
     current_residual_gate: torch.Tensor
     delete_logit: torch.Tensor
+    rank_delta_mean_camera: torch.Tensor | None = None
+    rank_delta_rotation: torch.Tensor | None = None
+    rank_delta_log_scale: torch.Tensor | None = None
+    rank_delta_opacity_logit: torch.Tensor | None = None
+    rank_delta_harmonics: torch.Tensor | None = None
+    rank_historical_gate: torch.Tensor | None = None
 
 
 def apply_current_gaussian_residual(
@@ -204,6 +211,26 @@ class StreamingGaussianState:
             ),
             stable_ids=self.stable_ids,
             observation_count=self.observation_count.detach(),
+        )
+
+    def detach_means(self) -> "StreamingGaussianState":
+        """Detach historical positions while preserving appearance gradients.
+
+        The overfit experiment uses this boundary before each newly arriving
+        view.  Historical geometry must not accumulate gradients through the
+        whole stream, while SH, opacity, scale, and rotation can still carry
+        the remaining cross-view graph when the corresponding mode is used.
+        """
+        return StreamingGaussianState(
+            gaussians=Gaussians(
+                means=self.gaussians.means.detach(),
+                harmonics=self.gaussians.harmonics,
+                opacities=self.gaussians.opacities,
+                scales=self.gaussians.scales,
+                rotations=self.gaussians.rotations,
+            ),
+            stable_ids=self.stable_ids,
+            observation_count=self.observation_count,
         )
 
     @classmethod
@@ -649,10 +676,35 @@ class StreamingGaussianState:
         prediction: GIRPrediction,
         camera_to_world: torch.Tensor,
         update_confidence: torch.Tensor | None = None,
+        num_contributors: int = 1,
+        mean_update_mode: str = "relative_depth",
+        raw_scale_residual: bool = False,
+        raw_opacity_residual: bool = False,
+        raw_rotation_residual: bool = False,
+        raw_harmonics_residual: bool = False,
     ) -> "StreamingGaussianState":
         b, n = self.gaussians.means.shape[:2]
         harmonics_flat = _flatten_harmonics(self.gaussians.harmonics)
         harmonic_dim = harmonics_flat.shape[-1]
+        num_contributors = max(1, int(num_contributors))
+        mean_update_mode = str(mean_update_mode).lower()
+        if mean_update_mode not in {"absolute", "relative_depth"}:
+            raise ValueError(
+                "mean_update_mode must be absolute or relative_depth; "
+                f"got {mean_update_mode!r}."
+            )
+        use_topk = num_contributors > 1
+        if use_topk:
+            if gir.contributor_ids is None or gir.contributor_weights is None:
+                raise RuntimeError(
+                    "Top-k historical update requires contributor IDs and weights."
+                )
+            if gir.contributor_ids.shape[1] < num_contributors:
+                raise RuntimeError(
+                    "Top-k historical update received fewer contributors than "
+                    f"requested: requested={num_contributors}, "
+                    f"available={gir.contributor_ids.shape[1]}."
+                )
 
         mean_updates = []
         rotation_updates = []
@@ -662,35 +714,118 @@ class StreamingGaussianState:
         observation_increments = []
 
         for batch_idx in range(b):
-            point_indices = gir.indices[batch_idx].reshape(-1)
-            valid = point_indices >= 0
-            safe_indices = point_indices.clamp_min(0)
+            if use_topk:
+                point_indices = gir.contributor_ids[
+                    batch_idx, :num_contributors
+                ].reshape(num_contributors, -1)
+                contribution = gir.contributor_weights[
+                    batch_idx, :num_contributors
+                ].float().reshape(num_contributors, -1).clamp_min(0.0)
+                valid = (point_indices >= 0) & (point_indices < n)
+                safe_indices = point_indices.clamp(min=0, max=max(n - 1, 0))
+
+                # Contributor depths are computed from the actual Gaussian
+                # centers. This matters because lower-ranked splats do not
+                # share the dominant splat's depth.
+                means = self.gaussians.means[batch_idx].detach().float()
+                ones = torch.ones(
+                    (n, 1), device=means.device, dtype=means.dtype
+                )
+                means_h = torch.cat([means, ones], dim=-1)
+                world_to_camera = torch.linalg.inv(
+                    camera_to_world[batch_idx].detach().float()
+                )
+                camera_points = means_h @ world_to_camera.transpose(0, 1)
+                contributor_depth = camera_points[:, 2].gather(
+                    0, safe_indices.reshape(-1)
+                ).reshape_as(safe_indices)
+                valid = valid & (contributor_depth > 1e-5)
+
+                dominant_weight = gir.dominant_weight[batch_idx].float().reshape(
+                    1, -1
+                ).clamp_min(1e-8)
+                relative_slot_weight = (
+                    contribution / dominant_weight
+                ).clamp(0.0, 1.0)
+            else:
+                point_indices = gir.indices[batch_idx].reshape(-1)
+                valid = point_indices >= 0
+                safe_indices = point_indices.clamp_min(0)
+                contribution = gir.dominant_weight[batch_idx].reshape(
+                    -1
+                ).clamp_min(0.0)
+                relative_slot_weight = None
             visible = valid.to(self.gaussians.means.dtype)
 
-            gate = prediction.historical_gate[batch_idx].reshape(-1).sigmoid()
-            old_count = self.observation_count[batch_idx].gather(0, safe_indices)
+            def flatten_prediction(
+                primary: torch.Tensor,
+                ranked: torch.Tensor | None,
+            ) -> torch.Tensor:
+                primary_value = primary[batch_idx].permute(1, 2, 0).reshape(
+                    -1, primary.shape[1]
+                )
+                if not use_topk:
+                    return primary_value
+                if ranked is None:
+                    return primary_value.unsqueeze(0).expand(
+                        num_contributors, -1, -1
+                    )
+                if ranked.shape[1] < num_contributors:
+                    raise RuntimeError(
+                        "Historical prediction has fewer rank heads than "
+                        f"requested: requested={num_contributors}, "
+                        f"available={ranked.shape[1]}."
+                    )
+                return ranked[batch_idx, :num_contributors].permute(
+                    0, 2, 3, 1
+                ).reshape(num_contributors, -1, ranked.shape[2])
+
+            gate = flatten_prediction(
+                prediction.historical_gate,
+                prediction.rank_historical_gate,
+            ).squeeze(-1).sigmoid()
+            old_count = self.observation_count[batch_idx].gather(
+                0, safe_indices.reshape(-1)
+            ).reshape_as(safe_indices)
             damping = old_count.add(1.0).rsqrt()
-            contribution = gir.dominant_weight[batch_idx].reshape(-1).clamp_min(0.0)
             support_weight = visible * contribution
             update_weight = support_weight * gate * damping
+            if relative_slot_weight is not None:
+                update_weight = update_weight * relative_slot_weight
             if update_confidence is not None:
                 confidence = update_confidence[batch_idx].reshape(-1).to(
                     update_weight.dtype
                 )
+                if use_topk:
+                    confidence = confidence.unsqueeze(0).expand(
+                        num_contributors, -1
+                    )
                 update_weight = update_weight * confidence
 
-            depth = gir.depth[batch_idx].reshape(-1).clamp_min(1e-4)
-            delta_mean_camera = prediction.delta_mean_camera[batch_idx]
-            delta_mean_camera = delta_mean_camera.permute(1, 2, 0).reshape(-1, 3)
-            delta_mean_camera = delta_mean_camera.tanh() * depth.unsqueeze(-1)
+            delta_mean_camera = flatten_prediction(
+                prediction.delta_mean_camera,
+                prediction.rank_delta_mean_camera,
+            )
+            if mean_update_mode == "relative_depth":
+                if use_topk:
+                    depth = contributor_depth.clamp_min(1e-4)
+                else:
+                    depth = gir.depth[batch_idx].reshape(-1).clamp_min(1e-4)
+                delta_mean_camera = (
+                    delta_mean_camera.tanh() * depth.unsqueeze(-1)
+                )
             rotation_c2w = camera_to_world[batch_idx, :3, :3].to(
                 delta_mean_camera.dtype
             )
             delta_mean_world = delta_mean_camera @ rotation_c2w.transpose(0, 1)
 
             def aggregate(values: torch.Tensor) -> torch.Tensor:
-                weighted = values * update_weight.unsqueeze(-1)
-                index = safe_indices.unsqueeze(-1).expand(-1, values.shape[-1])
+                values = values.reshape(-1, values.shape[-1])
+                flat_update_weight = update_weight.reshape(-1).to(values.dtype)
+                flat_support_weight = support_weight.reshape(-1).to(values.dtype)
+                flat_indices = safe_indices.reshape(-1)
+                weighted = values * flat_update_weight.unsqueeze(-1)
+                index = flat_indices.unsqueeze(-1).expand(-1, values.shape[-1])
                 numerator = torch.zeros(
                     (n, values.shape[-1]),
                     device=values.device,
@@ -700,27 +835,41 @@ class StreamingGaussianState:
                     n,
                     device=values.device,
                     dtype=values.dtype,
-                ).scatter_add(0, safe_indices, support_weight)
+                ).scatter_add(0, flat_indices, flat_support_weight)
                 return numerator / denominator.clamp_min(1e-8).unsqueeze(-1)
 
             mean_updates.append(aggregate(delta_mean_world))
 
-            delta_rotation = prediction.delta_rotation[batch_idx]
-            delta_rotation = delta_rotation.permute(1, 2, 0).reshape(-1, 3).tanh()
+            delta_rotation = flatten_prediction(
+                prediction.delta_rotation,
+                prediction.rank_delta_rotation,
+            )
+            if not raw_rotation_residual:
+                delta_rotation = delta_rotation.tanh()
             rotation_updates.append(aggregate(delta_rotation))
 
-            delta_scale = prediction.delta_log_scale[batch_idx]
-            delta_scale = delta_scale.permute(1, 2, 0).reshape(-1, 3).tanh()
+            delta_scale = flatten_prediction(
+                prediction.delta_log_scale,
+                prediction.rank_delta_log_scale,
+            )
+            if not raw_scale_residual:
+                delta_scale = delta_scale.tanh()
             scale_updates.append(aggregate(delta_scale))
 
-            delta_opacity = prediction.delta_opacity_logit[batch_idx]
-            delta_opacity = delta_opacity.permute(1, 2, 0).reshape(-1, 1).tanh()
+            delta_opacity = flatten_prediction(
+                prediction.delta_opacity_logit,
+                prediction.rank_delta_opacity_logit,
+            )
+            if not raw_opacity_residual:
+                delta_opacity = delta_opacity.tanh()
             opacity_updates.append(aggregate(delta_opacity))
 
-            delta_harmonics = prediction.delta_harmonics[batch_idx]
-            delta_harmonics = delta_harmonics.permute(1, 2, 0).reshape(
-                -1, harmonic_dim
-            ).tanh()
+            delta_harmonics = flatten_prediction(
+                prediction.delta_harmonics,
+                prediction.rank_delta_harmonics,
+            )
+            if not raw_harmonics_residual:
+                delta_harmonics = delta_harmonics.tanh()
             harmonic_updates.append(aggregate(delta_harmonics))
 
             observation_increments.append(
@@ -729,7 +878,7 @@ class StreamingGaussianState:
                     device=visible.device,
                     dtype=self.observation_count.dtype,
                 )
-                .scatter_add(0, safe_indices, visible)
+                .scatter_add(0, safe_indices.reshape(-1), visible.reshape(-1))
                 .clamp_max(1.0)
             )
 
@@ -913,6 +1062,7 @@ class GIRUpdateHead(nn.Module):
             nn.SiLU(inplace=True),
         )
         self.prediction = nn.Conv2d(hidden_dim, output_dim, kernel_size=1)
+        self.additional_historical_predictions = nn.ModuleList()
         self.current_prediction = nn.Conv2d(
             hidden_dim + 1,
             current_output_dim,
@@ -930,6 +1080,14 @@ class GIRUpdateHead(nn.Module):
         nn.init.zeros_(self.delete_prediction.weight)
         nn.init.constant_(self.delete_prediction.bias, -4.0)
 
+    def configure_historical_prediction_heads(self, num_heads: int) -> None:
+        """Create independent historical heads for contributor ranks."""
+        required_additional = max(1, int(num_heads)) - 1
+        while len(self.additional_historical_predictions) < required_additional:
+            self.additional_historical_predictions.append(
+                copy.deepcopy(self.prediction)
+            )
+
     def forward(
         self,
         current_feature: torch.Tensor,
@@ -937,6 +1095,7 @@ class GIRUpdateHead(nn.Module):
         current_depth: torch.Tensor,
         current_depth_confidence: torch.Tensor,
         gir: DominantGIR,
+        num_historical_predictions: int = 1,
     ) -> GIRPrediction:
         size = gir.depth.shape[-2:]
         current_feature = F.interpolate(
@@ -980,12 +1139,41 @@ class GIRUpdateHead(nn.Module):
             evidence_parts.append(gir.raster_alpha.to(current_feature.dtype))
         evidence = torch.cat(evidence_parts, dim=1)
         encoded = self.encoder(evidence)
-        prediction = self.prediction(encoded)
-        splits = torch.split(
-            prediction,
+        base_prediction = self.prediction(encoded)
+        base_splits = torch.split(
+            base_prediction,
             [3, 3, 3, 1, self.harmonic_dim, 1, 1],
             dim=1,
         )
+        num_historical_predictions = max(1, int(num_historical_predictions))
+        available_predictions = 1 + len(self.additional_historical_predictions)
+        if num_historical_predictions > available_predictions:
+            raise RuntimeError(
+                "GIRUpdateHead has fewer historical prediction heads than "
+                f"requested: requested={num_historical_predictions}, "
+                f"available={available_predictions}."
+            )
+        historical_splits = base_splits[:6]
+        rank_predictions = [None] * 6
+        if num_historical_predictions > 1:
+            rank_splits = [base_splits]
+            for head in self.additional_historical_predictions[
+                : num_historical_predictions - 1
+            ]:
+                rank_splits.append(
+                    torch.split(
+                        head(encoded),
+                        [3, 3, 3, 1, self.harmonic_dim, 1, 1],
+                        dim=1,
+                    )
+                )
+            rank_predictions = [
+                torch.stack(
+                    [rank_split[field_idx] for rank_split in rank_splits],
+                    dim=1,
+                )
+                for field_idx in range(6)
+            ]
         dominant_weight = gir.dominant_weight.to(encoded.dtype)
         current_prediction = self.current_prediction(
             torch.cat([encoded, dominant_weight], dim=1)
@@ -996,4 +1184,10 @@ class GIRUpdateHead(nn.Module):
             dim=1,
         )
         delete_logit = self.delete_prediction(encoded)
-        return GIRPrediction(*splits, *current_splits, delete_logit)
+        return GIRPrediction(
+            *historical_splits,
+            base_splits[6],
+            *current_splits,
+            delete_logit,
+            *rank_predictions,
+        )

@@ -8,6 +8,7 @@ import os
 import traceback
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as tf
 from einops import repeat
 from jaxtyping import Float
@@ -23,6 +24,7 @@ from .types import Stage
 from .view_sampler import ViewSampler
 from ..misc.cam_utils import camera_normalization
 from ..evaluation.benchmark_io import discover_scenes, image_8_path
+from .shims.load_shim import imread_cv2
 
 
 @dataclass
@@ -45,6 +47,11 @@ class DatasetDl3dvCfg(DatasetCfgCommon):
     tgt_list: list | None = None   
     test_scan_scenes: bool = False
     test_expected_scenes: int | None = None
+    # Optional scene-local GT depth directory.  When unset, the dataset stays
+    # RGB-only and DAV3-vs-GT diagnostics are simply not emitted.
+    gt_depth_dir: str | None = None
+    gt_depth_extension: str = "auto"
+    gt_depth_scale: float = 1.0
 
 
 @dataclass
@@ -243,6 +250,52 @@ class DatasetDL3DV(Dataset):
                 torch_images = torch.stack(torch_images)
         return torch_images
 
+    def _gt_depth_path(self, frame):
+        if self.cfg.gt_depth_dir is None:
+            return None
+        image_path = image_8_path(frame["file_path"])
+        depth_dir = Path(self.cfg.gt_depth_dir)
+        if not depth_dir.is_absolute():
+            depth_dir = image_path.parent.parent / depth_dir
+        stem = image_path.stem
+        extension = self.cfg.gt_depth_extension
+        if extension == "auto":
+            extensions = (".npy", ".exr", ".png", ".tiff", ".tif")
+        else:
+            extensions = (extension if extension.startswith(".") else "." + extension,)
+        for suffix in extensions:
+            candidate = depth_dir / f"{stem}{suffix}"
+            if candidate.is_file():
+                return candidate
+        expected = ", ".join(str(depth_dir / f"{stem}{suffix}") for suffix in extensions)
+        raise FileNotFoundError(
+            "GT depth is enabled, but no depth file was found. Tried: " + expected
+        )
+
+    def load_depths(self, frames):
+        if self.cfg.gt_depth_dir is None:
+            return None
+
+        depths = []
+        for frame in frames:
+            depth_path = self._gt_depth_path(frame)
+            if depth_path.suffix.lower() == ".npy":
+                depth = np.load(depth_path)
+            else:
+                depth = imread_cv2(str(depth_path))
+            depth = np.asarray(depth)
+            if depth.ndim == 3:
+                if depth.shape[-1] == 1:
+                    depth = depth[..., 0]
+                else:
+                    depth = depth[..., 0]
+            if depth.ndim != 2:
+                raise ValueError(
+                    f"GT depth must be HxW, got {depth.shape} from {depth_path}"
+                )
+            depths.append(torch.from_numpy(depth.astype(np.float32, copy=False)))
+        return torch.stack(depths) * float(self.cfg.gt_depth_scale)
+
     def getitem(self, index: int, num_context_views: int, patchsize: tuple) -> dict:
 
         scene = self.scene_ids[index]
@@ -294,9 +347,18 @@ class DatasetDL3DV(Dataset):
 
         context_images = self.load_frames(input_frames)
         target_images = self.load_frames(target_frame)
+        context_depth = self.load_depths(input_frames)
+        target_depth = self.load_depths(target_frame)
         resize = tf.Resize((270, 480))
         context_images = resize(context_images)
         target_images = resize(target_images)
+        if context_depth is not None:
+            context_depth = F.interpolate(
+                context_depth[:, None], size=(270, 480), mode="nearest"
+            ).squeeze(1)
+            target_depth = F.interpolate(
+                target_depth[:, None], size=(270, 480), mode="nearest"
+            ).squeeze(1)
 
         # Skip the example if the images don't have the right shape.
         context_image_invalid = context_images.shape[1:] != (
@@ -334,12 +396,19 @@ class DatasetDL3DV(Dataset):
                 extrinsics[context_indices][0:1], extrinsics
             )
 
+        rescale_factor = 1
         if self.cfg.rescale_to_1cube:
             scene_scale = torch.max(
                 torch.abs(extrinsics[context_indices][:, :3, 3])
             )  
             rescale_factor = 1 * scene_scale
             extrinsics[:, :3, 3] /= rescale_factor
+
+        # Depth is expressed in the same camera/world unit as the camera
+        # translations.  Apply the exact scene normalization used above.
+        if context_depth is not None:
+            context_depth = context_depth / scale / rescale_factor
+            target_depth = target_depth / scale / rescale_factor
 
         if torch.isnan(extrinsics).any() or torch.isinf(extrinsics).any():
             raise Exception("encounter nan or inf in input poses")
@@ -349,6 +418,7 @@ class DatasetDL3DV(Dataset):
                 "extrinsics": extrinsics[context_indices],
                 "intrinsics": intrinsics[context_indices],
                 "image": context_images,
+                **({"depth": context_depth} if context_depth is not None else {}),
                 "near": self.get_bound("near", len(context_indices)) / scale,
                 "far": self.get_bound("far", len(context_indices)) / scale,
                 "index": context_indices,
@@ -358,6 +428,7 @@ class DatasetDL3DV(Dataset):
                 "extrinsics": extrinsics[target_indices],
                 "intrinsics": intrinsics[target_indices],
                 "image": target_images,
+                **({"depth": target_depth} if target_depth is not None else {}),
                 "near": self.get_bound("near", len(target_indices)) / scale,
                 "far": self.get_bound("far", len(target_indices)) / scale,
                 "index": target_indices,

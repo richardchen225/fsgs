@@ -28,6 +28,7 @@ class LossDepthCfg:
     use_second_derivative: bool
     dav3_weights_path: str | None = None
     teacher: Literal["dav3", "abot"] = "dav3"
+    alignment: Literal["sequence_scale_only_log"] = "sequence_scale_only_log"
 
 
 @dataclass
@@ -46,8 +47,19 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
 
         if self.cfg.teacher not in ("dav3", "abot"):
             raise ValueError(f"Unknown depth teacher: {self.cfg.teacher}")
-        loss_kind = "log-depth L1 (no scale/shift alignment)" if self.cfg.teacher == "abot" else "per-image scale+shift aligned MSE"
+        if self.cfg.teacher == "abot":
+            loss_kind = "log-depth L1 (native teacher scale)"
+        else:
+            loss_kind = str(self.cfg.alignment)
+            if loss_kind != "sequence_scale_only_log":
+                raise ValueError(
+                    "DAV3 depth supervision requires alignment="
+                    "'sequence_scale_only_log'."
+                )
         print(f"Depth supervision: teacher={self.cfg.teacher}, {loss_kind}")
+        # Populated by ctx_depth_loss when the dataset provides context GT depth.
+        # These detached values are diagnostics only and never enter the loss.
+        self.last_teacher_gt_metrics: dict[str, torch.Tensor] = {}
         if self.cfg.teacher == "abot":
             # Teacher Z arrives from the frozen source-only ABot forward.
             # In particular, do not import/load/run Depth Anything 3 here.
@@ -90,26 +102,6 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
 
         return da_output
 
-    @staticmethod
-    def _align_depth(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        N = prediction.shape[0]
-        p = prediction.reshape(N, -1)
-        t = target.reshape(N, -1)
-
-        p_mean = p.mean(dim=-1, keepdim=True)
-        t_mean = t.mean(dim=-1, keepdim=True)
-
-        p_centered = p - p_mean
-        t_centered = t - t_mean
-
-        upper = (p_centered * t_centered).sum(dim=-1, keepdim=True)
-        lower = (p_centered**2).sum(dim=-1, keepdim=True) + 1e-8
-        s = upper / lower
-        s = torch.clamp(s, min=1e-4, max=100.0)
-        shift = t_mean - s * p_mean
-
-        return s.view(N, 1, 1) * prediction + shift.view(N, 1, 1)
-
     def ctx_depth_loss(
         self,
         depth_map: torch.Tensor,  # [B, V, H, W, C]
@@ -117,6 +109,7 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
         cxt_depth_weight: float = 0.01,
         teacher_depth: torch.Tensor | None = None,
     ):
+        self.last_teacher_gt_metrics = {}
         if self.cfg.teacher == "abot":
             if teacher_depth is None:
                 raise RuntimeError("ABot depth supervision requires source teacher_depth from the encoder.")
@@ -129,12 +122,131 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
             target = teacher_depth.detach().to(device=depth_map.device, dtype=torch.float32).flatten(0, 1).squeeze(-1)
             return cxt_depth_weight * self._masked_log_depth_l1(prediction, target)
 
-        da_output = self._context_depth_target(depth_map, batch)
-        pred_depth = depth_map.flatten(0, 1).squeeze(-1)
-        aligned_pred1 = self._align_depth(pred_depth, da_output)
-        loss_local = F.mse_loss(aligned_pred1, da_output, reduction="none").mean()
+        if self.cfg.alignment != "sequence_scale_only_log":
+            raise RuntimeError(
+                "Unsupported DAV3 depth alignment: "
+                f"{self.cfg.alignment!r}."
+            )
 
+        da_output = self._context_depth_target(depth_map, batch)
+        batch_size, view_count, height, width, channels = depth_map.shape
+        if channels != 1:
+            raise ValueError(
+                "Expected depth_map with one channel, got "
+                f"{channels} channels."
+            )
+        expected_shape = (batch_size * view_count, height, width)
+        if tuple(da_output.shape) != expected_shape:
+            raise ValueError(
+                "DAV3 target shape does not match context depth shape: "
+                f"target={tuple(da_output.shape)}, expected={expected_shape}."
+            )
+
+        prediction = depth_map.float().squeeze(-1)
+        target = da_output.detach().to(
+            device=prediction.device, dtype=prediction.dtype
+        ).reshape(batch_size, view_count, height, width)
+        prediction = prediction.reshape(batch_size, view_count, height, width)
+        gt_depth = None
+        if batch is not None and "context" in batch:
+            gt_depth = batch["context"].get("depth")
+        if gt_depth is not None:
+            self.last_teacher_gt_metrics = self._teacher_gt_metrics(
+                target.detach().float(), gt_depth.detach().float()
+            )
+        loss_local = self._sequence_scale_only_log_l1(prediction, target)
         return cxt_depth_weight * torch.nan_to_num(loss_local, nan=0.0)
+
+    @staticmethod
+    @torch.no_grad()
+    def _teacher_gt_metrics(
+        teacher_depth: torch.Tensor,
+        gt_depth: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Measure DAV3 against GT without adding a second training target.
+
+        DAV3 has an arbitrary global scale.  The aligned metrics therefore fit
+        one multiplicative scale per sequence, exactly like the current DAV3
+        supervision loss.  Raw metrics are retained as diagnostics only.
+        """
+        if teacher_depth.dim() != 4:
+            raise ValueError(
+                "Expected DAV3 depth with shape [B, V, H, W], got "
+                f"{tuple(teacher_depth.shape)}."
+            )
+        if gt_depth.dim() == 5 and gt_depth.shape[2] == 1:
+            gt_depth = gt_depth.squeeze(2)
+        elif gt_depth.dim() == 4:
+            pass
+        else:
+            raise ValueError(
+                "Expected context GT depth with shape [B, V, H, W] or "
+                f"[B, V, 1, H, W], got {tuple(gt_depth.shape)}."
+            )
+        if teacher_depth.shape != gt_depth.shape:
+            raise ValueError(
+                "DAV3 and GT depth shapes must match for diagnostics: "
+                f"teacher={tuple(teacher_depth.shape)}, gt={tuple(gt_depth.shape)}."
+            )
+
+        teacher_depth = teacher_depth.float()
+        gt_depth = gt_depth.to(device=teacher_depth.device, dtype=torch.float32)
+        valid = (
+            torch.isfinite(teacher_depth)
+            & torch.isfinite(gt_depth)
+            & (teacher_depth > 0)
+            & (gt_depth > 0)
+        )
+        valid_float = valid.float()
+        reduce_dims = (1, 2, 3)
+        count = valid_float.sum(dim=reduce_dims).clamp_min(1.0)
+
+        safe_teacher = torch.where(valid, teacher_depth, torch.ones_like(teacher_depth))
+        safe_gt = torch.where(valid, gt_depth, torch.ones_like(gt_depth))
+        log_ratio = safe_gt.clamp_min(1e-6).log() - safe_teacher.clamp_min(1e-6).log()
+        log_scale = (
+            (log_ratio * valid_float).sum(dim=reduce_dims) / count
+        )
+        # Avoid an invalid exponential if a malformed input contains very large
+        # finite values.  Normal DAV3/GT depths never reach these limits.
+        scale = log_scale.clamp(min=-20.0, max=20.0).exp()
+        # Use sanitized tensors for arithmetic: NaN * 0 is still NaN, so a
+        # later multiplication by the validity mask would not be sufficient.
+        aligned_teacher = safe_teacher * scale[:, None, None, None]
+        aligned_teacher = torch.where(valid, aligned_teacher, torch.zeros_like(aligned_teacher))
+        safe_teacher = torch.where(valid, safe_teacher, torch.zeros_like(safe_teacher))
+        safe_gt = torch.where(valid, safe_gt, torch.zeros_like(safe_gt))
+
+        aligned_abs_error = (aligned_teacher - safe_gt).abs()
+        raw_abs_error = (safe_teacher - safe_gt).abs()
+        aligned_log_error = (
+            aligned_teacher.clamp_min(1e-6).log()
+            - safe_gt.clamp_min(1e-6).log()
+        ).abs()
+
+        denominator = safe_gt
+        aligned_abs_rel = aligned_abs_error / denominator
+        raw_abs_rel = raw_abs_error / denominator
+
+        def masked_mean(value: torch.Tensor) -> torch.Tensor:
+            return (value * valid_float).sum() / valid_float.sum().clamp_min(1.0)
+
+        aligned_mse = ((aligned_teacher - safe_gt) ** 2) * valid_float
+        raw_mse = ((safe_teacher - safe_gt) ** 2) * valid_float
+        return {
+            "dav3_gt_abs_rel_aligned": masked_mean(aligned_abs_rel).detach(),
+            "dav3_gt_rmse_aligned": torch.sqrt(
+                aligned_mse.sum() / valid_float.sum().clamp_min(1.0)
+            ).detach(),
+            "dav3_gt_log_l1_aligned": masked_mean(aligned_log_error).detach(),
+            "dav3_gt_scale_aligned": (scale * (valid_float.sum(dim=reduce_dims) > 0).float()).sum()
+            / (valid_float.sum(dim=reduce_dims) > 0).float().sum().clamp_min(1.0),
+            "dav3_gt_abs_rel_raw": masked_mean(raw_abs_rel).detach(),
+            "dav3_gt_rmse_raw": torch.sqrt(
+                raw_mse.sum() / valid_float.sum().clamp_min(1.0)
+            ).detach(),
+            "dav3_gt_valid_ratio": valid_float.mean().detach(),
+        }
 
     @staticmethod
     def _masked_log_depth_l1(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -147,6 +259,44 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
         # An all-invalid teacher returns graph-connected zero, not a detached
         # scalar; this keeps the student branch in DDP's backward graph.
         return error.sum() / valid.sum().clamp_min(1)
+
+    @staticmethod
+    def _sequence_scale_only_log_l1(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compare a whole view sequence up to one multiplicative scale.
+
+        The scale is estimated across all views and valid pixels of each batch
+        item. No per-view scale and no additive shift are fitted, so relative
+        scale between views remains supervised.
+        """
+        if prediction.shape != target.shape or prediction.dim() != 4:
+            raise ValueError(
+                "Expected prediction and target with matching shape "
+                "[B, V, H, W], got "
+                f"prediction={tuple(prediction.shape)}, "
+                f"target={tuple(target.shape)}."
+            )
+
+        valid = (
+            torch.isfinite(prediction)
+            & torch.isfinite(target)
+            & (prediction > 0)
+            & (target > 0)
+        )
+        safe_prediction = torch.where(valid, prediction, torch.ones_like(prediction))
+        safe_target = torch.where(valid, target, torch.ones_like(target))
+        log_error = safe_prediction.clamp_min(1e-6).log() - safe_target.clamp_min(1e-6).log()
+
+        valid_float = valid.to(log_error.dtype)
+        reduce_dims = (1, 2, 3)
+        count = valid_float.sum(dim=reduce_dims, keepdim=True).clamp_min(1.0)
+        sequence_log_scale = (
+            (log_error * valid_float).sum(dim=reduce_dims, keepdim=True) / count
+        )
+        centered_error = log_error - sequence_log_scale
+        return (centered_error.abs() * valid_float).sum() / valid_float.sum().clamp_min(1.0)
 
     def ctx_depth_sequence_loss(
         self,
@@ -168,8 +318,10 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
 
         losses = []
         for iter_idx in range(R):
-            aligned_pred = self._align_depth(pred_depth[iter_idx], da_output)
-            loss_iter = F.mse_loss(aligned_pred, da_output, reduction="none").mean()
+            loss_iter = self._sequence_scale_only_log_l1(
+                pred_depth[iter_idx].reshape(B, V, H, W),
+                da_output.reshape(B, V, H, W),
+            )
             losses.append(torch.nan_to_num(loss_iter, nan=0.0))
 
         losses = torch.stack(losses)

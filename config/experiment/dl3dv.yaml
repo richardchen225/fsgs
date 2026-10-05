@@ -4,7 +4,7 @@ defaults:
   - /dataset@_group_.dl3dv: dl3dv
   - override /model/encoder: anysplat
   - override /model/encoder/backbone: croco
-  - override /loss: [mse, lpips, ssim, depth] 
+  - override /loss: [mse, depth]
 
 wandb:
   name: dl3dv
@@ -13,7 +13,7 @@ wandb:
 model:
   encoder:
     mode: ${mode}
-    reconstruction_backbone: abot
+    reconstruction_backbone: zipmap
     abot_pose_mode: two_pass
     abot_weights_path: weights/abot_recon.safetensors
     moge_weights_path: weights/model.pt
@@ -23,14 +23,14 @@ model:
     depth_refine_downsample_factor: 4
     depth_refine_enabled: false
     gs_refine_enabled: false
-    gir_enabled: false
+    gir_enabled: true
     gir_render_scale: 0.5
     gir_raster_evidence_enabled: true
     gir_dominant_id_enabled: true
     gir_dominant_min_weight: 1e-4
-    gir_top1_confidence_mode: floor_sqrt
+    gir_top1_confidence_mode: none
     gir_top1_confidence_floor: 0.25
-    gir_old_residual_enabled: false
+    gir_old_residual_enabled: true
     gir_old_delete_enabled: false
     gir_old_delete_warmup_steps: 1000
     gir_old_delete_target_ratio: 0.01
@@ -43,16 +43,34 @@ model:
     gir_old_decay_topk: 4
     gir_old_decay_strength: 0.02
     gir_old_decay_prune_threshold: 0.005
+    gir_residual_topk: 4
+    gir_residual_independent_heads: true
+    gir_mean_update_mode: absolute
+    gir_raw_scale_residual: true
+    gir_raw_opacity_residual: true
+    gir_raw_rotation_residual: false
+    gir_raw_harmonics_residual: false
+    gir_mean_relative_scale: 0.02
+    gir_rotation_scale: 0.05
+    gir_harmonics_scale: 0.10
     gir_hidden_dim: 64
     gir_tbptt_chunk: 4
     gir_replay_views: 1
-    gir_aux_loss_weight: 0.25
+    gir_aux_loss_weight: 1.0
+    gir_base_loss_weight: 1.0
+    gir_current_loss_weight: 1.0
+    gir_replay_loss_weight: 0.5
     gir_history_adapt_weight: 0.0
     gir_history_preserve_weight: 0.0
     gir_history_loss_interval: 4
     gir_history_preserve_margin: 0.002
     gir_history_replay_views: 1
     gir_add_gate_enabled: false
+    gir_new_residual_enabled: false
+    gir_historical_detach_mode: means
+    gir_residual_alpha_threshold: 0.02
+    gir_residual_depth_relative_tolerance: 0.08
+    gir_residual_rgb_bad_threshold: 0.08
     gir_add_gate_warmup_steps: 1000
     gir_add_rate_loss_weight: 0.0
     gir_regularization_weight: 1e-4
@@ -79,13 +97,13 @@ dataset:
 
 optimizer:
   lr: 5e-5
-  # Train only the DPT depth/features and GS parameter heads; backbone/cameras/MoGe stay frozen.
+  # Fine-tune the pretrained reconstruction and camera heads while training GIR.
   pretrained_lr: 1e-5
   scratch_lr: 5e-5
   warm_up_steps: 1000
   backbone_lr_multiplier: 0.1
   train_base_heads: true
-  train_gir: false
+  train_gir: true
 
 data_loader:
   train:
@@ -112,6 +130,7 @@ checkpointing:
 train:
   pose_loss_alpha: 1.0
   pose_loss_delta: 1.0
+  camera_focal_weight: 1.0
   cxt_depth_weight: 1.0
   weight_pose: 10.0
   weight_depth: 1.0
@@ -129,7 +148,8 @@ loss:
   ssim:
     conf: false
   depth:
-    teacher: abot
+    teacher: dav3
+    alignment: sequence_scale_only_log
     weight: 1.0
     sigma_image: null
     use_second_derivative: false

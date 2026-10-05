@@ -32,32 +32,43 @@ class LossMse(Loss[LossMseCfg, LossMseCfgWrapper]):
         depth_dict: dict | None,
         global_step: int,
     ) -> Float[Tensor, ""]:
+        gt = (batch["context"]["image"] + 1) / 2
+        pred = prediction.color
+        if pred.shape[:2] != gt.shape[:2]:
+            raise ValueError(
+                "RGB prediction/context view count mismatch: "
+                f"prediction={tuple(pred.shape)}, gt={tuple(gt.shape)}."
+            )
 
-        alpha = prediction.alpha
-        mask = torch.ones_like(alpha, device=alpha.device).bool()
+        # The encoder uses the first half of context views to construct the
+        # GS map and renders the remaining half as held-out views.  Use the
+        # same source/held-out split as the overfit experiment instead of
+        # silently mixing both groups into one MSE.
+        if depth_dict is None or "depth" not in depth_dict:
+            raise ValueError("RGB MSE needs depth_dict['depth'] to locate the source split.")
+        source_views = int(depth_dict["depth"].shape[1])
+        total_views = int(pred.shape[1])
+        if not 0 < source_views <= total_views:
+            raise ValueError(
+                "Invalid source/held-out split: "
+                f"source_views={source_views}, total_views={total_views}."
+            )
 
-        # pred_img = prediction.color.permute(0, 1, 3, 4, 2)[
-        #     :, : depth_dict["depth"].shape[1], ...
-        # ][mask[:, : depth_dict["depth"].shape[1], ...]]
-        # gt_img = ((batch["context"]["image"][:, batch["using_index"]] + 1) / 2).permute(
-        #     0, 1, 3, 4, 2
-        # )[:, : depth_dict["depth"].shape[1], ...][
-        #     mask[:, : depth_dict["depth"].shape[1], ...]
-        # ]
-        # delta1 = pred_img - gt_img
-
-        pred_img = prediction.color.permute(0, 1, 3, 4, 2)[mask]
-        gt_img = ((batch["context"]["image"][:, batch["using_index"]] + 1) / 2).permute(
-            0, 1, 3, 4, 2
-        )[
-            mask
-        ]
-        delta2 = pred_img - gt_img
+        source_loss = (pred[:, :source_views] - gt[:, :source_views]).square().mean()
+        if source_views < total_views:
+            heldout_loss = (
+                pred[:, source_views:] - gt[:, source_views:]
+            ).square().mean()
+        else:
+            heldout_loss = source_loss.new_zeros(())
 
         return torch.nan_to_num(
-            (delta2**2).mean(), nan=0.0, posinf=0.0, neginf=0.0
-        ) 
-    # + self.cfg.weight_ctx * torch.nan_to_num((delta1**2).mean(), nan=0.0, posinf=0.0, neginf=0.0)
+            self.cfg.weight_ctx * source_loss
+            + self.cfg.weight_novel * heldout_loss,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
 #         def forward(
 #             self,
 #             prediction: DecoderOutput,

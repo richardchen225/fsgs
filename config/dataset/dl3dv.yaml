@@ -5,6 +5,11 @@ defaults:
 name: dl3dv
 test_scan_scenes: false
 test_expected_scenes: null
+# Optional GT depth for DAV3-vs-GT diagnostics. Set this to a directory
+# relative to each scene directory, for example "depth".
+gt_depth_dir: null
+gt_depth_extension: auto
+gt_depth_scale: 1.0
 # Previous OpenBayes path:
 # roots: [/openbayes/input/input0/dl3dv, /openbayes/input/input0/dl3dv/train_index.json]
 roots: [datasets/dl3dv]

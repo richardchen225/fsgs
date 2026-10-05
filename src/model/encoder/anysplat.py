@@ -1,5 +1,6 @@
 import copy
 import numpy as np
+import math
 import os
 from pathlib import Path
 import sys
@@ -139,10 +140,23 @@ class EncoderAnySplatCfg:
     gir_old_decay_topk: int = 4
     gir_old_decay_strength: float = 0.02
     gir_old_decay_prune_threshold: float = 0.005
+    gir_residual_topk: int = 4
+    gir_residual_independent_heads: bool = True
+    gir_mean_update_mode: Literal["absolute", "relative_depth"] = "absolute"
+    gir_raw_scale_residual: bool = True
+    gir_raw_opacity_residual: bool = True
+    gir_raw_rotation_residual: bool = False
+    gir_raw_harmonics_residual: bool = False
+    gir_mean_relative_scale: float = 0.02
+    gir_rotation_scale: float = 0.05
+    gir_harmonics_scale: float = 0.10
     gir_hidden_dim: int = 64
     gir_tbptt_chunk: int = 2
     gir_replay_views: int = 1
-    gir_aux_loss_weight: float = 0.25
+    gir_aux_loss_weight: float = 1.0
+    gir_base_loss_weight: float = 1.0
+    gir_current_loss_weight: float = 1.0
+    gir_replay_loss_weight: float = 0.5
     gir_history_adapt_weight: float = 0.05
     gir_history_preserve_weight: float = 0.10
     gir_history_loss_interval: int = 4
@@ -152,6 +166,16 @@ class EncoderAnySplatCfg:
     gir_add_gate_warmup_steps: int = 1000
     gir_add_rate_loss_weight: float = 0.01
     gir_regularization_weight: float = 1e-4
+    # Match the overfit streaming boundary: detach the historical state before
+    # each new view.  "means" matches the selected overfit setup: historical
+    # positions are detached while appearance parameters keep their graph.
+    gir_historical_detach_mode: Literal["all", "means", "none"] = "means"
+    # The current-frame residual is an independent operation from appending
+    # new GS.  Keep it switchable so a full append can be tested by itself.
+    gir_new_residual_enabled: bool = True
+    gir_residual_alpha_threshold: float = 0.02
+    gir_residual_depth_relative_tolerance: float = 0.08
+    gir_residual_rgb_bad_threshold: float = 0.08
 
 class CameraDec(nn.Module):
     def __init__(self, dim_in=2048):
@@ -878,6 +902,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 ctx_img_num = int(v * 0.5)
 
         distill_infos = {}
+        infos = {}
         pred_all_extrinsic = None
         
         abot_cameras = None
@@ -914,8 +939,29 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             if abot_cameras is None:
                 pred_pose_enc_list = self.camera_head(aggregated_tokens_list)
                 last_pred_pose_enc = pred_pose_enc_list[-1]
-                pred_all_extrinsic, _ = pose_encoding_to_extri_intri(
-                    last_pred_pose_enc, image.shape[-2:]
+                raw_quaternion = last_pred_pose_enc[..., 3:7]
+                quaternion_norm = raw_quaternion.norm(dim=-1, keepdim=True)
+                identity_quaternion = torch.zeros_like(raw_quaternion)
+                identity_quaternion[..., 0] = 1.0
+                safe_quaternion = torch.where(
+                    quaternion_norm > 1e-6,
+                    F.normalize(raw_quaternion, dim=-1, eps=1e-8),
+                    identity_quaternion,
+                )
+                safe_pose_enc = torch.cat(
+                    [
+                        last_pred_pose_enc[..., :3],
+                        safe_quaternion,
+                        last_pred_pose_enc[..., 7:9].clamp(
+                            1e-3, math.pi - 1e-3
+                        ),
+                    ],
+                    dim=-1,
+                )
+                pred_all_extrinsic, pred_all_intrinsic_px = (
+                    pose_encoding_to_extri_intri(
+                        safe_pose_enc, image.shape[-2:]
+                    )
                 )
             else:
                 # ABot returns camera-to-world; this part of the encoder uses
@@ -950,20 +996,19 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             K_px[:, 1, 1] = K_px[:, 0, 0]
 
             if abot_cameras is not None:
-                normalized_k = K_px.clone()
-                normalized_k[:, 0] /= w
-                normalized_k[:, 1] /= h
+                pred_all_intrinsic_px = K_px[:, None].expand(
+                    b, v, 3, 3
+                ).clone()
                 last_pred_pose_enc = extri_intri_to_pose_encoding(
                     pred_all_extrinsic,
-                    normalized_k[:, None].expand(b, v, 3, 3),
+                    pred_all_intrinsic_px,
                     image_size_hw=(h, w),
                 )
                 pred_pose_enc_list = [last_pred_pose_enc]
             distill_infos["pred_pose_enc_list"] = last_pred_pose_enc
 
             # 复制成 [b, ctx_img_num, 3, 3]
-            K = K_px[:, None, :, :].expand(b, ctx_img_num, 3, 3).clone()
-            intrinsic = K
+            intrinsic = pred_all_intrinsic_px[:, :ctx_img_num]
             gt_ix = intrinsic
 
             extrinsic_padding = (
@@ -978,6 +1023,11 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             pred_all_extrinsic = torch.cat(
                 [pred_all_extrinsic, extrinsic_padding], dim=2
             ).inverse()
+            # Keep the differentiable predicted context poses available to the
+            # wrapper for GT camera supervision. Rendering may detach its own
+            # camera copy later, but this tensor must remain attached.
+            infos["pred_context_c2w"] = pred_all_extrinsic
+            infos["pred_context_pose_encoding"] = last_pred_pose_enc
 
             ctx_agg_token_list = [
                 token[:, :ctx_img_num, ...] for token in aggregated_tokens_list
@@ -1063,7 +1113,12 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         gaussians = {key_mapping.get(k, k): v for k, v in splats.items()}
         gaussians = Gaussians(**gaussians)
 
-        infos = {f"abot_alignment_{key}": value.mean() for key, value in abot_alignment.items()}
+        infos.update(
+            {
+                f"abot_alignment_{key}": value.mean()
+                for key, value in abot_alignment.items()
+            }
+        )
         if self.cfg.gs_refine_enabled or self.cfg.gir_enabled:
             infos["gs_refine"] = {
                 "features": out,
@@ -1092,15 +1147,20 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             .view(1, 1, 1, 4)
             .repeat(b, v, 1, 1)
         )
-        intrinsic = intrinsic.clone()
-        intrinsic = torch.stack(
-            [intrinsic[:, :, 0] / w, intrinsic[:, :, 1] / h, intrinsic[:, :, 2]], dim=2
+        render_intrinsic = pred_all_intrinsic_px.clone()
+        render_intrinsic = torch.stack(
+            [
+                render_intrinsic[:, :, 0] / w,
+                render_intrinsic[:, :, 1] / h,
+                render_intrinsic[:, :, 2],
+            ],
+            dim=2,
         )
         pred_context_pose = dict(
             extrinsic=torch.cat(
                 [extrinsic_padding], dim=2
             ),
-            intrinsic=intrinsic,
+            intrinsic=render_intrinsic,
         )
 
         if self.cfg.mode != "train":
@@ -1115,11 +1175,17 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                         distill_infos=distill_infos,
                     ),
                     pred_all_extrinsic,
-                    intrinsic,
+                    render_intrinsic,
                     depth_map,
                     ctx_img_num,
                 )
-            return gaussians, pred_all_extrinsic[:, ctx_img_num:], intrinsic, depth_map, ctx_img_num
+            return (
+                gaussians,
+                pred_all_extrinsic[:, ctx_img_num:],
+                render_intrinsic,
+                depth_map,
+                ctx_img_num,
+            )
 
         return (
             EncoderOutput(

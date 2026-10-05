@@ -61,6 +61,28 @@ gir_old_decay_enabled: false
 gir_old_decay_topk: 4
 gir_old_decay_strength: 0.02
 gir_old_decay_prune_threshold: 0.005
-gir_add_gate_enabled: true
+gir_residual_topk: 4
+gir_residual_independent_heads: true
+# Match the selected overfit residual parameterization.
+gir_mean_update_mode: absolute
+gir_raw_scale_residual: true
+gir_raw_opacity_residual: true
+gir_raw_rotation_residual: false
+gir_raw_harmonics_residual: false
+gir_mean_relative_scale: 0.02
+gir_rotation_scale: 0.05
+gir_harmonics_scale: 0.10
+# Keep every valid current-view Gaussian when it is appended to the stream.
+# New-GS suppression is disabled for the current ablation.
+gir_add_gate_enabled: false
 gir_add_gate_warmup_steps: 1000
-gir_add_rate_loss_weight: 0.01
+gir_add_rate_loss_weight: 0.0
+gir_base_loss_weight: 1.0
+gir_current_loss_weight: 1.0
+gir_replay_loss_weight: 0.5
+gir_aux_loss_weight: 1.0
+gir_historical_detach_mode: means
+gir_new_residual_enabled: false
+gir_residual_alpha_threshold: 0.02
+gir_residual_depth_relative_tolerance: 0.08
+gir_residual_rgb_bad_threshold: 0.08

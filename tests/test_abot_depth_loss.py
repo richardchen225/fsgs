@@ -63,9 +63,8 @@ class ABotDepthLossTests(unittest.TestCase):
     def test_scale_and_shift_errors_are_penalized_without_alignment(self):
         prediction = torch.linspace(1, 4, 20).reshape(1, 1, 4, 5, 1).requires_grad_()
         loss = self.make_loss()
-        with patch.object(loss, "_align_depth", side_effect=AssertionError("unexpected alignment")):
-            scale_error = loss.ctx_depth_loss(prediction, None, 1., prediction.detach() * 3.)
-            shift_error = loss.ctx_depth_loss(prediction, None, 1., prediction.detach() + 7.)
+        scale_error = loss.ctx_depth_loss(prediction, None, 1., prediction.detach() * 3.)
+        shift_error = loss.ctx_depth_loss(prediction, None, 1., prediction.detach() + 7.)
         torch.testing.assert_close(scale_error, torch.tensor(3.).log())
         self.assertGreater(shift_error.item(), 0.5)
         scale_error.backward()
@@ -111,16 +110,65 @@ class ABotDepthLossTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "shapes must match"):
             loss.ctx_depth_loss(prediction, None, teacher_depth=prediction[:, :2])
 
-    def test_dav3_branch_remains_unchanged(self):
+    def test_dav3_uses_sequence_scale_only_log_alignment(self):
         loss = self.make_loss()
         loss.cfg.teacher = "dav3"
-        prediction = torch.rand(2, 3, 4, 5, 1)
-        target = torch.rand(6, 4, 5)
+        loss.cfg.alignment = "sequence_scale_only_log"
+        prediction = torch.rand(2, 3, 4, 5, 1) + 1.0
+        target = torch.rand(6, 4, 5) + 1.0
         with patch.object(loss, "_context_depth_target", return_value=target) as teacher:
             actual = loss.ctx_depth_loss(prediction, None, 0.6)
         teacher.assert_called_once()
-        expected = 0.6 * F.mse_loss(LossDepth._align_depth(prediction.flatten(0, 1).squeeze(-1), target), target)
+        expected = 0.6 * LossDepth._sequence_scale_only_log_l1(
+            prediction.squeeze(-1), target.reshape(2, 3, 4, 5)
+        )
         torch.testing.assert_close(actual, expected)
+
+    def test_dav3_alignment_is_sequence_level_not_per_view(self):
+        target = torch.ones(1, 2, 2, 2)
+        globally_scaled = target * 3.0
+        per_view_scaled = target.clone()
+        per_view_scaled[:, 0] *= 2.0
+        per_view_scaled[:, 1] *= 3.0
+
+        global_loss = LossDepth._sequence_scale_only_log_l1(
+            globally_scaled, target
+        )
+        per_view_loss = LossDepth._sequence_scale_only_log_l1(
+            per_view_scaled, target
+        )
+
+        self.assertLess(global_loss.item(), 1e-6)
+        self.assertGreater(per_view_loss.item(), 0.1)
+
+    def test_dav3_gt_metrics_remove_one_sequence_scale(self):
+        teacher = torch.ones(1, 2, 2, 2) * 3.0
+        gt = torch.ones_like(teacher)
+        metrics = LossDepth._teacher_gt_metrics(teacher, gt)
+
+        self.assertAlmostEqual(metrics["dav3_gt_scale_aligned"].item(), 1.0 / 3.0, places=5)
+        self.assertLess(metrics["dav3_gt_abs_rel_aligned"].item(), 1e-6)
+        self.assertLess(metrics["dav3_gt_rmse_aligned"].item(), 1e-6)
+        self.assertLess(metrics["dav3_gt_log_l1_aligned"].item(), 1e-6)
+        self.assertGreater(metrics["dav3_gt_abs_rel_raw"].item(), 1.9)
+
+    def test_dav3_gt_metrics_keep_cross_view_scale_error(self):
+        gt = torch.ones(1, 2, 2, 2)
+        teacher = gt.clone()
+        teacher[:, 0] *= 2.0
+        teacher[:, 1] *= 4.0
+        metrics = LossDepth._teacher_gt_metrics(teacher, gt)
+
+        self.assertGreater(metrics["dav3_gt_abs_rel_aligned"].item(), 0.1)
+        self.assertGreater(metrics["dav3_gt_log_l1_aligned"].item(), 0.1)
+
+    def test_dav3_gt_metrics_ignore_invalid_pixels(self):
+        teacher = torch.tensor([[[[2.0, float("nan")], [0.0, 4.0]]]])
+        gt = torch.tensor([[[[1.0, 2.0], [3.0, 2.0]]]])
+        metrics = LossDepth._teacher_gt_metrics(teacher, gt)
+
+        self.assertAlmostEqual(metrics["dav3_gt_valid_ratio"].item(), 0.5, places=6)
+        self.assertTrue(torch.isfinite(torch.stack(list(metrics.values()))).all())
 
 
 if __name__ == "__main__":

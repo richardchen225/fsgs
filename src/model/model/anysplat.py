@@ -9,7 +9,7 @@ import torch.distributed
 import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from src.model.types import Gaussians
 from src.model.streaming_gir import (
@@ -37,6 +37,63 @@ def _group_count(channels: int, max_groups: int = 8) -> int:
     while channels % groups != 0:
         groups -= 1
     return groups
+
+
+def _bound_tanh_input(value: torch.Tensor, scale: float) -> torch.Tensor:
+    """Encode a scaled tanh bound for the activation in update_historical."""
+    if scale <= 0:
+        return value * 0.0
+    bounded = (torch.tanh(value) * min(float(scale), 0.999)).clamp(
+        -0.999, 0.999
+    )
+    return torch.atanh(bounded)
+
+
+def _mask_gir(gir: DominantGIR, mask: torch.Tensor) -> DominantGIR:
+    """Keep GIR evidence only at pixels selected for historical updates."""
+    mask = mask.bool()
+    mask_hw = mask[:, 0]
+    return replace(
+        gir,
+        indices=torch.where(mask_hw, gir.indices, torch.full_like(gir.indices, -1)),
+        stable_ids=torch.where(
+            mask_hw, gir.stable_ids, torch.full_like(gir.stable_ids, -1)
+        ),
+        valid=gir.valid & mask,
+        dominant_weight=torch.where(
+            mask, gir.dominant_weight, torch.zeros_like(gir.dominant_weight)
+        ),
+        depth=torch.where(mask, gir.depth, torch.zeros_like(gir.depth)),
+        opacity=torch.where(mask, gir.opacity, torch.zeros_like(gir.opacity)),
+        scale=torch.where(mask, gir.scale, torch.zeros_like(gir.scale)),
+        observation_count=torch.where(
+            mask, gir.observation_count, torch.zeros_like(gir.observation_count)
+        ),
+        raster_depth=torch.where(
+            mask, gir.raster_depth, torch.zeros_like(gir.raster_depth)
+        ),
+        raster_alpha=torch.where(
+            mask, gir.raster_alpha, torch.zeros_like(gir.raster_alpha)
+        ),
+        contributor_ids=(
+            None
+            if gir.contributor_ids is None
+            else torch.where(
+                mask[:, None],
+                gir.contributor_ids,
+                torch.full_like(gir.contributor_ids, -1),
+            )
+        ),
+        contributor_weights=(
+            None
+            if gir.contributor_weights is None
+            else torch.where(
+                mask[:, None],
+                gir.contributor_weights,
+                torch.zeros_like(gir.contributor_weights),
+            )
+        ),
+    )
 
 
 class ConvGRUCell(nn.Module):
@@ -361,6 +418,13 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     cfg, "gir_raster_evidence_enabled", False
                 ),
             )
+            residual_topk = max(1, int(getattr(cfg, "gir_residual_topk", 1)))
+            if residual_topk > 1 and bool(
+                getattr(cfg, "gir_residual_independent_heads", True)
+            ):
+                self.gir_update_head.configure_historical_prediction_heads(
+                    residual_topk
+                )
             return
         if not getattr(cfg, "gs_refine_enabled", False):
             return
@@ -670,6 +734,40 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             0.0,
             float(getattr(cfg, "gir_old_decay_prune_threshold", 0.005)),
         )
+        residual_topk = max(1, int(getattr(cfg, "gir_residual_topk", 1)))
+        independent_residual_heads = bool(
+            getattr(cfg, "gir_residual_independent_heads", True)
+        )
+        mean_update_mode = str(
+            getattr(cfg, "gir_mean_update_mode", "absolute")
+        ).lower()
+        if mean_update_mode not in {"absolute", "relative_depth"}:
+            raise ValueError(
+                "GIR mean update mode must be absolute or relative_depth; "
+                f"got {mean_update_mode!r}."
+            )
+        raw_scale_residual = bool(
+            getattr(cfg, "gir_raw_scale_residual", True)
+        )
+        raw_opacity_residual = bool(
+            getattr(cfg, "gir_raw_opacity_residual", True)
+        )
+        raw_rotation_residual = bool(
+            getattr(cfg, "gir_raw_rotation_residual", False)
+        )
+        raw_harmonics_residual = bool(
+            getattr(cfg, "gir_raw_harmonics_residual", False)
+        )
+        mean_relative_scale = float(
+            getattr(cfg, "gir_mean_relative_scale", 0.02)
+        )
+        rotation_scale = float(getattr(cfg, "gir_rotation_scale", 0.05))
+        harmonics_scale = float(getattr(cfg, "gir_harmonics_scale", 0.10))
+        if residual_topk > 1 and not use_raster_evidence:
+            raise ValueError(
+                "Top-k historical residuals require "
+                "gir_raster_evidence_enabled=true."
+            )
         if old_decay_enabled and old_decay_topk > 1 and not use_raster_evidence:
             raise ValueError(
                 "Top-k old-GS decay requires gir_raster_evidence_enabled=true."
@@ -724,6 +822,17 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         add_gate_enabled = bool(
             getattr(cfg, "gir_add_gate_enabled", True)
         )
+        new_residual_enabled = bool(
+            getattr(cfg, "gir_new_residual_enabled", True)
+        )
+        historical_detach_mode = str(
+            getattr(cfg, "gir_historical_detach_mode", "means")
+        ).lower()
+        if historical_detach_mode not in {"all", "means", "none"}:
+            raise ValueError(
+                "GIR historical detach mode must be one of all, means, none; "
+                f"got {historical_detach_mode!r}."
+            )
         if not add_gate_enabled and prune_threshold > 0.0:
             raise ValueError(
                 "GIR test pruning requires gir_add_gate_enabled=true."
@@ -759,7 +868,11 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         depth = refine_info["depth"]
         depth_confidence = refine_info["depth_conf"]
         state: Optional[StreamingGaussianState] = None
-        auxiliary_losses = []
+        # Streaming RGB supervision is kept as three separate terms to match
+        # the overfit experiment: initial map, newly arrived view, and replay.
+        base_rgb_losses = []
+        current_rgb_losses = []
+        replay_rgb_losses = []
         history_adapt_losses = []
         history_preserve_losses = []
         history_before_errors = []
@@ -809,8 +922,21 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         dominant_weight_means = []
         new_residual_magnitudes = []
         new_residual_gates = []
+        auxiliary_enabled = bool(
+            self.training
+            and float(getattr(cfg, "gir_aux_loss_weight", 0.0)) > 0.0
+        )
 
         for view_idx in range(source_views):
+            # This is the same temporal boundary used by the overfit
+            # experiment.  It prevents historical GS geometry from retaining
+            # a gradient path through every earlier view.
+            if state is not None:
+                if historical_detach_mode == "all":
+                    state = state.detach()
+                elif historical_detach_mode == "means":
+                    state = state.detach_means()
+
             current_feature = features[:, view_idx]
             current_rgb = context_image[:, view_idx]
             current_depth = depth[:, view_idx].permute(0, 3, 1, 2)
@@ -821,6 +947,28 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 gaussians_per_view,
             )
             has_history = state is not None
+
+            if auxiliary_enabled and view_idx == 0:
+                # Render the first-view GS before any historical update or
+                # later-view append. This is loss_base_first in overfit.
+                base_render = self.decoder.forward(
+                    current_gaussians,
+                    pred_all_extrinsic[:, :1],
+                    intrinsics[:, :1],
+                    torch.full((b, 1), near, device=features.device),
+                    torch.full((b, 1), far, device=features.device),
+                    (low_h, low_w),
+                    "depth",
+                )
+                base_target = F.interpolate(
+                    current_rgb.float(),
+                    size=(low_h, low_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )[:, None].to(base_render.color.dtype)
+                base_rgb_losses.append(
+                    (base_render.color - base_target).square().mean()
+                )
 
             if state is None:
                 gir = DominantGIR.empty(
@@ -855,7 +1003,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                         (low_h, low_w),
                         use_dominant_ids,
                         min_dominant_weight,
-                        old_decay_topk if old_decay_enabled else 1,
+                        residual_topk if old_residual_enabled else 1,
                     )
 
             if use_raster_evidence:
@@ -866,17 +1014,106 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     (gir.dominant_weight * gir.valid).sum() / valid_count
                 )
 
+            residual_gir = gir
+            if has_history:
+                # Match the overfit residual selection: update historical GS
+                # only where the old map is geometrically consistent but RGB
+                # is wrong, or where the old map lies behind the current
+                # surface.  All masks are evaluated at GIR resolution.
+                current_depth_low = F.interpolate(
+                    current_depth.float(),
+                    size=(low_h, low_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                current_rgb_low = F.interpolate(
+                    current_rgb.float(),
+                    size=(low_h, low_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                valid_depth_low = current_depth_low > 0
+                old_coverage = gir.valid & (
+                    gir.raster_alpha
+                    >= float(getattr(cfg, "gir_residual_alpha_threshold", 0.02))
+                )
+                relative_depth_delta = (
+                    gir.depth.float() - current_depth_low
+                ) / current_depth_low.clamp_min(1e-4)
+                depth_tolerance = float(
+                    getattr(cfg, "gir_residual_depth_relative_tolerance", 0.08)
+                )
+                depth_consistent = (
+                    old_coverage
+                    & valid_depth_low
+                    & (relative_depth_delta.abs() <= depth_tolerance)
+                )
+                old_in_front = (
+                    old_coverage
+                    & valid_depth_low
+                    & (relative_depth_delta < -depth_tolerance)
+                )
+                rgb_error = (
+                    gir.rgb.float() - current_rgb_low.float()
+                ).abs().mean(dim=1, keepdim=True)
+                rgb_bad = rgb_error >= float(
+                    getattr(cfg, "gir_residual_rgb_bad_threshold", 0.08)
+                )
+                residual_mask = (depth_consistent & rgb_bad) | old_in_front
+                residual_gir = _mask_gir(gir, residual_mask)
+
             prediction = self.gir_update_head(
                 current_feature,
                 current_rgb,
                 current_depth,
                 current_depth_confidence,
-                gir,
+                residual_gir,
+                num_historical_predictions=(
+                    residual_topk
+                    if independent_residual_heads and old_residual_enabled
+                    else 1
+                ),
             )
+            if mean_update_mode == "relative_depth":
+                prediction.delta_mean_camera = _bound_tanh_input(
+                    prediction.delta_mean_camera, mean_relative_scale
+                )
+            if not raw_rotation_residual:
+                prediction.delta_rotation = _bound_tanh_input(
+                    prediction.delta_rotation, rotation_scale
+                )
+            if not raw_harmonics_residual:
+                prediction.delta_harmonics = _bound_tanh_input(
+                    prediction.delta_harmonics, harmonics_scale
+                )
+            if prediction.rank_delta_mean_camera is not None:
+                if mean_update_mode == "relative_depth":
+                    prediction.rank_delta_mean_camera = _bound_tanh_input(
+                        prediction.rank_delta_mean_camera,
+                        mean_relative_scale,
+                    )
+                if not raw_rotation_residual:
+                    prediction.rank_delta_rotation = _bound_tanh_input(
+                        prediction.rank_delta_rotation, rotation_scale
+                    )
+                if not raw_harmonics_residual:
+                    prediction.rank_delta_harmonics = _bound_tanh_input(
+                        prediction.rank_delta_harmonics, harmonics_scale
+                    )
             old_delete_graph_anchor = (
                 old_delete_graph_anchor + 0.0 * prediction.delete_logit.sum()
             )
-            prediction.historical_gate = prediction.historical_gate - 4.0
+            # The overfit experiment uses a selected-update mask and an
+            # always-on historical update for the selected pixels.  Keep the
+            # same behavior here; the mask, not a learned gate, decides which
+            # old GS receive the residual.
+            prediction.historical_gate = torch.full_like(
+                prediction.historical_gate, 12.0
+            )
+            if prediction.rank_historical_gate is not None:
+                prediction.rank_historical_gate = torch.full_like(
+                    prediction.rank_historical_gate, 12.0
+                )
 
             if has_history:
                 history_interval = max(
@@ -977,10 +1214,16 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
 
                 if old_residual_enabled:
                     state = state.update_historical(
-                        gir,
+                        residual_gir,
                         prediction,
                         pred_all_extrinsic[:, view_idx],
                         update_confidence=historical_update_confidence,
+                        num_contributors=residual_topk,
+                        mean_update_mode=mean_update_mode,
+                        raw_scale_residual=raw_scale_residual,
+                        raw_opacity_residual=raw_opacity_residual,
+                        raw_rotation_residual=raw_rotation_residual,
+                        raw_harmonics_residual=raw_harmonics_residual,
                     )
 
                 if old_decay_enabled:
@@ -1205,27 +1448,39 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                             / replay_normalizer
                         )
 
-                current_gaussians = apply_current_gaussian_residual(
-                    current_gaussians,
-                    prediction,
-                    pred_all_extrinsic[:, view_idx],
-                    current_depth,
-                )
-                new_residual_energy = (
-                    prediction.current_delta_mean_camera.square().sum(
-                        dim=1, keepdim=True
+                if new_residual_enabled:
+                    current_gaussians = apply_current_gaussian_residual(
+                        current_gaussians,
+                        prediction,
+                        pred_all_extrinsic[:, view_idx],
+                        current_depth,
                     )
-                    + prediction.current_delta_rotation.square().sum(
-                        dim=1, keepdim=True
+                    new_residual_energy = (
+                        prediction.current_delta_mean_camera.square().sum(
+                            dim=1, keepdim=True
+                        )
+                        + prediction.current_delta_rotation.square().sum(
+                            dim=1, keepdim=True
+                        )
+                        + prediction.current_delta_log_scale.square().sum(
+                            dim=1, keepdim=True
+                        )
+                        + prediction.current_delta_opacity_logit.square()
+                        + prediction.current_delta_harmonics.square().mean(
+                            dim=1, keepdim=True
+                        )
                     )
-                    + prediction.current_delta_log_scale.square().sum(
-                        dim=1, keepdim=True
-                    )
-                    + prediction.current_delta_opacity_logit.square()
-                    + prediction.current_delta_harmonics.square().mean(
-                        dim=1, keepdim=True
-                    )
-                )
+                else:
+                    # Keep the disabled current branch connected to the graph
+                    # with zero weight, avoiding an unused DDP head while
+                    # guaranteeing that no new-GS residual is written back.
+                    new_residual_energy = (
+                        prediction.current_delta_mean_camera.square().sum()
+                        + prediction.current_delta_rotation.square().sum()
+                        + prediction.current_delta_log_scale.square().sum()
+                        + prediction.current_delta_opacity_logit.square().sum()
+                        + prediction.current_delta_harmonics.square().sum()
+                    ) * 0.0
                 new_residual_magnitudes.append(new_residual_energy.mean().sqrt())
                 new_residual_gates.append(
                     prediction.current_residual_gate.sigmoid().mean()
@@ -1234,6 +1489,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 new_residual_energy = prediction.add_logit.new_zeros(())
 
             coverage = gir.valid.to(prediction.add_logit.dtype)
+            residual_coverage = residual_gir.valid.to(
+                prediction.add_logit.dtype
+            )
             visible_ratios.append(coverage.mean())
             if state is None or not add_gate_enabled:
                 # Frame zero and residual-only experiments keep every new GS.
@@ -1293,16 +1551,36 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 / coverage.sum().clamp_min(1.0)
             )
             valid_normalizer = coverage.sum().clamp_min(1.0)
-            residual_energy = (
-                prediction.delta_mean_camera.square().sum(dim=1, keepdim=True)
-                + prediction.delta_rotation.square().sum(dim=1, keepdim=True)
-                + prediction.delta_log_scale.square().sum(dim=1, keepdim=True)
-                + prediction.delta_opacity_logit.square()
-                + prediction.delta_harmonics.square().mean(dim=1, keepdim=True)
-            )
+            if prediction.rank_delta_mean_camera is not None:
+                # Include all independent contributor heads in the residual
+                # statistic and regularizer, rather than only rank 1.
+                residual_energy = (
+                    prediction.rank_delta_mean_camera.square().sum(
+                        dim=2, keepdim=True
+                    )
+                    + prediction.rank_delta_rotation.square().sum(
+                        dim=2, keepdim=True
+                    )
+                    + prediction.rank_delta_log_scale.square().sum(
+                        dim=2, keepdim=True
+                    )
+                    + prediction.rank_delta_opacity_logit.square()
+                    + prediction.rank_delta_harmonics.square().mean(
+                        dim=2, keepdim=True
+                    )
+                ).mean(dim=1)
+            else:
+                residual_energy = (
+                    prediction.delta_mean_camera.square().sum(dim=1, keepdim=True)
+                    + prediction.delta_rotation.square().sum(dim=1, keepdim=True)
+                    + prediction.delta_log_scale.square().sum(dim=1, keepdim=True)
+                    + prediction.delta_opacity_logit.square()
+                    + prediction.delta_harmonics.square().mean(dim=1, keepdim=True)
+                )
             residual_magnitudes.append(residual_energy.mean().sqrt())
             old_residual_regularization = (
-                (residual_energy * coverage).sum() / valid_normalizer
+                (residual_energy * residual_coverage).sum()
+                / residual_coverage.sum().clamp_min(1.0)
                 if old_residual_enabled
                 else residual_energy.sum() * 0.0
             )
@@ -1328,7 +1606,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     prune_threshold=prune_threshold,
                 )
 
-            if self.training and cfg.gir_aux_loss_weight > 0:
+            if auxiliary_enabled and view_idx > 0:
                 replay_count = max(0, int(cfg.gir_replay_views))
                 replay_indices = list(
                     range(max(0, view_idx - replay_count), view_idx)
@@ -1362,19 +1640,15 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     b=b,
                     v=render_views,
                 ).to(render_output.color.dtype)
+                # Match the overfit experiment's replay/current RGB objective.
+                # It uses plain MSE rather than the previous Charbonnier-like
+                # sqrt(error^2 + eps) objective.
                 difference = render_output.color - target
-                auxiliary_losses.append(
-                    torch.sqrt(difference.square() + 1e-6).mean()
-                )
-
-            chunk_size = max(0, int(cfg.gir_tbptt_chunk))
-            if (
-                self.training
-                and chunk_size > 0
-                and (view_idx + 1) % chunk_size == 0
-                and view_idx + 1 < source_views
-            ):
-                state = state.detach()
+                current_rgb_losses.append(difference[:, -1:].square().mean())
+                if replay_indices:
+                    replay_rgb_losses.append(
+                        difference[:, :-1].square().mean()
+                    )
 
         if state is None:
             return encoder_output.gaussians
@@ -1389,6 +1663,19 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             )
             encoder_output.infos["gir_old_residual_enabled"] = torch.tensor(
                 float(old_residual_enabled), device=features.device
+            )
+            encoder_output.infos["gir_residual_topk"] = torch.tensor(
+                float(residual_topk), device=features.device
+            )
+            encoder_output.infos["gir_residual_independent_heads"] = torch.tensor(
+                float(independent_residual_heads), device=features.device
+            )
+            encoder_output.infos["gir_new_residual_enabled"] = torch.tensor(
+                float(new_residual_enabled), device=features.device
+            )
+            encoder_output.infos["gir_historical_detach_mode_code"] = torch.tensor(
+                {"all": 0.0, "means": 1.0, "none": 2.0}[historical_detach_mode],
+                device=features.device,
             )
             if test_pruned_new_ratios:
                 unpruned_map_gaussians = source_views * gaussians_per_view
@@ -1511,10 +1798,30 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 encoder_output.infos["gir_history_past_degradation"] = torch.stack(
                     history_past_degradations
                 ).mean()
-            if auxiliary_losses:
-                encoder_output.infos["gir_aux_loss"] = torch.stack(
-                    auxiliary_losses
-                ).mean()
+            streaming_rgb_terms = []
+            if base_rgb_losses:
+                base_rgb_loss = torch.stack(base_rgb_losses).mean()
+                encoder_output.infos["gir_base_rgb_loss"] = base_rgb_loss
+                streaming_rgb_terms.append(
+                    float(getattr(cfg, "gir_base_loss_weight", 1.0))
+                    * base_rgb_loss
+                )
+            if current_rgb_losses:
+                current_rgb_loss = torch.stack(current_rgb_losses).mean()
+                encoder_output.infos["gir_current_rgb_loss"] = current_rgb_loss
+                streaming_rgb_terms.append(
+                    float(getattr(cfg, "gir_current_loss_weight", 1.0))
+                    * current_rgb_loss
+                )
+            if replay_rgb_losses:
+                replay_rgb_loss = torch.stack(replay_rgb_losses).mean()
+                encoder_output.infos["gir_replay_rgb_loss"] = replay_rgb_loss
+                streaming_rgb_terms.append(
+                    float(getattr(cfg, "gir_replay_loss_weight", 0.5))
+                    * replay_rgb_loss
+                )
+            if streaming_rgb_terms:
+                encoder_output.infos["gir_aux_loss"] = sum(streaming_rgb_terms)
             encoder_output.infos["gir_regularization_loss"] = torch.stack(
                 regularization_losses
             ).mean() + old_delete_graph_anchor
@@ -2326,10 +2633,18 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         #     (pred_context_pose["extrinsic"], pred_all_target_extrinsic), dim=1
         # )
 
+        render_intrinsics = pred_context_pose["intrinsic"]
+        if render_intrinsics.shape[1] == 1 and v > 1:
+            render_intrinsics = render_intrinsics.expand(-1, v, -1, -1)
+        if render_intrinsics.shape[1] != v:
+            raise RuntimeError(
+                "Predicted intrinsic view count does not match the render "
+                f"sequence: intrinsics={render_intrinsics.shape[1]}, views={v}."
+            )
         output = self.decoder.forward(
             gaussians,
             pred_all_extrinsic.detach(),
-            pred_context_pose["intrinsic"][:, 0:1, ...].repeat(1, v, 1, 1).detach(),
+            render_intrinsics.detach(),
             torch.ones(b, v, device=device) * near,
             torch.ones(b, v, device=device) * far,
             (h, w),

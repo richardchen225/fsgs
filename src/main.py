@@ -171,6 +171,7 @@ def train(cfg_dict: DictConfig):
             load_prefixes = (
                 "encoder.gaussian_param_head.",
                 "encoder.gs_head.",
+                "encoder.camera_head.",
                 "encoder.cam_dec.",
                 "encoder.depth_refiner.",
                 "gs_residual_refiner.",
@@ -241,6 +242,7 @@ def train(cfg_dict: DictConfig):
             for key, value in ckpt.items()
             if "gaussian_param_head" in key
             or "gs_head" in key
+            or "camera_head" in key
             or "cam_dec" in key
             or "depth_refiner" in key
             or "gs_residual_refiner" in key
@@ -304,6 +306,7 @@ def train(cfg_dict: DictConfig):
         required_prefixes = [
             "encoder.gaussian_param_head.",
             "encoder.gs_head.",
+            "encoder.camera_head.",
         ]
         if getattr(cfg.model.encoder, "gir_enabled", False):
             required_prefixes.append("gir_update_head.")

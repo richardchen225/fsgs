@@ -1,3 +1,5 @@
 mse:
   weight_ctx: 1.0
-  weight_novel: 1.5
+  # Source and held-out views use the same MSE weight, matching the overfit
+  # experiment after its explicit source/held-out split.
+  weight_novel: 1.0

@@ -1,5 +1,6 @@
 depth:
   teacher: dav3
+  alignment: sequence_scale_only_log
   weight: 1.0
   sigma_image: null
   use_second_derivative: false

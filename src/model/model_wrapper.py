@@ -107,12 +107,75 @@ class TrainCfg:
     max_val_comparisons: int = 16
     pose_loss_alpha: float = 1.0
     pose_loss_delta: float = 1.0
+    camera_focal_weight: float = 1.0
     cxt_depth_weight: float = 0.01
     weight_pose: float = 1.0
     weight_depth: float = 1.0
     weight_normal: float = 1.0
     render_ba: bool = False
     render_ba_after_step: int = 0
+
+
+def _camera_supervision_losses(
+    predicted_c2w: torch.Tensor,
+    predicted_pose_encoding: torch.Tensor,
+    target_c2w: torch.Tensor,
+    target_intrinsics: torch.Tensor,
+    translation_weight: float,
+    rotation_weight: float,
+    focal_weight: float,
+) -> dict[str, torch.Tensor]:
+    """Compare camera trajectories in each sequence's first-view frame."""
+    predicted_c2w = predicted_c2w.float()
+    target_c2w = target_c2w.to(
+        device=predicted_c2w.device, dtype=predicted_c2w.dtype
+    )
+    if predicted_c2w.shape[:2] != target_c2w.shape[:2]:
+        raise RuntimeError(
+            "Predicted and GT camera sequences have different shapes: "
+            f"predicted={tuple(predicted_c2w.shape)}, "
+            f"gt={tuple(target_c2w.shape)}."
+        )
+    if predicted_pose_encoding.shape[:2] != target_intrinsics.shape[:2]:
+        raise RuntimeError(
+            "Predicted camera encoding and GT intrinsics have different "
+            f"view counts: predicted={tuple(predicted_pose_encoding.shape)}, "
+            f"gt={tuple(target_intrinsics.shape)}."
+        )
+
+    predicted_relative = torch.linalg.inv(predicted_c2w[:, :1]) @ predicted_c2w
+    target_relative = torch.linalg.inv(target_c2w[:, :1]) @ target_c2w
+    translation = F.smooth_l1_loss(
+        predicted_relative[..., :3, 3], target_relative[..., :3, 3]
+    )
+    rotation = F.mse_loss(
+        predicted_relative[..., :3, :3], target_relative[..., :3, :3]
+    )
+    target_intrinsics = target_intrinsics.to(
+        device=predicted_pose_encoding.device,
+        dtype=predicted_pose_encoding.dtype,
+    )
+    gt_fov_h = 2.0 * torch.atan(
+        0.5 / target_intrinsics[..., 1, 1].clamp_min(1e-6)
+    )
+    gt_fov_w = 2.0 * torch.atan(
+        0.5 / target_intrinsics[..., 0, 0].clamp_min(1e-6)
+    )
+    gt_fov = torch.stack([gt_fov_h, gt_fov_w], dim=-1)
+    focal = F.smooth_l1_loss(
+        predicted_pose_encoding[..., 7:9].float(), gt_fov.float()
+    )
+    total = (
+        translation_weight * translation
+        + rotation_weight * rotation
+        + focal_weight * focal
+    )
+    return {
+        "total": total,
+        "translation": translation,
+        "rotation": rotation,
+        "focal": focal,
+    }
 
 
 @runtime_checkable
@@ -451,6 +514,8 @@ class ModelWrapper(LightningModule):
                 )
             for metric_name in (
                 "gir_old_residual_enabled",
+                "gir_residual_topk",
+                "gir_residual_independent_heads",
                 "gir_old_delete_target_ratio",
                 "gir_old_delete_candidate_probability",
                 "gir_old_delete_candidate_count",
@@ -494,6 +559,16 @@ class ModelWrapper(LightningModule):
             gir_aux_loss = encoder_output.infos["gir_aux_loss"]
             gir_aux_weight = float(self.model.encoder.cfg.gir_aux_loss_weight)
             self.log("loss/gir_aux", gir_aux_loss.item())
+            for metric_name in (
+                "gir_base_rgb_loss",
+                "gir_current_rgb_loss",
+                "gir_replay_rgb_loss",
+            ):
+                if metric_name in encoder_output.infos:
+                    self.log(
+                        f"loss/{metric_name}",
+                        encoder_output.infos[metric_name].item(),
+                    )
             total_loss = total_loss + gir_aux_weight * gir_aux_loss
         if (
             encoder_output.infos is not None
@@ -585,6 +660,18 @@ class ModelWrapper(LightningModule):
             self.log(
                 "loss/loss_depth_ctx",
                 loss_depth_ctx.item())
+            # DAV3-vs-GT diagnostics are detached and are not part of the loss.
+            # Lightning/W&B records these scalars as step curves automatically.
+            for metric_name, metric_value in getattr(
+                depth_loss_module, "last_teacher_gt_metrics", {}
+            ).items():
+                self.log(
+                    f"train/{metric_name}",
+                    metric_value,
+                    on_step=True,
+                    on_epoch=False,
+                    sync_dist=True,
+                )
             total_loss = total_loss + loss_depth_ctx
             
             # depth_loss_idx = list(get_cfg()["loss"].keys()).index("depth")
@@ -604,6 +691,59 @@ class ModelWrapper(LightningModule):
                 loss = loss_fn.forward(output, batch, gaussians, depth_dict, self.global_step)
                 self.log(f"loss/{loss_fn.name}", loss.item())
                 total_loss = total_loss + loss
+
+            predicted_context_c2w = None
+            predicted_context_pose_encoding = None
+            if encoder_output.infos is not None:
+                predicted_context_c2w = encoder_output.infos.get(
+                    "pred_context_c2w"
+                )
+                predicted_context_pose_encoding = encoder_output.infos.get(
+                    "pred_context_pose_encoding"
+                )
+            gt_context_c2w = batch["context"].get("extrinsics")
+            gt_context_intrinsics = batch["context"].get("intrinsics")
+            if (
+                self.train_cfg.weight_pose != 0
+                and (
+                    predicted_context_c2w is None
+                    or predicted_context_pose_encoding is None
+                    or gt_context_c2w is None
+                    or gt_context_intrinsics is None
+                )
+            ):
+                raise RuntimeError(
+                    "GT camera supervision is enabled, but the model did not "
+                    "provide complete differentiable pose/FOV predictions or "
+                    "the batch has no GT cameras."
+                )
+            if (
+                predicted_context_c2w is not None
+                and predicted_context_pose_encoding is not None
+                and gt_context_c2w is not None
+                and gt_context_intrinsics is not None
+            ):
+                camera_losses = _camera_supervision_losses(
+                    predicted_context_c2w,
+                    predicted_context_pose_encoding,
+                    gt_context_c2w,
+                    gt_context_intrinsics,
+                    translation_weight=float(self.train_cfg.pose_loss_alpha),
+                    rotation_weight=float(self.train_cfg.pose_loss_delta),
+                    focal_weight=float(self.train_cfg.camera_focal_weight),
+                )
+                loss_camera = camera_losses["total"]
+                self.log("loss/camera", loss_camera.item())
+                self.log(
+                    "loss/camera_translation",
+                    camera_losses["translation"].item(),
+                )
+                self.log(
+                    "loss/camera_rotation",
+                    camera_losses["rotation"].item(),
+                )
+                self.log("loss/camera_focal", camera_losses["focal"].item())
+                total_loss = total_loss + self.train_cfg.weight_pose * loss_camera
 
             # int loss
             # loss_ca1 = F.mse_loss(
@@ -1111,11 +1251,18 @@ class ModelWrapper(LightningModule):
         from .utils import make_sampling_heatmap_overlay_tensors
         num_context_view = ctx_img_num
         pred_all_target_extrinsic = pred_all_extrinsic[:, ctx_img_num:]
+        pred_all_target_intrinsic = intrinsic[:, ctx_img_num:]
         render_view_count = pred_all_target_extrinsic.shape[1]
         if render_view_count != target_view_count:
             raise RuntimeError(
                 "Test target-pose count mismatch: "
                 f"predicted={render_view_count}, expected={target_view_count}."
+            )
+        if pred_all_target_intrinsic.shape[1] != target_view_count:
+            raise RuntimeError(
+                "Test target-intrinsic count mismatch: "
+                f"predicted={pred_all_target_intrinsic.shape[1]}, "
+                f"expected={target_view_count}."
             )
         render_device = gaussians.means.device
                 
@@ -1123,8 +1270,7 @@ class ModelWrapper(LightningModule):
             output = self.model.decoder.forward(
                 gaussians,
                 pred_all_target_extrinsic,
-                intrinsic[:,0:1,:,:].repeat(1, render_view_count, 1, 1).float(),
-                # intrinsic.float(),
+                pred_all_target_intrinsic.float(),
                 torch.ones(1, render_view_count, device=render_device) * 0.01,
                 torch.ones(1, render_view_count, device=render_device) * 100,
                 (h, w),
@@ -1494,6 +1640,7 @@ class ModelWrapper(LightningModule):
         pretrained_keys = (
             "model.encoder.gaussian_param_head",
             "model.encoder.gs_head",
+            "model.encoder.camera_head",
         )
         scratch_keys = (
             "model.encoder.depth_refiner",
