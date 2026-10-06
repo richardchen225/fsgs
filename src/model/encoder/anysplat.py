@@ -942,7 +942,8 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 raw_quaternion = last_pred_pose_enc[..., 3:7]
                 quaternion_norm = raw_quaternion.norm(dim=-1, keepdim=True)
                 identity_quaternion = torch.zeros_like(raw_quaternion)
-                identity_quaternion[..., 0] = 1.0
+                # Camera quaternions use XYZW ordering (scalar last).
+                identity_quaternion[..., 3] = 1.0
                 safe_quaternion = torch.where(
                     quaternion_norm > 1e-6,
                     F.normalize(raw_quaternion, dim=-1, eps=1e-8),
@@ -1142,11 +1143,6 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             depth_dict["depth_uncertainty"] = depth_uncertainty
 
         # print("B:", b, "V:", v, "H:", h, "W:", w)
-        extrinsic_padding = (
-            torch.tensor([0, 0, 0, 1], device=device, dtype=pred_all_extrinsic.dtype)
-            .view(1, 1, 1, 4)
-            .repeat(b, v, 1, 1)
-        )
         render_intrinsic = pred_all_intrinsic_px.clone()
         render_intrinsic = torch.stack(
             [
@@ -1157,9 +1153,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             dim=2,
         )
         pred_context_pose = dict(
-            extrinsic=torch.cat(
-                [extrinsic_padding], dim=2
-            ),
+            extrinsic=pred_all_extrinsic,
             intrinsic=render_intrinsic,
         )
 

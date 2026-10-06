@@ -283,6 +283,22 @@ class ModelWrapper(LightningModule):
                 )
             module.requires_grad_(train_base_heads)
 
+        camera_head = getattr(self.model.encoder, "camera_head", None)
+        reconstruction_backbone = getattr(
+            self.model.encoder.cfg, "reconstruction_backbone", "zipmap"
+        )
+        if reconstruction_backbone == "zipmap":
+            if camera_head is None:
+                raise RuntimeError("ZipMap training requires encoder.camera_head.")
+            camera_head.requires_grad_(train_base_heads)
+            if train_base_heads and self.train_cfg.weight_pose != 0 and not any(
+                parameter.requires_grad for parameter in camera_head.parameters()
+            ):
+                raise RuntimeError(
+                    "GT camera loss is enabled, but the ZipMap camera head "
+                    "has no trainable parameters."
+                )
+
         gir_head = getattr(self.model, "gir_update_head", None)
         gir_enabled = bool(getattr(self.model.encoder.cfg, "gir_enabled", False))
         if train_gir and (not gir_enabled or gir_head is None):
@@ -301,7 +317,9 @@ class ModelWrapper(LightningModule):
         print(
             "Training stage: "
             f"gir_enabled={gir_enabled}, "
-            f"train_base_heads={train_base_heads}, train_gir={train_gir}"
+            f"train_base_heads={train_base_heads}, "
+            f"train_camera_head={reconstruction_backbone == 'zipmap' and train_base_heads}, "
+            f"train_gir={train_gir}"
         )
 
     def on_train_epoch_start(self) -> None:

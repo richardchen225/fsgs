@@ -224,7 +224,7 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
             - safe_gt.clamp_min(1e-6).log()
         ).abs()
 
-        denominator = safe_gt
+        denominator = torch.where(valid, safe_gt, torch.ones_like(safe_gt))
         aligned_abs_rel = aligned_abs_error / denominator
         raw_abs_rel = raw_abs_error / denominator
 
