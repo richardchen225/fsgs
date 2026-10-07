@@ -7,9 +7,11 @@ from ..misc.step_tracker import StepTracker
 from .types import Stage
 from .view_sampler import get_view_sampler
 from .dataset_dl3dv import DatasetDL3DV, DatasetDL3DVCfgWrapper
+from .dataset_dl3dv_1 import DatasetDL3DV1
 from .dataset_re10k import Datasetre10k, Datasetre10kCfgWrapper
 DATASETS: dict[str, Dataset] = {
     "dl3dv": DatasetDL3DV,
+    "dl3dv_1": DatasetDL3DV1,
     "re10k": Datasetre10k,
 }
 

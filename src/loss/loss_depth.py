@@ -27,7 +27,7 @@ class LossDepthCfg:
     sigma_image: float | None
     use_second_derivative: bool
     dav3_weights_path: str | None = None
-    teacher: Literal["dav3", "abot"] = "dav3"
+    teacher: Literal["dav3"] = "dav3"
     alignment: Literal["sequence_scale_only_log"] = "sequence_scale_only_log"
 
 
@@ -45,26 +45,18 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
         self.cfg = getattr(cfg, field.name)
         self.name = field.name
 
-        if self.cfg.teacher not in ("dav3", "abot"):
+        if self.cfg.teacher != "dav3":
             raise ValueError(f"Unknown depth teacher: {self.cfg.teacher}")
-        if self.cfg.teacher == "abot":
-            loss_kind = "log-depth L1 (native teacher scale)"
-        else:
-            loss_kind = str(self.cfg.alignment)
-            if loss_kind != "sequence_scale_only_log":
-                raise ValueError(
-                    "DAV3 depth supervision requires alignment="
-                    "'sequence_scale_only_log'."
-                )
+        loss_kind = str(self.cfg.alignment)
+        if loss_kind != "sequence_scale_only_log":
+            raise ValueError(
+                "DAV3 depth supervision requires alignment="
+                "'sequence_scale_only_log'."
+            )
         print(f"Depth supervision: teacher={self.cfg.teacher}, {loss_kind}")
         # Populated by ctx_depth_loss when the dataset provides context GT depth.
         # These detached values are diagnostics only and never enter the loss.
         self.last_teacher_gt_metrics: dict[str, torch.Tensor] = {}
-        if self.cfg.teacher == "abot":
-            # Teacher Z arrives from the frozen source-only ABot forward.
-            # In particular, do not import/load/run Depth Anything 3 here.
-            return
-
         from .dav3.src.depth_anything_3.api import DepthAnything3
 
         if self.cfg.dav3_weights_path is None:
@@ -107,20 +99,21 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
         depth_map: torch.Tensor,  # [B, V, H, W, C]
         batch,
         cxt_depth_weight: float = 0.01,
-        teacher_depth: torch.Tensor | None = None,
     ):
         self.last_teacher_gt_metrics = {}
-        if self.cfg.teacher == "abot":
-            if teacher_depth is None:
-                raise RuntimeError("ABot depth supervision requires source teacher_depth from the encoder.")
-            if teacher_depth.shape != depth_map.shape:
-                raise ValueError(
-                    "ABot teacher/student depth shapes must match [B,S,H,W,1]: "
-                    f"teacher={tuple(teacher_depth.shape)}, student={tuple(depth_map.shape)}"
-                )
-            prediction = depth_map.float().flatten(0, 1).squeeze(-1)
-            target = teacher_depth.detach().to(device=depth_map.device, dtype=torch.float32).flatten(0, 1).squeeze(-1)
-            return cxt_depth_weight * self._masked_log_depth_l1(prediction, target)
+        effective_weight = float(self.cfg.weight) * float(cxt_depth_weight)
+
+        # Do not build the DAV3 graph when this branch is disabled. In
+        # particular, 0 * NaN is still NaN in the backward graph, so merely
+        # multiplying the final loss by zero is not sufficient.
+        if effective_weight == 0.0:
+            safe_depth = torch.nan_to_num(
+                depth_map.float(),
+                nan=1e-4,
+                posinf=100.0,
+                neginf=1e-4,
+            )
+            return safe_depth.sum() * 0.0
 
         if self.cfg.alignment != "sequence_scale_only_log":
             raise RuntimeError(
@@ -142,7 +135,17 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
                 f"target={tuple(da_output.shape)}, expected={expected_shape}."
             )
 
-        prediction = depth_map.float().squeeze(-1)
+        # The student depth is produced by exp(raw) in the Gaussian parameter
+        # head. Sanitize at the loss boundary as a second line of defense for
+        # callers that do not use EncoderAnySplat's geometry path. This keeps
+        # valid depths differentiable, while preventing an overflowing exp
+        # value from creating NaN during backward through a masked log loss.
+        prediction = torch.nan_to_num(
+            depth_map.float(),
+            nan=1e-4,
+            posinf=100.0,
+            neginf=1e-4,
+        ).clamp(1e-4, 100.0).squeeze(-1)
         target = da_output.detach().to(
             device=prediction.device, dtype=prediction.dtype
         ).reshape(batch_size, view_count, height, width)
@@ -155,7 +158,7 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
                 target.detach().float(), gt_depth.detach().float()
             )
         loss_local = self._sequence_scale_only_log_l1(prediction, target)
-        return cxt_depth_weight * torch.nan_to_num(loss_local, nan=0.0)
+        return effective_weight * torch.nan_to_num(loss_local, nan=0.0)
 
     @staticmethod
     @torch.no_grad()
@@ -249,18 +252,6 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
         }
 
     @staticmethod
-    def _masked_log_depth_l1(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Keep the native teacher scale; sanitize invalid targets BEFORE log
-        # so masked NaNs cannot contaminate backward.
-        valid = torch.isfinite(target) & (target > 0)
-        p = torch.where(valid, prediction, 1).clamp_min(1e-6)
-        t = torch.where(valid, target, 1).clamp_min(1e-6)
-        error = (p.log() - t.log()).abs()
-        # An all-invalid teacher returns graph-connected zero, not a detached
-        # scalar; this keeps the student branch in DDP's backward graph.
-        return error.sum() / valid.sum().clamp_min(1)
-
-    @staticmethod
     def _sequence_scale_only_log_l1(
         prediction: torch.Tensor,
         target: torch.Tensor,
@@ -307,8 +298,6 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
         aux_weight: float = 0.5,
         final_weight: float = 1.0,
     ):
-        if self.cfg.teacher != "dav3":
-            raise RuntimeError("ABot teacher supervises the initial DPT depth via ctx_depth_loss only.")
         if depth_iters.numel() == 0:
             return depth_iters.new_tensor(0.0)
 
@@ -352,8 +341,6 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
         gaussians: Gaussians,
         global_step: int,
     ) -> Float[Tensor, ""]:
-        if self.cfg.teacher != "dav3":
-            raise RuntimeError("Use ctx_depth_loss with encoder teacher_depth for ABot supervision.")
         # Scale the depth between the near and far planes.
         target_imgs = batch["target"]["image"]
         B, V, _, H, W = target_imgs.shape

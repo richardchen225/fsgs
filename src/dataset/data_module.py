@@ -36,6 +36,7 @@ def get_data_shim(encoder: nn.Module) -> DataShim:
 
 # the training ratio of datasets (example)
 prob_mapping = {DatasetDL3DV: 0.5,
+               DatasetDL3DV1: 0.5,
                Datasetre10k: 0.5}
 
 @dataclass

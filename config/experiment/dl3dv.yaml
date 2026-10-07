@@ -4,7 +4,7 @@ defaults:
   - /dataset@_group_.dl3dv: dl3dv
   - override /model/encoder: anysplat
   - override /model/encoder/backbone: croco
-  - override /loss: [mse, depth]
+  - override /loss: [mse, lpips, ssim, depth]
 
 wandb:
   name: dl3dv
@@ -14,15 +14,9 @@ model:
   encoder:
     mode: ${mode}
     reconstruction_backbone: zipmap
-    abot_pose_mode: two_pass
-    abot_weights_path: weights/abot_recon.safetensors
-    moge_weights_path: weights/model.pt
     zipmap_weights_path: weights/pre_zipmap.pt
-    gs_refine_detach_evidence: false
-    gs_refine_render_scale: 0.25
     depth_refine_downsample_factor: 4
     depth_refine_enabled: false
-    gs_refine_enabled: false
     gir_enabled: true
     gir_render_scale: 0.5
     gir_raster_evidence_enabled: true
@@ -54,8 +48,8 @@ model:
     gir_rotation_scale: 0.05
     gir_harmonics_scale: 0.10
     gir_hidden_dim: 64
-    gir_tbptt_chunk: 4
-    gir_replay_views: 1
+    gir_tbptt_chunk: 8
+    gir_replay_views: 8
     gir_aux_loss_weight: 1.0
     gir_base_loss_weight: 1.0
     gir_current_loss_weight: 1.0
@@ -143,6 +137,12 @@ hydra:
 loss:
   mse:
     conf: false
+  lpips:
+    weight: 0.05
+    apply_after_step: 0
+  ssim:
+    weight: 0.05
+    apply_after_step: 0
   depth:
     teacher: dav3
     alignment: sequence_scale_only_log

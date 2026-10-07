@@ -260,6 +260,9 @@ class LossSsim(Loss[LossSsimCfg, LossSsimCfgWrapper]):
         # Convert [-1, 1] image to [0, 1]
         image = (batch["context"]["image"] + 1) / 2
 
+        if self.cfg.weight == 0.0:
+            return torch.nan_to_num(prediction.color).sum() * 0.0
+
         # Before the specified step, don't apply the loss.
         if global_step < self.cfg.apply_after_step:
             return torch.tensor(0.0, dtype=torch.float32, device=image.device)

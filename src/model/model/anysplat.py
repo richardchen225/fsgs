@@ -49,6 +49,38 @@ def _bound_tanh_input(value: torch.Tensor, scale: float) -> torch.Tensor:
     return torch.atanh(bounded)
 
 
+def _gir_debug_tensor(name: str, value: torch.Tensor) -> None:
+    """Print compact finite/range statistics for a GIR tensor."""
+    if (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_rank() != 0
+    ):
+        return
+    if value is None:
+        print(f"[GIR DEBUG] {name}: None", flush=True)
+        return
+    detached = value.detach().float()
+    finite = torch.isfinite(detached)
+    finite_count = int(finite.sum().item())
+    total_count = detached.numel()
+    if finite_count == 0:
+        print(
+            f"[GIR DEBUG] {name}: finite=0/{total_count}, all_nonfinite",
+            flush=True,
+        )
+        return
+    finite_values = detached[finite]
+    print(
+        f"[GIR DEBUG] {name}: finite={finite_count}/{total_count} "
+        f"min={finite_values.min().item():.6e} "
+        f"max={finite_values.max().item():.6e} "
+        f"absmax={finite_values.abs().max().item():.6e} "
+        f"mean={finite_values.mean().item():.6e}",
+        flush=True,
+    )
+
+
 def _mask_gir(gir: DominantGIR, mask: torch.Tensor) -> DominantGIR:
     """Keep GIR evidence only at pixels selected for historical updates."""
     mask = mask.bool()
@@ -79,7 +111,11 @@ def _mask_gir(gir: DominantGIR, mask: torch.Tensor) -> DominantGIR:
             None
             if gir.contributor_ids is None
             else torch.where(
-                mask[:, None],
+                # contributor_ids is laid out as [B, K, H, W]. The mask is
+                # already [B, 1, H, W], so adding another axis would create
+                # [B, 1, K, H, W] through broadcasting and collapse the
+                # apparent contributor dimension to 1 downstream.
+                mask,
                 gir.contributor_ids,
                 torch.full_like(gir.contributor_ids, -1),
             )
@@ -88,227 +124,12 @@ def _mask_gir(gir: DominantGIR, mask: torch.Tensor) -> DominantGIR:
             None
             if gir.contributor_weights is None
             else torch.where(
-                mask[:, None],
+                mask,
                 gir.contributor_weights,
                 torch.zeros_like(gir.contributor_weights),
             )
         ),
     )
-
-
-class ConvGRUCell(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int) -> None:
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.gates = nn.Conv2d(
-            input_dim + hidden_dim,
-            hidden_dim * 2,
-            kernel_size=3,
-            padding=1,
-        )
-        self.candidate = nn.Conv2d(
-            input_dim + hidden_dim,
-            hidden_dim,
-            kernel_size=3,
-            padding=1,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        hidden: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if hidden is None:
-            hidden = x.new_zeros(
-                x.shape[0],
-                self.hidden_dim,
-                x.shape[-2],
-                x.shape[-1],
-            )
-
-        gate_input = torch.cat([x, hidden], dim=1)
-        reset_gate, update_gate = self.gates(gate_input).chunk(2, dim=1)
-        reset_gate = torch.sigmoid(reset_gate)
-        update_gate = torch.sigmoid(update_gate)
-
-        candidate_input = torch.cat([x, reset_gate * hidden], dim=1)
-        candidate = torch.tanh(self.candidate(candidate_input))
-        return (1.0 - update_gate) * hidden + update_gate * candidate
-
-
-class GaussianResidualRefiner(nn.Module):
-    def __init__(
-        self,
-        feature_dim: int,
-        sh_dim: int,
-        hidden_dim: int = 64,
-        num_iters: int = 4,
-    ) -> None:
-        super().__init__()
-        evidence_dim = 9
-        self.sh_dim = sh_dim
-        self.num_iters = max(1, int(num_iters))
-        norm_groups = _group_count(hidden_dim)
-        error_context_dim = 5 + 8
-
-        self.evidence_encoder = nn.Sequential(
-            nn.Conv2d(feature_dim + evidence_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.GroupNorm(norm_groups, hidden_dim),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.GroupNorm(norm_groups, hidden_dim),
-            nn.SiLU(inplace=True),
-        )
-        self.error_feature_encoder = nn.Sequential(
-            nn.Conv2d(3, 8, kernel_size=3, padding=1),
-            nn.GroupNorm(_group_count(8), 8),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(8, 8, kernel_size=3, padding=1),
-        )
-        self.error_context_encoder = nn.Sequential(
-            nn.Conv2d(error_context_dim, hidden_dim, kernel_size=1),
-            nn.GroupNorm(norm_groups, hidden_dim),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.GroupNorm(norm_groups, hidden_dim),
-            nn.SiLU(inplace=True),
-        )
-        self.reprojection_encoder = nn.Sequential(
-            nn.Conv2d(16, hidden_dim, kernel_size=3, padding=1),
-            nn.GroupNorm(norm_groups, hidden_dim),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-        )
-        self.context_gate = nn.Parameter(torch.tensor(-4.0))
-        self.reprojection_gate = nn.Parameter(torch.tensor(0.0))
-        self.iter_embed = nn.Parameter(torch.zeros(self.num_iters, hidden_dim, 1, 1))
-        self.update_block = ConvGRUCell(hidden_dim, hidden_dim)
-
-        self.geometry_head = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_dim, 3 + 4 + 1, kernel_size=1),
-        )
-        self.density_head = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_dim, 1 + 3 + 1, kernel_size=1),
-        )
-        self.appearance_head = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_dim, sh_dim + 1, kernel_size=1),
-        )
-        for head in (self.geometry_head, self.density_head, self.appearance_head):
-            nn.init.zeros_(head[-1].weight)
-            nn.init.zeros_(head[-1].bias)
-        nn.init.zeros_(self.reprojection_encoder[-1].weight)
-        nn.init.zeros_(self.reprojection_encoder[-1].bias)
-
-    def encode_feature_error(
-        self,
-        render_color: torch.Tensor,
-        target_color: torch.Tensor,
-    ) -> torch.Tensor:
-        b, s, c, h, w = render_color.shape
-        render_color = rearrange(render_color.detach().float(), "b s c h w -> (b s) c h w")
-        target_color = rearrange(target_color.detach().float(), "b s c h w -> (b s) c h w")
-        feature_error = self.error_feature_encoder(render_color) - self.error_feature_encoder(target_color)
-        return rearrange(feature_error, "(b s) c h w -> b s c h w", b=b, s=s)
-
-    def forward(
-        self,
-        features: torch.Tensor,
-        rgb_residual: torch.Tensor,
-        depth_residual: torch.Tensor,
-        alpha: torch.Tensor,
-        depth_conf: torch.Tensor,
-        depth_uncertainty: torch.Tensor,
-        opacity: torch.Tensor,
-        scale_norm: torch.Tensor,
-        view_gate: torch.Tensor,
-        causal_error_context: Optional[torch.Tensor] = None,
-        reprojection_evidence: Optional[torch.Tensor] = None,
-        hidden_state: Optional[torch.Tensor] = None,
-        iter_idx: int = 0,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        b, s, c, h, w = features.shape
-        x = torch.cat(
-            [
-                features,
-                rgb_residual,
-                depth_residual,
-                alpha,
-                depth_conf,
-                depth_uncertainty,
-                opacity,
-                scale_norm,
-            ],
-            dim=2,
-        )
-        x = rearrange(x, "b s c h w -> (b s) c h w")
-        evidence = self.evidence_encoder(x)
-        if causal_error_context is not None:
-            causal_error_context = rearrange(
-                causal_error_context.to(evidence.dtype),
-                "b s c h w -> (b s) c h w",
-            )
-            context_evidence = self.error_context_encoder(causal_error_context)
-            evidence = evidence + torch.sigmoid(self.context_gate).to(evidence.dtype) * context_evidence
-        if reprojection_evidence is not None:
-            reprojection_evidence = rearrange(
-                reprojection_evidence.to(evidence.dtype),
-                "b s c h w -> (b s) c h w",
-            )
-            reprojection_feature = self.reprojection_encoder(reprojection_evidence)
-            reprojection_feature = F.interpolate(
-                reprojection_feature,
-                size=evidence.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-            evidence = evidence + (
-                torch.sigmoid(self.reprojection_gate).to(evidence.dtype)
-                * reprojection_feature
-            )
-        iter_embed = self.iter_embed[min(max(int(iter_idx), 0), self.num_iters - 1)]
-        evidence = evidence + iter_embed
-        hidden_state = self.update_block(evidence, hidden_state)
-
-        geometry = self.geometry_head(hidden_state)
-        density = self.density_head(hidden_state)
-        appearance = self.appearance_head(hidden_state)
-
-        geometry = rearrange(geometry, "(b s) c h w -> b s c h w", b=b, s=s)
-        density = rearrange(density, "(b s) c h w -> b s c h w", b=b, s=s)
-        appearance = rearrange(appearance, "(b s) c h w -> b s c h w", b=b, s=s)
-
-        delta_mean = geometry[:, :, 0:3]
-        delta_quat = geometry[:, :, 3:7]
-        geometry_gate = torch.sigmoid(geometry[:, :, 7:8]) * view_gate
-
-        delta_opacity = density[:, :, 0:1]
-        delta_scale = density[:, :, 1:4]
-        density_gate = torch.sigmoid(density[:, :, 4:5]) * view_gate
-
-        delta_sh = appearance[:, :, : self.sh_dim]
-        appearance_gate = torch.sigmoid(appearance[:, :, self.sh_dim : self.sh_dim + 1]) * view_gate
-
-        return (
-            geometry_gate * delta_mean.tanh(),
-            geometry_gate * delta_quat.tanh(),
-            density_gate * delta_opacity.tanh(),
-            density_gate * delta_scale.tanh(),
-            appearance_gate * delta_sh.tanh(),
-            hidden_state,
-        )
 
 
 class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
@@ -322,7 +143,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         self.decoder_cfg = decoder_cfg
         self.build_encoder(encoder_cfg)
         self.build_decoder(decoder_cfg)
-        self.build_gs_refiner()
+        self.build_gir()
 
     def convert_nested_config(self, cfg_dict: dict, target_class: type):
         """Convert nested dictionary config to dataclass instance
@@ -393,68 +214,35 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     def build_decoder(self, decoder_cfg: DecoderSplattingCUDACfg):
         self.decoder = DecoderSplattingCUDA(decoder_cfg)
 
-    def build_gs_refiner(self):
+    def build_gir(self):
         cfg = self.encoder.cfg
-        self.gs_residual_refiner = None
+        # GIR is the only streaming Gaussian refinement path.
         self.gir_renderer = None
         self.gir_update_head = None
-        if getattr(cfg, "gir_enabled", False):
-            if getattr(cfg, "gs_refine_enabled", False):
-                raise ValueError(
-                    "gir_enabled and gs_refine_enabled are mutually exclusive."
-                )
-            if getattr(cfg, "gir_dominant_id_enabled", False) and not getattr(
-                cfg, "gir_raster_evidence_enabled", False
-            ):
-                raise ValueError(
-                    "gir_dominant_id_enabled requires gir_raster_evidence_enabled."
-                )
-            self.gir_renderer = DominantGIRRenderer()
-            self.gir_update_head = GIRUpdateHead(
-                feature_dim=self.encoder.feature_dim // 2,
-                harmonic_dim=self.encoder.nums_sh * 3,
-                hidden_dim=cfg.gir_hidden_dim,
-                use_raster_evidence=getattr(
-                    cfg, "gir_raster_evidence_enabled", False
-                ),
+        if not getattr(cfg, "gir_enabled", False):
+            return
+        if getattr(cfg, "gir_dominant_id_enabled", False) and not getattr(
+            cfg, "gir_raster_evidence_enabled", False
+        ):
+            raise ValueError(
+                "gir_dominant_id_enabled requires gir_raster_evidence_enabled."
             )
-            residual_topk = max(1, int(getattr(cfg, "gir_residual_topk", 1)))
-            if residual_topk > 1 and bool(
-                getattr(cfg, "gir_residual_independent_heads", True)
-            ):
-                self.gir_update_head.configure_historical_prediction_heads(
-                    residual_topk
-                )
-            return
-        if not getattr(cfg, "gs_refine_enabled", False):
-            return
-
-        feature_dim = self.encoder.feature_dim // 2
-        sh_dim = self.encoder.nums_sh * 3
-        self.gs_residual_refiner = GaussianResidualRefiner(
-            feature_dim=feature_dim,
-            sh_dim=sh_dim,
-            hidden_dim=cfg.gs_refine_hidden_dim,
-            num_iters=cfg.gs_refine_iters,
+        self.gir_renderer = DominantGIRRenderer()
+        self.gir_update_head = GIRUpdateHead(
+            feature_dim=self.encoder.feature_dim // 2,
+            harmonic_dim=self.encoder.nums_sh * 3,
+            hidden_dim=cfg.gir_hidden_dim,
+            use_raster_evidence=getattr(
+                cfg, "gir_raster_evidence_enabled", False
+            ),
         )
-
-    def _build_gaussians_from_refine_state(
-        self,
-        refine_info: dict,
-        means_raw: torch.Tensor,
-        quats_raw: torch.Tensor,
-        scales_raw: torch.Tensor,
-        opacities_raw: torch.Tensor,
-        res_sh_raw: torch.Tensor,
-    ) -> Gaussians:
-        return self._build_gaussians_from_raw_state(
-            refine_info["base_sh"],
-            means_raw,
-            quats_raw,
-            scales_raw,
-            opacities_raw,
-            res_sh_raw,
-        )
+        residual_topk = max(1, int(getattr(cfg, "gir_residual_topk", 1)))
+        if residual_topk > 1 and bool(
+            getattr(cfg, "gir_residual_independent_heads", True)
+        ):
+            self.gir_update_head.configure_historical_prediction_heads(
+                residual_topk
+            )
 
     @staticmethod
     def _build_gaussians_from_raw_state(
@@ -478,21 +266,6 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             scales=scales,
             rotations=rotations,
         )
-
-    @staticmethod
-    def _normalize_render_depth(depth: torch.Tensor, b: int, views: int, h: int, w: int) -> torch.Tensor:
-        if depth.dim() == 2:
-            depth = depth.view(1, 1, h, w)
-        elif depth.dim() == 3:
-            if depth.shape[0] == b * views:
-                depth = depth.view(b, views, h, w)
-            elif depth.shape[0] == views and b == 1:
-                depth = depth.unsqueeze(0)
-            else:
-                depth = depth.view(b, views, h, w)
-        elif depth.dim() != 4:
-            depth = depth.reshape(b, views, h, w)
-        return depth.unsqueeze(2)
 
     @staticmethod
     def _normalize_render_alpha(alpha: torch.Tensor, b: int, views: int, h: int, w: int) -> torch.Tensor:
@@ -673,7 +446,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         test_top1_confidence_mode: str = "inherit",
         test_top1_confidence_floor: float = 0.25,
     ) -> Gaussians:
-        refine_info = None if encoder_output.infos is None else encoder_output.infos.get("gs_refine")
+        refine_info = None if encoder_output.infos is None else encoder_output.infos.get("gir")
         if refine_info is None:
             raise RuntimeError("GIR is enabled, but the encoder did not return per-view GS data.")
 
@@ -865,6 +638,14 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         if intrinsics.shape[1] == 1 and source_views > 1:
             intrinsics = intrinsics.expand(-1, source_views, -1, -1)
 
+        # Match the overfit experiment: camera/depth geometry is a frozen
+        # condition for the streaming GIR rollout. The camera head is trained
+        # only by the explicit GT camera loss in ModelWrapper. Without this
+        # detach, the auxiliary/replay RGB renders send unstable rasterizer
+        # gradients back into camera_mlp_head at step zero.
+        pred_all_extrinsic = pred_all_extrinsic.detach()
+        intrinsics = intrinsics.detach()
+
         depth = refine_info["depth"]
         depth_confidence = refine_info["depth_conf"]
         state: Optional[StreamingGaussianState] = None
@@ -925,6 +706,10 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         auxiliary_enabled = bool(
             self.training
             and float(getattr(cfg, "gir_aux_loss_weight", 0.0)) > 0.0
+        )
+        debug_numerics = bool(getattr(cfg, "gir_debug_numerics", False))
+        debug_max_views = max(
+            0, int(getattr(cfg, "gir_debug_numerics_max_views", 2))
         )
 
         for view_idx in range(source_views):
@@ -1074,6 +859,36 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     else 1
                 ),
             )
+            debug_view = debug_numerics and view_idx < debug_max_views
+            if debug_view:
+                _gir_debug_tensor(
+                    f"step={global_step} view={view_idx} current_feature",
+                    current_feature,
+                )
+                _gir_debug_tensor(
+                    f"step={global_step} view={view_idx} current_depth",
+                    current_depth,
+                )
+                _gir_debug_tensor(
+                    f"step={global_step} view={view_idx} gir_depth",
+                    residual_gir.depth,
+                )
+                _gir_debug_tensor(
+                    f"step={global_step} view={view_idx} gir_alpha",
+                    residual_gir.raster_alpha,
+                )
+                _gir_debug_tensor(
+                    f"step={global_step} view={view_idx} delta_mean_raw",
+                    prediction.delta_mean_camera,
+                )
+                _gir_debug_tensor(
+                    f"step={global_step} view={view_idx} delta_scale_raw",
+                    prediction.delta_log_scale,
+                )
+                _gir_debug_tensor(
+                    f"step={global_step} view={view_idx} delta_opacity_raw",
+                    prediction.delta_opacity_logit,
+                )
             if mean_update_mode == "relative_depth":
                 prediction.delta_mean_camera = _bound_tanh_input(
                     prediction.delta_mean_camera, mean_relative_scale
@@ -1225,6 +1040,22 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                         raw_rotation_residual=raw_rotation_residual,
                         raw_harmonics_residual=raw_harmonics_residual,
                     )
+                    if debug_view:
+                        _gir_debug_tensor(
+                            f"step={global_step} view={view_idx} "
+                            "historical_state.means",
+                            state.gaussians.means,
+                        )
+                        _gir_debug_tensor(
+                            f"step={global_step} view={view_idx} "
+                            "historical_state.scales",
+                            state.gaussians.scales,
+                        )
+                        _gir_debug_tensor(
+                            f"step={global_step} view={view_idx} "
+                            "historical_state.opacities",
+                            state.gaussians.opacities,
+                        )
 
                 if old_decay_enabled:
                     state, decay_stats = state.decay_historical_opacity(
@@ -1588,6 +1419,20 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 old_residual_regularization + new_residual_energy.mean()
             )
 
+            if debug_view:
+                _gir_debug_tensor(
+                    f"step={global_step} view={view_idx} residual_energy",
+                    residual_energy,
+                )
+                _gir_debug_tensor(
+                    f"step={global_step} view={view_idx} old_reg",
+                    old_residual_regularization,
+                )
+                _gir_debug_tensor(
+                    f"step={global_step} view={view_idx} new_reg",
+                    new_residual_energy,
+                )
+
             if state is None:
                 state = StreamingGaussianState.from_current(
                     current_gaussians,
@@ -1604,6 +1449,24 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     current_gaussians,
                     add_gate,
                     prune_threshold=prune_threshold,
+                )
+
+            if debug_view:
+                _gir_debug_tensor(
+                    f"step={global_step} view={view_idx} state.means",
+                    state.gaussians.means,
+                )
+                _gir_debug_tensor(
+                    f"step={global_step} view={view_idx} state.scales",
+                    state.gaussians.scales,
+                )
+                _gir_debug_tensor(
+                    f"step={global_step} view={view_idx} state.opacities",
+                    state.gaussians.opacities,
+                )
+                _gir_debug_tensor(
+                    f"step={global_step} view={view_idx} state.rotations",
+                    state.gaussians.rotations,
                 )
 
             if auxiliary_enabled and view_idx > 0:
@@ -1650,11 +1513,26 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                         difference[:, :-1].square().mean()
                     )
 
+            # Truncated BPTT for the streaming map. The loss for the current
+            # view has already been built above, so cutting here prevents a
+            # later view from backpropagating through older chunks while still
+            # allowing gradients within the current chunk. This is separate
+            # from gir_historical_detach_mode, which is applied at every view
+            # boundary and may only detach historical means.
+            tbptt_chunk = max(0, int(getattr(cfg, "gir_tbptt_chunk", 0)))
+            if (
+                self.training
+                and tbptt_chunk > 0
+                and (view_idx + 1) % tbptt_chunk == 0
+                and view_idx + 1 < source_views
+            ):
+                state = state.detach()
+
         if state is None:
             return encoder_output.gaussians
 
         if encoder_output.infos is not None:
-            encoder_output.infos.pop("gs_refine", None)
+            encoder_output.infos.pop("gir", None)
             encoder_output.infos["gir_history_views"] = torch.tensor(
                 max(source_views - 1, 0), device=features.device
             )
@@ -1675,6 +1553,10 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             )
             encoder_output.infos["gir_historical_detach_mode_code"] = torch.tensor(
                 {"all": 0.0, "means": 1.0, "none": 2.0}[historical_detach_mode],
+                device=features.device,
+            )
+            encoder_output.infos["gir_tbptt_chunk"] = torch.tensor(
+                float(max(0, int(getattr(cfg, "gir_tbptt_chunk", 0)))),
                 device=features.device,
             )
             if test_pruned_new_ratios:
@@ -1948,626 +1830,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 test_top1_confidence_mode,
                 test_top1_confidence_floor,
             )
-        if self.gs_residual_refiner is None:
-            return encoder_output.gaussians
-        refine_info = None if encoder_output.infos is None else encoder_output.infos.get("gs_refine")
-        if refine_info is None:
-            return encoder_output.gaussians
-
-        cfg = self.encoder.cfg
-        features = refine_info["features"]
-        b, s, _, h, w = features.shape
-        if s <= 1:
-            if self.training:
-                raise RuntimeError(
-                    "Old-only GS refinement requires at least two source views. "
-                    "Increase the training sampler's minimum total view count to four."
-                )
-            return encoder_output.gaussians
-
-        device = features.device
-        evidence_features = features.detach() if cfg.gs_refine_detach_evidence else features
-        render_scale = float(max(0.0, min(1.0, cfg.gs_refine_render_scale)))
-        low_h = max(8, int(round(h * render_scale)))
-        low_w = max(8, int(round(w * render_scale)))
-
-        means_raw = refine_info["means"]
-        quats_raw = refine_info["quats"]
-        scales_raw = refine_info["scales_raw"]
-        opacities_raw = refine_info["opacities_raw"]
-        res_sh_raw = refine_info["res_sh_raw"]
-        base_sh_raw = refine_info["base_sh"]
-
-        depth = refine_info["depth"]
-        if cfg.gs_refine_detach_evidence:
-            depth = depth.detach()
-        depth_low = rearrange(depth, "b s h w c -> (b s) c h w")
-        depth_low = F.interpolate(depth_low.float(), size=(low_h, low_w), mode="bilinear", align_corners=False)
-        depth_low = rearrange(depth_low, "(b s) c h w -> b s c h w", b=b, s=s)
-
-        depth_conf = refine_info["depth_conf"]
-        if cfg.gs_refine_detach_evidence:
-            depth_conf = depth_conf.detach()
-        depth_conf = rearrange(depth_conf, "b s h w c -> (b s) c h w")
-        depth_conf = F.interpolate(depth_conf.float(), size=(h, w), mode="bilinear", align_corners=False)
-        depth_conf = rearrange(depth_conf, "(b s) c h w -> b s c h w", b=b, s=s)
-
-        depth_uncertainty = refine_info["depth_uncertainty"]
-        if depth_uncertainty is None:
-            depth_uncertainty = torch.zeros((b, s, 1, h, w), device=device, dtype=features.dtype)
-        else:
-            if cfg.gs_refine_detach_evidence:
-                depth_uncertainty = depth_uncertainty.detach()
-            depth_uncertainty = rearrange(depth_uncertainty, "b s h w c -> (b s) c h w")
-            depth_uncertainty = F.interpolate(
-                depth_uncertainty.float(), size=(h, w), mode="bilinear", align_corners=False
-            )
-            depth_uncertainty = rearrange(depth_uncertainty, "(b s) c h w -> b s c h w", b=b, s=s)
-
-        target_low = rearrange(context_image[:, :s], "b s c h w -> (b s) c h w")
-        target_low = F.interpolate(target_low.float(), size=(low_h, low_w), mode="bilinear", align_corners=False)
-        target_low = rearrange(target_low, "(b s) c h w -> b s c h w", b=b, s=s)
-
-        render_intrinsics = pred_context_pose["intrinsic"][:, 0:1].detach()
-        near_tensor = torch.full((b, 1), near, device=device)
-        far_tensor = torch.full((b, 1), far, device=device)
-
-        with torch.no_grad():
-            reprojection_features_low = rearrange(
-                features.detach().float(), "b s c h w -> (b s) c h w"
-            )
-            reprojection_features_low = F.interpolate(
-                reprojection_features_low,
-                size=(low_h, low_w),
-                mode="bilinear",
-                align_corners=False,
-            )
-            reprojection_features_low = F.normalize(
-                reprojection_features_low, dim=1, eps=1e-6
-            )
-            reprojection_features_low = rearrange(
-                reprojection_features_low,
-                "(b s) c h w -> b s c h w",
-                b=b,
-                s=s,
-            )
-            source_w2c = torch.linalg.inv(
-                pred_all_extrinsic[:, :s].detach().float()
-            )
-            source_intrinsics = pred_context_pose["intrinsic"].detach().float()
-            if source_intrinsics.shape[1] == 1 and s > 1:
-                source_intrinsics = source_intrinsics.expand(-1, s, -1, -1)
-            source_intrinsics = source_intrinsics[:, :s]
-            history_rgb_depth_low = torch.cat(
-                [target_low.detach().float(), depth_low.detach().float()], dim=2
-            )
-
-            reprojection_offsets = torch.tensor(
-                [
-                    [-1, -1],
-                    [0, -1],
-                    [1, -1],
-                    [-1, 0],
-                    [0, 0],
-                    [1, 0],
-                    [-1, 1],
-                    [0, 1],
-                    [1, 1],
-                ],
-                device=device,
-                dtype=torch.float32,
-            )
-            reprojection_offsets[:, 0] *= 2.0 / float(low_w)
-            reprojection_offsets[:, 1] *= 2.0 / float(low_h)
-
-        def upsample_error(error: torch.Tensor) -> torch.Tensor:
-            error = rearrange(error, "b s c h w -> (b s) c h w")
-            error = F.interpolate(error, size=(h, w), mode="bilinear", align_corners=False)
-            return rearrange(error, "(b s) c h w -> b s c h w", b=b)
-
-        def build_history_reprojection_evidence(
-            view_idx: int,
-            means_state: torch.Tensor,
-        ) -> torch.Tensor:
-            if view_idx <= 0:
-                return torch.zeros(
-                    (b, 1, 16, low_h, low_w),
-                    device=device,
-                    dtype=torch.float32,
-                )
-
-            with torch.no_grad():
-                current_means = rearrange(
-                    means_state[:, view_idx].detach().float(),
-                    "b (h w) c -> b c h w",
-                    h=h,
-                    w=w,
-                )
-                current_means = F.interpolate(
-                    current_means,
-                    size=(low_h, low_w),
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                current_means = rearrange(
-                    current_means, "b c h w -> b h w c"
-                )
-                current_means_h = torch.cat(
-                    [
-                        current_means,
-                        torch.ones_like(current_means[..., :1]),
-                    ],
-                    dim=-1,
-                )
-
-                current_feature = reprojection_features_low[:, view_idx]
-                current_rgb = target_low[:, view_idx].detach().float()
-                pair_evidence = []
-                pair_scores = []
-                pair_masks = []
-                pair_max_correlations = []
-                pair_confidences = []
-
-                for history_idx in range(view_idx):
-                    points_history = torch.einsum(
-                        "bij,bhwj->bhwi",
-                        source_w2c[:, history_idx],
-                        current_means_h,
-                    )
-                    z_history = points_history[..., 2]
-                    z_safe = z_history.clamp_min(1e-4)
-
-                    intrinsic = source_intrinsics[:, history_idx]
-                    fx = intrinsic[:, 0, 0].view(b, 1, 1) * float(low_w)
-                    fy = intrinsic[:, 1, 1].view(b, 1, 1) * float(low_h)
-                    cx = intrinsic[:, 0, 2].view(b, 1, 1) * float(low_w)
-                    cy = intrinsic[:, 1, 2].view(b, 1, 1) * float(low_h)
-                    u_pixel = fx * points_history[..., 0] / z_safe + cx
-                    v_pixel = fy * points_history[..., 1] / z_safe + cy
-                    grid = torch.stack(
-                        [
-                            2.0 * (u_pixel + 0.5) / float(low_w) - 1.0,
-                            2.0 * (v_pixel + 0.5) / float(low_h) - 1.0,
-                        ],
-                        dim=-1,
-                    )
-
-                    projection_valid = (
-                        (z_history > 1e-4)
-                        & (u_pixel >= 0.0)
-                        & (u_pixel <= float(low_w - 1))
-                        & (v_pixel >= 0.0)
-                        & (v_pixel <= float(low_h - 1))
-                    ).unsqueeze(1)
-
-                    sampled_rgb_depth = F.grid_sample(
-                        history_rgb_depth_low[:, history_idx],
-                        grid,
-                        mode="bilinear",
-                        padding_mode="zeros",
-                        align_corners=False,
-                    )
-                    sampled_rgb = sampled_rgb_depth[:, :3]
-                    sampled_depth = sampled_rgb_depth[:, 3:4]
-
-                    offset_grid = grid.unsqueeze(3) + reprojection_offsets.view(
-                        1, 1, 1, 9, 2
-                    )
-                    offset_grid = offset_grid.reshape(
-                        b, low_h, low_w * 9, 2
-                    )
-                    sampled_feature = F.grid_sample(
-                        reprojection_features_low[:, history_idx],
-                        offset_grid,
-                        mode="bilinear",
-                        padding_mode="zeros",
-                        align_corners=False,
-                    )
-                    sampled_feature = sampled_feature.reshape(
-                        b,
-                        sampled_feature.shape[1],
-                        low_h,
-                        low_w,
-                        9,
-                    )
-                    sampled_feature = F.normalize(
-                        sampled_feature, dim=1, eps=1e-6
-                    )
-                    correlation = (
-                        current_feature.unsqueeze(-1) * sampled_feature
-                    ).sum(dim=1)
-                    correlation = rearrange(
-                        correlation, "b h w n -> b n h w"
-                    ).clamp(-1.0, 1.0)
-
-                    relative_depth = (
-                        z_history.unsqueeze(1) - sampled_depth
-                    ) / sampled_depth.clamp_min(1e-4)
-                    relative_depth = relative_depth.clamp(-1.0, 1.0)
-                    max_correlation = correlation.max(dim=1, keepdim=True).values
-                    depth_consistency = torch.exp(
-                        -relative_depth.abs() / 0.15
-                    )
-                    feature_consistency = (
-                        (max_correlation + 1.0) * 0.5
-                    ).clamp(1e-3, 1.0)
-                    visibility = (
-                        projection_valid
-                        & (sampled_depth > 1e-4)
-                        & (
-                            z_history.unsqueeze(1)
-                            <= sampled_depth * 1.10
-                        )
-                    )
-                    confidence = depth_consistency * feature_consistency
-                    score = torch.log(confidence.clamp_min(1e-6))
-
-                    pair_evidence.append(
-                        torch.cat(
-                            [
-                                current_rgb - sampled_rgb,
-                                relative_depth,
-                                correlation,
-                            ],
-                            dim=1,
-                        )
-                    )
-                    pair_scores.append(score)
-                    pair_masks.append(visibility)
-                    pair_max_correlations.append(max_correlation)
-                    pair_confidences.append(confidence)
-
-                pair_evidence = torch.stack(pair_evidence, dim=1)
-                pair_scores = torch.stack(pair_scores, dim=1)
-                pair_masks = torch.stack(pair_masks, dim=1)
-                pair_max_correlations = torch.stack(
-                    pair_max_correlations, dim=1
-                )
-                pair_confidences = torch.stack(pair_confidences, dim=1)
-
-                masked_scores = pair_scores.masked_fill(~pair_masks, -1e4)
-                score_max = masked_scores.max(dim=1, keepdim=True).values
-                raw_weights = (
-                    torch.exp((pair_scores - score_max).clamp(-30.0, 30.0))
-                    * pair_masks.to(pair_scores.dtype)
-                )
-                weights = raw_weights / raw_weights.sum(
-                    dim=1, keepdim=True
-                ).clamp_min(1e-6)
-                aggregated = (weights * pair_evidence).sum(dim=1)
-
-                any_visible = pair_masks.any(dim=1)
-                max_correlation = pair_max_correlations.masked_fill(
-                    ~pair_masks, -1.0
-                ).max(dim=1).values
-                max_correlation = torch.where(
-                    any_visible, max_correlation, torch.zeros_like(max_correlation)
-                )
-                visible_support = pair_masks.float().mean(dim=1)
-                aggregated_confidence = (
-                    weights * pair_confidences
-                ).sum(dim=1)
-
-                evidence = torch.cat(
-                    [
-                        aggregated,
-                        max_correlation,
-                        visible_support,
-                        aggregated_confidence,
-                    ],
-                    dim=1,
-                )
-                return evidence.unsqueeze(1)
-
-        def build_causal_evidence(
-            view_idx: int,
-            means_state: torch.Tensor,
-            quats_state: torch.Tensor,
-            scales_state: torch.Tensor,
-            opacities_state: torch.Tensor,
-            sh_state: torch.Tensor,
-            include_current: bool,
-        ):
-            # The first iteration observes history only. Later iterations render
-            # the updated causal prefix, including the current view, to close the
-            # refinement loop without exposing any future views.
-            prefix_end = view_idx + 1 if include_current else view_idx
-            with torch.no_grad():
-                prefix_gaussians = self._build_gaussians_from_raw_state(
-                    base_sh_raw[:, :prefix_end].detach(),
-                    means_state[:, :prefix_end].detach(),
-                    quats_state[:, :prefix_end].detach(),
-                    scales_state[:, :prefix_end].detach(),
-                    opacities_state[:, :prefix_end].detach(),
-                    sh_state[:, :prefix_end].detach(),
-                )
-                prefix_output = self.decoder.forward(
-                    prefix_gaussians,
-                    pred_all_extrinsic[:, view_idx : view_idx + 1].detach(),
-                    render_intrinsics,
-                    near_tensor,
-                    far_tensor,
-                    (low_h, low_w),
-                    "depth",
-                )
-                render_color = prefix_output.color.detach()
-                render_depth = self._normalize_render_depth(
-                    prefix_output.depth.detach(), b, 1, low_h, low_w
-                )
-                render_alpha = self._normalize_render_alpha(
-                    prefix_output.alpha.detach(), b, 1, low_h, low_w
-                )
-
-            current_target_low = target_low[:, view_idx : view_idx + 1]
-            rgb_residual_low = (render_color - current_target_low).to(features.dtype)
-            current_depth_low = depth_low[:, view_idx : view_idx + 1].clamp_min(1e-4)
-            depth_residual_low = ((render_depth - current_depth_low) / current_depth_low).clamp(-1.0, 1.0)
-            depth_residual_low = depth_residual_low.to(features.dtype)
-            alpha_low = render_alpha.to(features.dtype)
-
-            rgb_residual = upsample_error(rgb_residual_low)
-            depth_residual = upsample_error(depth_residual_low)
-            alpha = upsample_error(alpha_low)
-            feature_error = self.gs_residual_refiner.encode_feature_error(
-                render_color,
-                current_target_low,
-            )
-            feature_error = upsample_error(feature_error)
-            reprojection_evidence = build_history_reprojection_evidence(
-                view_idx,
-                means_state,
-            )
-            return (
-                rgb_residual,
-                depth_residual,
-                alpha,
-                feature_error,
-                reprojection_evidence,
-            )
-
-        def select_views(state: torch.Tensor, view_indices: list[int]) -> torch.Tensor:
-            indices = torch.tensor(view_indices, device=state.device, dtype=torch.long)
-            return state.index_select(1, indices)
-
-        def refine_view_batch_once(
-            view_indices: list[int],
-            means_state: torch.Tensor,
-            quats_state: torch.Tensor,
-            scales_state: torch.Tensor,
-            opacities_state: torch.Tensor,
-            sh_state: torch.Tensor,
-            evidence: list[
-                tuple[
-                    torch.Tensor,
-                    torch.Tensor,
-                    torch.Tensor,
-                    torch.Tensor,
-                    torch.Tensor,
-                ]
-            ],
-            refiner_hidden: Optional[torch.Tensor],
-            refine_iter: int,
-        ):
-            rgb_residual = torch.cat([item[0] for item in evidence], dim=1)
-            depth_residual = torch.cat([item[1] for item in evidence], dim=1)
-            alpha = torch.cat([item[2] for item in evidence], dim=1)
-            feature_error = torch.cat([item[3] for item in evidence], dim=1)
-            reprojection_evidence = torch.cat(
-                [item[4] for item in evidence], dim=1
-            )
-            error_context = torch.cat(
-                [
-                    rgb_residual.detach().float(),
-                    depth_residual.detach().float(),
-                    alpha.detach().float(),
-                    feature_error.float(),
-                ],
-                dim=2,
-            )
-
-            current_means = select_views(means_state, view_indices)
-            current_quats = select_views(quats_state, view_indices)
-            current_scales = select_views(scales_state, view_indices)
-            current_opacities = select_views(opacities_state, view_indices)
-            current_sh = select_views(sh_state, view_indices)
-            current_features = select_views(evidence_features, view_indices)
-            current_depth_conf = select_views(depth_conf, view_indices)
-            current_depth_uncertainty = select_views(depth_uncertainty, view_indices)
-            mean_step_source = select_views(depth, view_indices)
-            if cfg.gs_refine_detach_evidence:
-                mean_step_source = mean_step_source.detach()
-            mean_step = rearrange(mean_step_source.float(), "b s h w c -> b s (h w) c")
-            view_gate = torch.ones(
-                (b, len(view_indices), 1, h, w),
-                device=device,
-                dtype=features.dtype,
-            )
-
-            opacity_source = current_opacities.detach() if cfg.gs_refine_detach_evidence else current_opacities
-            scale_source = current_scales.detach() if cfg.gs_refine_detach_evidence else current_scales
-            opacity = act_gs.reg_dense_opacities(opacity_source)
-            opacity = rearrange(opacity, "b s (h w) c -> b s c h w", h=h, w=w)
-            scale_norm = act_gs.reg_dense_scales(scale_source).clamp_max(0.1).norm(dim=-1, keepdim=True)
-            scale_norm = rearrange(scale_norm, "b s (h w) c -> b s c h w", h=h, w=w)
-
-            (
-                delta_mean,
-                delta_quat,
-                delta_opacity,
-                delta_scale,
-                delta_sh,
-                refiner_hidden,
-            ) = self.gs_residual_refiner(
-                current_features.float(),
-                rgb_residual.float(),
-                depth_residual.float(),
-                alpha.float(),
-                current_depth_conf.float(),
-                current_depth_uncertainty.float(),
-                opacity.float(),
-                scale_norm.float(),
-                view_gate.float(),
-                causal_error_context=error_context,
-                reprojection_evidence=reprojection_evidence,
-                hidden_state=refiner_hidden,
-                iter_idx=refine_iter,
-            )
-
-            delta_mean = rearrange(delta_mean, "b s c h w -> b s (h w) c")
-            delta_quat = rearrange(delta_quat, "b s c h w -> b s (h w) c")
-            delta_opacity = rearrange(delta_opacity, "b s c h w -> b s (h w) c")
-            delta_scale = rearrange(delta_scale, "b s c h w -> b s (h w) c")
-            delta_sh = rearrange(delta_sh, "b s c h w -> b s (h w) c")
-
-            current_means = current_means + mean_step.to(current_means.dtype) * delta_mean.to(current_means.dtype)
-            current_quats = current_quats + delta_quat.to(current_quats.dtype)
-            current_opacities = current_opacities + cfg.gs_refine_step_opacity * delta_opacity.to(current_opacities.dtype)
-            current_scales = current_scales + cfg.gs_refine_step_scale * delta_scale.to(current_scales.dtype)
-            current_sh = current_sh + cfg.gs_refine_step_sh * delta_sh.to(current_sh.dtype)
-
-            return (
-                current_means,
-                current_quats,
-                current_scales,
-                current_opacities,
-                current_sh,
-                refiner_hidden,
-            )
-
-        def replace_view(
-            state: torch.Tensor,
-            view_idx: int,
-            current: torch.Tensor,
-        ) -> torch.Tensor:
-            return torch.cat(
-                [state[:, :view_idx], current, state[:, view_idx + 1 :]],
-                dim=1,
-            )
-
-        num_refine_iters = max(0, int(cfg.gs_refine_iters))
-        if num_refine_iters == 0:
-            return encoder_output.gaussians
-
-        if self.training:
-            # Full-t synchronous causal refinement. Each round renders the
-            # states produced by the previous round, while every view is
-            # restricted to its own prefix and all updates remain batched.
-            refine_view_indices = list(range(1, s))
-            refiner_hidden = None
-            for refine_iter in range(num_refine_iters):
-                evidence = [
-                    build_causal_evidence(
-                        view_idx,
-                        means_raw,
-                        quats_raw,
-                        scales_raw,
-                        opacities_raw,
-                        res_sh_raw,
-                        include_current=refine_iter > 0,
-                    )
-                    for view_idx in refine_view_indices
-                ]
-                (
-                    current_means,
-                    current_quats,
-                    current_scales,
-                    current_opacities,
-                    current_sh,
-                    refiner_hidden,
-                ) = refine_view_batch_once(
-                    refine_view_indices,
-                    means_raw,
-                    quats_raw,
-                    scales_raw,
-                    opacities_raw,
-                    res_sh_raw,
-                    evidence,
-                    refiner_hidden,
-                    refine_iter,
-                )
-
-                means_raw = torch.cat([means_raw[:, :1], current_means], dim=1)
-                quats_raw = torch.cat([quats_raw[:, :1], current_quats], dim=1)
-                scales_raw = torch.cat([scales_raw[:, :1], current_scales], dim=1)
-                opacities_raw = torch.cat(
-                    [opacities_raw[:, :1], current_opacities], dim=1
-                )
-                res_sh_raw = torch.cat([res_sh_raw[:, :1], current_sh], dim=1)
-
-            refined_gaussians = self._build_gaussians_from_refine_state(
-                refine_info,
-                means_raw,
-                quats_raw,
-                scales_raw,
-                opacities_raw,
-                res_sh_raw,
-            )
-        else:
-            # Validation/test perform a streaming rollout. Previous views are
-            # fully refined and frozen before the newly arrived view runs its
-            # own closed-loop iterations.
-            for refine_view_idx in range(1, s):
-                refiner_hidden = None
-                for refine_iter in range(num_refine_iters):
-                    evidence = [
-                        build_causal_evidence(
-                            refine_view_idx,
-                            means_raw,
-                            quats_raw,
-                            scales_raw,
-                            opacities_raw,
-                            res_sh_raw,
-                            include_current=refine_iter > 0,
-                        )
-                    ]
-                    (
-                        current_means,
-                        current_quats,
-                        current_scales,
-                        current_opacities,
-                        current_sh,
-                        refiner_hidden,
-                    ) = refine_view_batch_once(
-                        [refine_view_idx],
-                        means_raw,
-                        quats_raw,
-                        scales_raw,
-                        opacities_raw,
-                        res_sh_raw,
-                        evidence,
-                        refiner_hidden,
-                        refine_iter,
-                    )
-
-                    means_raw = replace_view(means_raw, refine_view_idx, current_means)
-                    quats_raw = replace_view(quats_raw, refine_view_idx, current_quats)
-                    scales_raw = replace_view(scales_raw, refine_view_idx, current_scales)
-                    opacities_raw = replace_view(
-                        opacities_raw, refine_view_idx, current_opacities
-                    )
-                    res_sh_raw = replace_view(res_sh_raw, refine_view_idx, current_sh)
-
-            refined_gaussians = self._build_gaussians_from_refine_state(
-                refine_info,
-                means_raw,
-                quats_raw,
-                scales_raw,
-                opacities_raw,
-                res_sh_raw,
-            )
-
-        if encoder_output.infos is not None:
-            encoder_output.infos.pop("gs_refine", None)
-            encoder_output.infos["gs_refine_steps"] = torch.tensor(
-                int(cfg.gs_refine_iters), device=device
-            )
-            encoder_output.infos["gs_refine_history_views"] = torch.tensor(
-                s - 1, device=device
-            )
-            encoder_output.infos["gs_refine_reprojection_gate"] = torch.sigmoid(
-                self.gs_residual_refiner.reprojection_gate.detach()
-            )
-        return refined_gaussians
+        return encoder_output.gaussians
 
     @torch.no_grad()
     def inference(

@@ -309,14 +309,46 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
                 "tile_size": info["tile_size"],
             }
             def rasterize_contributors(count: int) -> tuple[Tensor, Tensor]:
+                expected_shape = (1, h, w, count)
                 if rasterize_top_contributing_gaussian_ids is not None:
-                    return rasterize_top_contributing_gaussian_ids(
-                        **contributor_args,
-                        num_depth_samples=count,
+                    native_ids, native_weights = (
+                        rasterize_top_contributing_gaussian_ids(
+                            **contributor_args,
+                            num_depth_samples=count,
+                        )
                     )
-                return _rasterize_top_contributor_fallback(
-                    **contributor_args,
-                    num_depth_samples=count,
+                    # Some installed gsplat builds expose this symbol but
+                    # still return only the dominant contributor, regardless
+                    # of num_depth_samples. Use the local implementation for
+                    # those builds so top-k remains an actual top-k query.
+                    if (
+                        tuple(native_ids.shape) == expected_shape
+                        and tuple(native_weights.shape) == expected_shape
+                    ):
+                        return native_ids, native_weights
+
+                if rasterize_to_indices_in_range is not None:
+                    fallback_ids, fallback_weights = (
+                        _rasterize_top_contributor_fallback(
+                            **contributor_args,
+                            num_depth_samples=count,
+                        )
+                    )
+                    if (
+                        tuple(fallback_ids.shape) == expected_shape
+                        and tuple(fallback_weights.shape) == expected_shape
+                    ):
+                        return fallback_ids, fallback_weights
+
+                native_shape = (
+                    None
+                    if rasterize_top_contributing_gaussian_ids is None
+                    else (tuple(native_ids.shape), tuple(native_weights.shape))
+                )
+                raise RuntimeError(
+                    "GIR contributor rasterizer returned an incompatible "
+                    f"shape for top-{count}: expected={expected_shape}, "
+                    f"native={native_shape}."
                 )
 
             # Keep the legacy K=1 query as the canonical dominant match. This

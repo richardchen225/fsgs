@@ -20,6 +20,39 @@ import warnings
 import torch.nn.functional as F
 warnings.filterwarnings("ignore")
 
+
+def _print_gir_parameter_stats(model, enabled: bool) -> None:
+    """Print GIR head ranges after optional pretrained weights are loaded."""
+    if not enabled or not hasattr(model, "gir_update_head"):
+        return
+    gir_head = model.gir_update_head
+    print("[GIR DEBUG] parameter initialization after checkpoint loading:")
+    for module_name in (
+        "prediction",
+        "current_prediction",
+        "delete_prediction",
+    ):
+        module = getattr(gir_head, module_name, None)
+        if module is None:
+            continue
+        for parameter_name, parameter in module.named_parameters():
+            value = parameter.detach().float()
+            finite = torch.isfinite(value)
+            finite_count = int(finite.sum().item())
+            finite_values = value[finite]
+            if finite_count:
+                print(
+                    f"[GIR DEBUG] init {module_name}.{parameter_name}: "
+                    f"finite={finite_count}/{value.numel()} "
+                    f"absmax={finite_values.abs().max().item():.6e} "
+                    f"mean={finite_values.mean().item():.6e}"
+                )
+            else:
+                print(
+                    f"[GIR DEBUG] init {module_name}.{parameter_name}: "
+                    f"finite=0/{value.numel()}"
+                )
+
 # Configure beartype and jaxtyping.
 with install_import_hook(
     ("src",),
@@ -174,7 +207,6 @@ def train(cfg_dict: DictConfig):
                 "encoder.camera_head.",
                 "encoder.cam_dec.",
                 "encoder.depth_refiner.",
-                "gs_residual_refiner.",
                 "gir_update_head.",
             )
             model_state = model.state_dict()
@@ -224,7 +256,7 @@ def train(cfg_dict: DictConfig):
                     f"loaded={loaded_count}/{len(head_keys)} tensors; "
                     f"kept_initialized={len(head_keys) - loaded_count}"
                 )
-                
+
     else:
         if cfg.checkpointing.load is None:
             raise ValueError("checkpointing.load must be set when mode=test.")
@@ -245,7 +277,6 @@ def train(cfg_dict: DictConfig):
             or "camera_head" in key
             or "cam_dec" in key
             or "depth_refiner" in key
-            or "gs_residual_refiner" in key
             or "gir_update_head" in key
         }
 
@@ -253,50 +284,11 @@ def train(cfg_dict: DictConfig):
         compatible_ckpt = {}
         skipped_keys = []
         for key, value in ckpt.items():
-            remap_key = {
-                "gs_residual_refiner.net.0.weight": "gs_residual_refiner.evidence_encoder.0.weight",
-                "gs_residual_refiner.net.0.bias": "gs_residual_refiner.evidence_encoder.0.bias",
-                "gs_residual_refiner.net.2.weight": "gs_residual_refiner.evidence_encoder.3.weight",
-                "gs_residual_refiner.net.2.bias": "gs_residual_refiner.evidence_encoder.3.bias",
-            }.get(key)
-            if key not in model_state and remap_key in model_state:
-                key = remap_key
-
             if key not in model_state:
                 skipped_keys.append(key)
                 continue
             if value.shape == model_state[key].shape:
                 compatible_ckpt[key] = value
-                continue
-
-            # Older GS refiners predicted opacity/scale/SH/gate only. The current
-            # head prepends mean/quat residuals, so copy old channels into the
-            # matching tail and keep new geometry channels zero-initialized.
-            remap_key = {
-                "gs_residual_refiner.net.6.weight": "gs_residual_refiner.net.4.weight",
-                "gs_residual_refiner.net.6.bias": "gs_residual_refiner.net.4.bias",
-            }.get(key)
-            if remap_key in model_state:
-                target = model_state[remap_key]
-                if (
-                    value.shape[0] + 7 == target.shape[0]
-                    and value.shape[1:] == target.shape[1:]
-                ):
-                    expanded = target.clone()
-                    expanded.zero_()
-                    expanded[7:] = value
-                    compatible_ckpt[remap_key] = expanded
-                    continue
-
-            if (
-                key in ("gs_residual_refiner.net.4.weight", "gs_residual_refiner.net.4.bias")
-                and value.shape[0] + 7 == model_state[key].shape[0]
-                and value.shape[1:] == model_state[key].shape[1:]
-            ):
-                expanded = model_state[key].clone()
-                expanded.zero_()
-                expanded[7:] = value
-                compatible_ckpt[key] = expanded
                 continue
 
             skipped_keys.append(key)
@@ -334,6 +326,11 @@ def train(cfg_dict: DictConfig):
                 f"{preview}"
             )
         model.load_state_dict(compatible_ckpt, strict=False)
+
+    _print_gir_parameter_stats(
+        model,
+        bool(getattr(cfg.model.encoder, "gir_debug_numerics", False)),
+    )
     
     model_wrapper = ModelWrapper(
         cfg.optimizer,

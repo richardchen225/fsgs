@@ -820,23 +820,32 @@ class StreamingGaussianState:
             delta_mean_world = delta_mean_camera @ rotation_c2w.transpose(0, 1)
 
             def aggregate(values: torch.Tensor) -> torch.Tensor:
-                values = values.reshape(-1, values.shape[-1])
-                flat_update_weight = update_weight.reshape(-1).to(values.dtype)
-                flat_support_weight = support_weight.reshape(-1).to(values.dtype)
+                # GIR normally runs under mixed precision.  In float16,
+                # 1e-8 used by the denominator clamp underflows to zero, so
+                # pixels with no valid contributor become 0/0 and poison the
+                # entire streaming state even when the predicted residual is
+                # exactly zero.  Accumulate and normalize in float32, then
+                # convert the finite update back to the Gaussian dtype.
+                output_dtype = values.dtype
+                values = values.reshape(-1, values.shape[-1]).float()
+                flat_update_weight = update_weight.reshape(-1).float()
+                flat_support_weight = support_weight.reshape(-1).float()
                 flat_indices = safe_indices.reshape(-1)
                 weighted = values * flat_update_weight.unsqueeze(-1)
                 index = flat_indices.unsqueeze(-1).expand(-1, values.shape[-1])
                 numerator = torch.zeros(
                     (n, values.shape[-1]),
                     device=values.device,
-                    dtype=values.dtype,
+                    dtype=torch.float32,
                 ).scatter_add(0, index, weighted)
                 denominator = torch.zeros(
                     n,
                     device=values.device,
-                    dtype=values.dtype,
+                    dtype=torch.float32,
                 ).scatter_add(0, flat_indices, flat_support_weight)
-                return numerator / denominator.clamp_min(1e-8).unsqueeze(-1)
+                return (
+                    numerator / denominator.clamp_min(1e-8).unsqueeze(-1)
+                ).to(output_dtype)
 
             mean_updates.append(aggregate(delta_mean_world))
 

@@ -69,6 +69,30 @@ class DatasetDL3DV(Dataset):
     near: float = 0.1
     far: float = 100.0
 
+    @staticmethod
+    def resolve_scene_dir(data_root, item):
+        item_path = os.path.join(data_root, item)
+        scene_name = item.split("/")[-1].split(".")[0]
+        candidates = [
+            os.path.join(item_path, scene_name),
+            os.path.join(item_path, "nerfstudio"),
+            item_path,
+        ]
+        if os.path.isdir(item_path):
+            for child in sorted(os.listdir(item_path)):
+                candidates.append(os.path.join(item_path, child))
+
+        seen = set()
+        for scene_path in candidates:
+            if scene_path in seen:
+                continue
+            seen.add(scene_path)
+            images_8_path = os.path.join(scene_path, "images_8")
+            transforms_path = os.path.join(scene_path, "transforms.json")
+            if os.path.isdir(images_8_path) and os.path.exists(transforms_path):
+                return scene_path, images_8_path, transforms_path
+        return None, None, None
+
     def __init__(
         self,
         cfg: DatasetDl3dvCfg,
@@ -100,36 +124,15 @@ class DatasetDL3DV(Dataset):
             if not isinstance(data_index, list):
                 raise TypeError(f"{index_path} must be a JSON array.")
 
-        def resolve_scene_dir(data_root, item):
-            item_path = os.path.join(data_root, item)
-            scene_name = item.split("/")[-1].split(".")[0]
-            candidates = [
-                os.path.join(item_path, scene_name),
-                os.path.join(item_path, "nerfstudio"),
-                item_path,
-            ]
-            if os.path.isdir(item_path):
-                for child in sorted(os.listdir(item_path)):
-                    candidates.append(os.path.join(item_path, child))
-
-            seen = set()
-            for scene_path in candidates:
-                if scene_path in seen:
-                    continue
-                seen.add(scene_path)
-                images_8_path = os.path.join(scene_path, "images_8")
-                transforms_path = os.path.join(scene_path, "transforms.json")
-                if os.path.isdir(images_8_path) and os.path.exists(transforms_path):
-                    return scene_path, images_8_path, transforms_path
-            return None, None, None
-
         def filter_data_list(data_index, data_root):
             data_list = []
 
             for item in data_index:
                 item = str(item)
                 item_path = os.path.join(data_root, item)
-                scene_path, images_8_path, transforms_path = resolve_scene_dir(data_root, item)
+                scene_path, images_8_path, transforms_path = self.resolve_scene_dir(
+                    data_root, item
+                )
                 if os.path.exists(item_path) and \
                    scene_path is not None and \
                    len(os.listdir(images_8_path)) > 0 and \

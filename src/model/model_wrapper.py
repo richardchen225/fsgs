@@ -117,7 +117,6 @@ class TrainCfg:
 
 
 def _camera_supervision_losses(
-    predicted_c2w: torch.Tensor,
     predicted_pose_encoding: torch.Tensor,
     target_c2w: torch.Tensor,
     target_intrinsics: torch.Tensor,
@@ -125,15 +124,22 @@ def _camera_supervision_losses(
     rotation_weight: float,
     focal_weight: float,
 ) -> dict[str, torch.Tensor]:
-    """Compare camera trajectories in each sequence's first-view frame."""
-    predicted_c2w = predicted_c2w.float()
+    """Supervise the camera encoding in the first-view coordinate frame.
+
+    Keep this path independent from the differentiable rendering camera. The
+    overfit experiment supervises the predicted camera parameters directly;
+    routing this loss through the full camera/intrinsics construction makes an
+    unstable early camera prediction produce non-finite gradients.
+    """
+    predicted_pose_encoding = predicted_pose_encoding.float()
     target_c2w = target_c2w.to(
-        device=predicted_c2w.device, dtype=predicted_c2w.dtype
+        device=predicted_pose_encoding.device,
+        dtype=predicted_pose_encoding.dtype,
     )
-    if predicted_c2w.shape[:2] != target_c2w.shape[:2]:
+    if predicted_pose_encoding.shape[:2] != target_c2w.shape[:2]:
         raise RuntimeError(
-            "Predicted and GT camera sequences have different shapes: "
-            f"predicted={tuple(predicted_c2w.shape)}, "
+            "Predicted camera encoding and GT camera sequence have different "
+            f"view counts: predicted={tuple(predicted_pose_encoding.shape)}, "
             f"gt={tuple(target_c2w.shape)}."
         )
     if predicted_pose_encoding.shape[:2] != target_intrinsics.shape[:2]:
@@ -143,13 +149,48 @@ def _camera_supervision_losses(
             f"gt={tuple(target_intrinsics.shape)}."
         )
 
-    predicted_relative = torch.linalg.inv(predicted_c2w[:, :1]) @ predicted_c2w
-    target_relative = torch.linalg.inv(target_c2w[:, :1]) @ target_c2w
+    # ZipMap encodes world-to-camera translation and rotation. Convert only
+    # these compact predictions to c2w components; this avoids any 4x4 matrix
+    # inverse or dependency on the render-camera construction.
+    raw_quaternion = predicted_pose_encoding[..., 3:7]
+    quaternion_norm = raw_quaternion.norm(dim=-1, keepdim=True)
+    quaternion = raw_quaternion / quaternion_norm.clamp_min(1e-6)
+    identity_quaternion = torch.zeros_like(quaternion)
+    identity_quaternion[..., 3] = 1.0
+    quaternion = torch.where(
+        quaternion_norm > 1e-6, quaternion, identity_quaternion
+    )
+    rotation_w2c = quat_to_mat(quaternion)
+    rotation_c2w = rotation_w2c.transpose(-1, -2)
+    translation_w2c = predicted_pose_encoding[..., :3]
+    translation_c2w = -torch.matmul(
+        rotation_c2w, translation_w2c.unsqueeze(-1)
+    ).squeeze(-1)
+
+    def relative_c2w(
+        rotation: torch.Tensor, translation: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        reference_rotation = rotation[:, :1]
+        reference_translation = translation[:, :1]
+        reference_rotation_t = reference_rotation.transpose(-1, -2)
+        relative_rotation = reference_rotation_t @ rotation
+        relative_translation = (
+            reference_rotation_t
+            @ (translation - reference_translation).unsqueeze(-1)
+        ).squeeze(-1)
+        return relative_rotation, relative_translation
+
+    predicted_relative_rotation, predicted_relative_translation = relative_c2w(
+        rotation_c2w, translation_c2w
+    )
+    target_relative_rotation, target_relative_translation = relative_c2w(
+        target_c2w[..., :3, :3], target_c2w[..., :3, 3]
+    )
     translation = F.smooth_l1_loss(
-        predicted_relative[..., :3, 3], target_relative[..., :3, 3]
+        predicted_relative_translation, target_relative_translation
     )
     rotation = F.mse_loss(
-        predicted_relative[..., :3, :3], target_relative[..., :3, :3]
+        predicted_relative_rotation, target_relative_rotation
     )
     target_intrinsics = target_intrinsics.to(
         device=predicted_pose_encoding.device,
@@ -163,7 +204,8 @@ def _camera_supervision_losses(
     )
     gt_fov = torch.stack([gt_fov_h, gt_fov_w], dim=-1)
     focal = F.smooth_l1_loss(
-        predicted_pose_encoding[..., 7:9].float(), gt_fov.float()
+        predicted_pose_encoding[..., 7:9].clamp(1e-3, math.pi - 1e-3),
+        gt_fov.float(),
     )
     total = (
         translation_weight * translation
@@ -238,11 +280,7 @@ class ModelWrapper(LightningModule):
         # Fixed loss networks are initialized from their own pretrained weights.
         state_dict = checkpoint["state_dict"]
         for key in list(state_dict):
-            if key.startswith((
-                "losses.",
-                "model.encoder.aggregator.network.point_decoder.",
-                "model.encoder.aggregator.network.point_head.",
-            )):
+            if key.startswith("losses."):
                 del state_dict[key]
 
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
@@ -255,17 +293,6 @@ class ModelWrapper(LightningModule):
         state_dict = checkpoint["state_dict"]
         for key, value in self.losses.state_dict(prefix="losses.").items():
             state_dict.setdefault(key, value)
-        # Like loss networks, the frozen ABot teacher is reconstructed from
-        # official pretrained weights; never fill missing trainable head keys.
-        encoder = getattr(getattr(self, "model", None), "encoder", None)
-        if encoder is not None and getattr(encoder.cfg, "reconstruction_backbone", None) == "abot":
-            network = encoder.aggregator.network
-            for name in ("point_decoder", "point_head"):
-                module = getattr(network, name, None)
-                if module is not None:
-                    prefix = f"model.encoder.aggregator.network.{name}."
-                    for key, value in module.state_dict(prefix=prefix).items():
-                        state_dict.setdefault(key, value)
 
     def _configure_training_stage(self) -> None:
         train_base_heads = bool(self.optimizer_cfg.train_base_heads)
@@ -307,6 +334,65 @@ class ModelWrapper(LightningModule):
             )
         if gir_head is not None:
             gir_head.requires_grad_(train_gir)
+
+            if train_gir:
+                # Keep the optimizer/DDP parameter set consistent with the
+                # streaming branches that are actually enabled.  The GIR
+                # head contains several independent output heads, but the
+                # current experiment trains only historical residuals.
+                new_residual_enabled = bool(
+                    getattr(
+                        self.model.encoder.cfg,
+                        "gir_new_residual_enabled",
+                        True,
+                    )
+                )
+                old_delete_enabled = bool(
+                    getattr(
+                        self.model.encoder.cfg,
+                        "gir_old_delete_enabled",
+                        False,
+                    )
+                )
+                old_decay_enabled = bool(
+                    getattr(
+                        self.model.encoder.cfg,
+                        "gir_old_decay_enabled",
+                        False,
+                    )
+                )
+
+                current_prediction = getattr(
+                    gir_head, "current_prediction", None
+                )
+                if current_prediction is not None and not new_residual_enabled:
+                    # current_prediction is only consumed by
+                    # apply_current_gaussian_residual(). When new-GS
+                    # residuals are disabled, its zero-valued regularizer is
+                    # not a meaningful training signal.
+                    current_prediction.requires_grad_(False)
+
+                delete_prediction = getattr(gir_head, "delete_prediction", None)
+                if (
+                    delete_prediction is not None
+                    and not old_delete_enabled
+                    and not old_decay_enabled
+                ):
+                    # delete_logit is only consumed by the delete/decay
+                    # branches. The graph anchor used for DDP consistency is
+                    # deliberately zero and must not keep this head trainable.
+                    delete_prediction.requires_grad_(False)
+
+                if not new_residual_enabled or (
+                    not old_delete_enabled and not old_decay_enabled
+                ):
+                    print(
+                        "GIR branch training: "
+                        f"historical_residual={bool(getattr(self.model.encoder.cfg, 'gir_old_residual_enabled', True))}, "
+                        f"new_residual={new_residual_enabled}, "
+                        f"delete={old_delete_enabled or old_decay_enabled}; "
+                        "disabled GIR heads are frozen"
+                    )
 
         if not train_base_heads and not train_gir:
             raise ValueError(
@@ -420,25 +506,6 @@ class ModelWrapper(LightningModule):
         )
         
         distill_infos = encoder_output.distill_infos
-        for metric, value in (encoder_output.infos or {}).items():
-            if metric.startswith("abot_alignment_"):
-                self.log(f"train/{metric}", value.float())
-        if (
-            encoder_output.infos is not None
-            and "gs_refine_history_views" in encoder_output.infos
-        ):
-            self.log(
-                "train/gs_refine_history_views",
-                encoder_output.infos["gs_refine_history_views"].float(),
-            )
-        if (
-            encoder_output.infos is not None
-            and "gs_refine_reprojection_gate" in encoder_output.infos
-        ):
-            self.log(
-                "train/gs_refine_reprojection_gate",
-                encoder_output.infos["gs_refine_reprojection_gate"].float(),
-            )
         if encoder_output.infos is not None and "gir_add_gate" in encoder_output.infos:
             self.log(
                 "train/gir_add_gate",
@@ -587,7 +654,8 @@ class ModelWrapper(LightningModule):
                         f"loss/{metric_name}",
                         encoder_output.infos[metric_name].item(),
                     )
-            total_loss = total_loss + gir_aux_weight * gir_aux_loss
+            if gir_aux_weight != 0.0:
+                total_loss = total_loss + gir_aux_weight * gir_aux_loss
         if (
             encoder_output.infos is not None
             and "gir_old_delete_budget_loss" in encoder_output.infos
@@ -599,10 +667,11 @@ class ModelWrapper(LightningModule):
                 self.model.encoder.cfg.gir_old_delete_budget_weight
             )
             self.log("loss/gir_old_delete_budget", old_delete_budget_loss.item())
-            total_loss = (
-                total_loss
-                + old_delete_budget_weight * old_delete_budget_loss
-            )
+            if old_delete_budget_weight != 0.0:
+                total_loss = (
+                    total_loss
+                    + old_delete_budget_weight * old_delete_budget_loss
+                )
         if (
             encoder_output.infos is not None
             and "gir_old_decay_budget_loss" in encoder_output.infos
@@ -614,9 +683,10 @@ class ModelWrapper(LightningModule):
                 self.model.encoder.cfg.gir_old_delete_budget_weight
             )
             self.log("loss/gir_old_decay_budget", old_decay_budget_loss.item())
-            total_loss = total_loss + (
-                old_decay_budget_weight * old_decay_budget_loss
-            )
+            if old_decay_budget_weight != 0.0:
+                total_loss = total_loss + (
+                    old_decay_budget_weight * old_decay_budget_loss
+                )
         if (
             encoder_output.infos is not None
             and "gir_history_adapt_loss" in encoder_output.infos
@@ -626,7 +696,8 @@ class ModelWrapper(LightningModule):
                 self.model.encoder.cfg.gir_history_adapt_weight
             )
             self.log("loss/gir_history_adapt", gir_history_adapt.item())
-            total_loss = total_loss + adapt_weight * gir_history_adapt
+            if adapt_weight != 0.0:
+                total_loss = total_loss + adapt_weight * gir_history_adapt
         if (
             encoder_output.infos is not None
             and "gir_history_preserve_loss" in encoder_output.infos
@@ -641,7 +712,8 @@ class ModelWrapper(LightningModule):
                 "loss/gir_history_preserve",
                 gir_history_preserve.item(),
             )
-            total_loss = total_loss + preserve_weight * gir_history_preserve
+            if preserve_weight != 0.0:
+                total_loss = total_loss + preserve_weight * gir_history_preserve
         if (
             encoder_output.infos is not None
             and "gir_add_rate_loss" in encoder_output.infos
@@ -651,9 +723,10 @@ class ModelWrapper(LightningModule):
                 self.model.encoder.cfg.gir_add_rate_loss_weight
             )
             self.log("loss/gir_add_rate", gir_add_rate_loss.item())
-            total_loss = (
-                total_loss + gir_add_rate_weight * gir_add_rate_loss
-            )
+            if gir_add_rate_weight != 0.0:
+                total_loss = (
+                    total_loss + gir_add_rate_weight * gir_add_rate_loss
+                )
         if (
             encoder_output.infos is not None
             and "gir_regularization_loss" in encoder_output.infos
@@ -663,7 +736,8 @@ class ModelWrapper(LightningModule):
                 self.model.encoder.cfg.gir_regularization_weight
             )
             self.log("loss/gir_regularization", gir_regularization.item())
-            total_loss = total_loss + regularization_weight * gir_regularization
+            if regularization_weight != 0.0:
+                total_loss = total_loss + regularization_weight * gir_regularization
 
         with torch.amp.autocast("cuda", enabled=False):
             depth_loss_idx = list(get_cfg()["loss"].keys()).index("depth")
@@ -671,8 +745,10 @@ class ModelWrapper(LightningModule):
             loss_depth_ctx = depth_loss_module.ctx_depth_loss(
                 depth_dict["depth"],
                 batch,
-                cxt_depth_weight=self.train_cfg.cxt_depth_weight,
-                teacher_depth=depth_dict.get("teacher_depth"),
+                cxt_depth_weight=(
+                    self.train_cfg.cxt_depth_weight
+                    * self.train_cfg.weight_depth
+                ),
             )
 
             self.log(
@@ -724,8 +800,7 @@ class ModelWrapper(LightningModule):
             if (
                 self.train_cfg.weight_pose != 0
                 and (
-                    predicted_context_c2w is None
-                    or predicted_context_pose_encoding is None
+                    predicted_context_pose_encoding is None
                     or gt_context_c2w is None
                     or gt_context_intrinsics is None
                 )
@@ -736,13 +811,12 @@ class ModelWrapper(LightningModule):
                     "the batch has no GT cameras."
                 )
             if (
-                predicted_context_c2w is not None
+                self.train_cfg.weight_pose != 0
                 and predicted_context_pose_encoding is not None
                 and gt_context_c2w is not None
                 and gt_context_intrinsics is not None
             ):
                 camera_losses = _camera_supervision_losses(
-                    predicted_context_c2w,
                     predicted_context_pose_encoding,
                     gt_context_c2w,
                     gt_context_intrinsics,
@@ -830,6 +904,21 @@ class ModelWrapper(LightningModule):
         if self.global_step % 50 == 0:
             gc.collect()
             torch.cuda.empty_cache()
+
+        encoder_cfg = getattr(getattr(get_cfg(), "model", None), "encoder", None)
+        if bool(getattr(encoder_cfg, "gir_debug_numerics", False)):
+            debug_losses = {"total": float(total_loss.detach().float().item())}
+            for key in (
+                "gir_regularization_loss",
+                "gir_aux_loss",
+                "gir_base_rgb_loss",
+                "gir_current_rgb_loss",
+                "gir_replay_rgb_loss",
+            ):
+                value = (encoder_output.infos or {}).get(key)
+                if value is not None:
+                    debug_losses[key] = float(value.detach().float().item())
+            self._gir_debug_losses = debug_losses
         
         return total_loss
 
@@ -874,6 +963,53 @@ class ModelWrapper(LightningModule):
                     f"[skip step] global_step={self.global_step}, "
                     f"bad_param={self._bad_grad_name}"
                 )
+                encoder_cfg = getattr(
+                    getattr(get_cfg(), "model", None), "encoder", None
+                )
+                if bool(getattr(encoder_cfg, "gir_debug_numerics", False)):
+                    print(
+                        f"[GIR DEBUG] losses={getattr(self, '_gir_debug_losses', {})}",
+                        flush=True,
+                    )
+                    gir_head = getattr(self.model, "gir_update_head", None)
+                    if gir_head is not None:
+                        for name, parameter in gir_head.named_parameters():
+                            if not parameter.requires_grad:
+                                continue
+                            value = parameter.detach().float()
+                            grad = parameter.grad
+                            if grad is None:
+                                print(
+                                    f"[GIR DEBUG] grad {name}: None "
+                                    f"param_absmax={value.abs().max().item():.6e}",
+                                    flush=True,
+                                )
+                                continue
+                            grad = grad.detach().float()
+                            finite = torch.isfinite(grad)
+                            finite_count = int(finite.sum().item())
+                            if finite_count > 0:
+                                finite_grad = grad[finite]
+                                grad_min = finite_grad.min().item()
+                                grad_max = finite_grad.max().item()
+                                grad_absmax = finite_grad.abs().max().item()
+                                grad_norm = torch.linalg.vector_norm(
+                                    finite_grad
+                                ).item()
+                            else:
+                                grad_min = float("nan")
+                                grad_max = float("nan")
+                                grad_absmax = float("nan")
+                                grad_norm = float("nan")
+                            print(
+                                f"[GIR DEBUG] grad {name}: "
+                                f"finite={finite_count}/{grad.numel()} "
+                                f"min={grad_min:.6e} max={grad_max:.6e} "
+                                f"absmax={grad_absmax:.6e} "
+                                f"norm={grad_norm:.6e} "
+                                f"param_absmax={value.abs().max().item():.6e}",
+                                flush=True,
+                            )
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
         # 如果这一轮梯度坏了：不更新参数，只清梯度
@@ -1008,7 +1144,7 @@ class ModelWrapper(LightningModule):
                     # decoder = self.model.decoder, 
                     name = batch['scene'],
                     target_view_count=target_view_count,
-                    return_refine_data=True,
+                    return_gir_data=True,
                     # global_rank = self.global_rank
                 )
                 gaussians = self.model._refine_gaussians(
@@ -1030,18 +1166,6 @@ class ModelWrapper(LightningModule):
                         self.test_cfg.gir_test_top1_confidence_floor
                     ),
                 )
-                if (
-                    encoder_output.infos is not None
-                    and "gs_refine_history_views" in encoder_output.infos
-                ):
-                    final_history = int(
-                        encoder_output.infos["gs_refine_history_views"].item()
-                    )
-                    if final_history != ctx_img_num - 1:
-                        raise RuntimeError(
-                            "GS refiner test rollout did not consume all causal context views: "
-                            f"history={final_history}, expected={ctx_img_num - 1}."
-                        )
                 if (
                     encoder_output.infos is not None
                     and "gir_history_views" in encoder_output.infos
@@ -1662,7 +1786,6 @@ class ModelWrapper(LightningModule):
         )
         scratch_keys = (
             "model.encoder.depth_refiner",
-            "model.gs_residual_refiner",
             "model.gir_update_head",
         )
 

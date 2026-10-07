@@ -4,7 +4,7 @@ import math
 import os
 from pathlib import Path
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Literal, Optional
 from einops import rearrange
 import torch
@@ -24,7 +24,6 @@ from src.model.encoder.vggt.utils.geometry import (
 import matplotlib.pyplot as plt
 from src.model.encoder.vggt.utils.pose_enc import (
     pose_encoding_to_extri_intri,
-    extri_intri_to_pose_encoding,
 )
 from torch import nn, Tensor
 from torch_scatter import scatter_add, scatter_max
@@ -44,7 +43,6 @@ from safetensors.torch import load_file
 root_path = os.path.abspath(".")
 sys.path.append(root_path)
 from src.model.encoder.vggt.models.vggt import VGGT
-from moge.model.v2 import MoGeModel
 # from src.model.encoder.lingbot_map.models.gct_stream import GCTStream
 
 inf = float("inf")
@@ -90,16 +88,12 @@ class EncoderAnySplatCfg:
     gs_keep_ratio: float = 1.0
     opacity_conf: bool = False
     # Model weights paths
-    reconstruction_backbone: Literal["zipmap", "abot"] = "zipmap"
-    abot_weights_path: Optional[str] = None
-    abot_pose_mode: Literal["single_pass", "two_pass"] = "two_pass"
-    depth_teacher: Literal["dav3", "abot"] = "dav3"
-    abot_feature_layers: list[int] = field(default_factory=lambda: [7, 17, 25, 35])
+    reconstruction_backbone: Literal["zipmap"] = "zipmap"
+    depth_teacher: Literal["dav3"] = "dav3"
     streamvggt_weights_path: Optional[str] = None
     zipmap_weights_path: Optional[str] = None
     zipmap_use_ema: bool = False
     zipmap_ttt_window_size: int = 1
-    moge_weights_path: Optional[str] = None
     depth_refine_enabled: bool = True
     depth_refine_iters: int = 4
     depth_refine_candidates: int = 9
@@ -110,16 +104,6 @@ class EncoderAnySplatCfg:
     depth_refine_geometry_neighbors: int = 2
     depth_refine_geometry_weight: float = 0.1
     num_test_context_views: Optional[int] = None
-    gs_refine_enabled: bool = True
-    gs_refine_iters: int = 4
-    gs_refine_render_scale: float = 0.25
-    gs_refine_hidden_dim: int = 64
-    gs_refine_step_opacity: float = 0.25
-    gs_refine_step_scale: float = 0.10
-    gs_refine_step_sh: float = 0.05
-    gs_refine_detach_evidence: bool = True
-    gs_refine_max_render_views: Optional[int] = None
-    gs_refine_geometry_neighbors: int = 2
     gir_enabled: bool = False
     gir_render_scale: float = 0.25
     gir_raster_evidence_enabled: bool = False
@@ -166,6 +150,8 @@ class EncoderAnySplatCfg:
     gir_add_gate_warmup_steps: int = 1000
     gir_add_rate_loss_weight: float = 0.01
     gir_regularization_weight: float = 1e-4
+    gir_debug_numerics: bool = False
+    gir_debug_numerics_max_views: int = 2
     # Match the overfit streaming boundary: detach the historical state before
     # each new view.  "means" matches the selected overfit setup: historical
     # positions are detached while appearance parameters keep their graph.
@@ -799,36 +785,14 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
 
     def __init__(self, cfg: EncoderAnySplatCfg) -> None:
         super().__init__(cfg)
-        if cfg.depth_teacher not in ("dav3", "abot"):
+        if cfg.depth_teacher != "dav3":
             raise ValueError(f"Unknown depth teacher: {cfg.depth_teacher}")
-        if cfg.depth_teacher == "abot" and cfg.reconstruction_backbone != "abot":
-            raise ValueError("loss.depth.teacher=abot requires reconstruction_backbone=abot.")
-        if cfg.reconstruction_backbone == "zipmap":
-            self._init_zipmap(cfg)
-        elif cfg.reconstruction_backbone == "abot":
-            from .abot_adapter import ABotBackboneAdapter
-
-            if cfg.abot_pose_mode not in ("single_pass", "two_pass"):
-                raise ValueError(f"Unknown ABot pose mode: {cfg.abot_pose_mode}")
-            print(f"ABot pose mode: {cfg.abot_pose_mode}")
-            if cfg.abot_weights_path is None:
-                raise ValueError("model.encoder.abot_weights_path must be set for ABot.")
-            self.aggregator = ABotBackboneAdapter(
-                cfg.abot_weights_path, tuple(cfg.abot_feature_layers),
-                enable_depth_teacher=cfg.depth_teacher == "abot" and cfg.mode == "train",
+        if cfg.reconstruction_backbone != "zipmap":
+            raise ValueError(
+                "Only reconstruction_backbone='zipmap' is supported in fsgs-main."
             )
-            # ABot's native camera decoder/head live inside the adapter.
-            self.camera_head = nn.Identity()
-        else:
-            raise ValueError(f"Unknown reconstruction backbone: {cfg.reconstruction_backbone}")
-        print(f"Reconstruction backbone: {cfg.reconstruction_backbone} (frozen)")
-
-        if cfg.moge_weights_path is None:
-            raise ValueError("model.encoder.moge_weights_path must be set before using EncoderAnySplat.")
-        print("Loading MoGe-2 model for intrinsics...")
-        self.moge_model = MoGeModel.from_pretrained(cfg.moge_weights_path).to("cuda").eval()
-        for param in self.moge_model.parameters():
-            param.requires_grad = False
+        self._init_zipmap(cfg)
+        print("Reconstruction backbone: zipmap (frozen)")
 
         for module in [self.aggregator, self.camera_head]:
             for param in module.parameters():
@@ -884,10 +848,9 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         global_step: int = 0,
         name: str = None,
         target_view_count: Optional[int] = None,
-        return_refine_data: bool = False,
+        return_gir_data: bool = False,
     ) -> Gaussians:
 
-        device = image.device
         b, v, _, h, w = image.shape
         if self.cfg.num_test_context_views is not None and self.cfg.mode != "train":
             ctx_img_num = min(int(self.cfg.num_test_context_views), v)
@@ -905,107 +868,44 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         infos = {}
         pred_all_extrinsic = None
         
-        abot_cameras = None
-        abot_alignment = {}
-        teacher_depth = None
-        collect_teacher_depth = (
-            self.cfg.depth_teacher == "abot" and self.cfg.mode == "train"
-            and self.training and torch.is_grad_enabled()
-        )
         with torch.no_grad():
-            if self.cfg.reconstruction_backbone == "abot":
-                if self.cfg.abot_pose_mode == "two_pass":
-                    abot_output = self.aggregator.forward_two_pass(
-                        image, ctx_img_num, ctx_index, return_depth=collect_teacher_depth
-                    )
-                    aggregated_tokens_list, patch_start_idx, abot_cameras, abot_alignment = abot_output[:4]
-                else:
-                    abot_output = self.aggregator(
-                        image, num_feature_views=ctx_img_num, return_depth=collect_teacher_depth
-                    )
-                    aggregated_tokens_list, patch_start_idx, abot_cameras = abot_output[:3]
-                if collect_teacher_depth:
-                    teacher_depth = abot_output[-1]
-                del abot_output
-                # ABot runs bf16; the existing DPT runs in float32 below.
-                aggregated_tokens_list = [tokens.float() for tokens in aggregated_tokens_list]
-            else:
-                with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
-                    aggregated_tokens_list, patch_start_idx = self.aggregator(
-                        image.to(torch.float16)
-                    )
+            with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
+                aggregated_tokens_list, patch_start_idx = self.aggregator(
+                    image.to(torch.float16)
+                )
 
         with torch.amp.autocast("cuda", enabled=False):
-            if abot_cameras is None:
-                pred_pose_enc_list = self.camera_head(aggregated_tokens_list)
-                last_pred_pose_enc = pred_pose_enc_list[-1]
-                raw_quaternion = last_pred_pose_enc[..., 3:7]
-                quaternion_norm = raw_quaternion.norm(dim=-1, keepdim=True)
-                identity_quaternion = torch.zeros_like(raw_quaternion)
-                # Camera quaternions use XYZW ordering (scalar last).
-                identity_quaternion[..., 3] = 1.0
-                safe_quaternion = torch.where(
-                    quaternion_norm > 1e-6,
-                    F.normalize(raw_quaternion, dim=-1, eps=1e-8),
-                    identity_quaternion,
-                )
-                safe_pose_enc = torch.cat(
-                    [
-                        last_pred_pose_enc[..., :3],
-                        safe_quaternion,
-                        last_pred_pose_enc[..., 7:9].clamp(
-                            1e-3, math.pi - 1e-3
-                        ),
-                    ],
-                    dim=-1,
-                )
-                pred_all_extrinsic, pred_all_intrinsic_px = (
-                    pose_encoding_to_extri_intri(
-                        safe_pose_enc, image.shape[-2:]
-                    )
-                )
-            else:
-                # ABot returns camera-to-world; this part of the encoder uses
-                # world-to-camera until the common conversion below.
-                pred_all_extrinsic = closed_form_inverse_se3(
-                    abot_cameras.flatten(0, 1)
-                ).reshape(b, v, 4, 4)[..., :3, :]
-            
-            # moge 
-            moge_out = self.moge_model.infer(
-                image[:,0],
-                fov_x=None,                         # None = 让 MoGe 自己估计 FOV / focal
-                use_fp16=(device.type == "cuda"),    # CUDA 上快一些
+            pred_pose_enc_list = self.camera_head(aggregated_tokens_list)
+            last_pred_pose_enc = pred_pose_enc_list[-1]
+            raw_quaternion = last_pred_pose_enc[..., 3:7]
+            quaternion_norm = raw_quaternion.norm(dim=-1, keepdim=True)
+            identity_quaternion = torch.zeros_like(raw_quaternion)
+            # Camera quaternions use XYZW ordering (scalar last).
+            identity_quaternion[..., 3] = 1.0
+            safe_quaternion = raw_quaternion / quaternion_norm.clamp_min(1e-6)
+            safe_quaternion = torch.where(
+                quaternion_norm > 1e-6, safe_quaternion, identity_quaternion
             )
-
-            K_norm = moge_out["intrinsics"].float()
-            if K_norm.dim() == 2:
-                K_norm = K_norm.unsqueeze(0)
-           
+            safe_pose_enc = torch.cat(
+                [
+                    last_pred_pose_enc[..., :3],
+                    safe_quaternion,
+                    last_pred_pose_enc[..., 7:9].clamp(
+                        1e-3, math.pi - 1e-3
+                    ),
+                ],
+                dim=-1,
+            )
+            pred_all_extrinsic, pred_all_intrinsic_px = (
+                pose_encoding_to_extri_intri(
+                    safe_pose_enc, image.shape[-2:]
+                )
+            )
             
             gt_ex = closed_form_inverse_se3(
                 pred_all_extrinsic[:, :ctx_img_num, ...].flatten(0, 1)
             )
 
-            K_px = K_norm.to(device=device, dtype=pred_all_extrinsic.dtype).clone()
-
-            K_px[:, 0, 0] = K_px[:, 0, 0] * w   # fx
-            K_px[:, 1, 1] = K_px[:, 1, 1] * h   # fy
-            K_px[:, 0, 2] = K_px[:, 0, 2] * w   # cx
-            K_px[:, 1, 2] = K_px[:, 1, 2] * h   # cy
-            # 把 fy 改成 fx
-            K_px[:, 1, 1] = K_px[:, 0, 0]
-
-            if abot_cameras is not None:
-                pred_all_intrinsic_px = K_px[:, None].expand(
-                    b, v, 3, 3
-                ).clone()
-                last_pred_pose_enc = extri_intri_to_pose_encoding(
-                    pred_all_extrinsic,
-                    pred_all_intrinsic_px,
-                    image_size_hw=(h, w),
-                )
-                pred_pose_enc_list = [last_pred_pose_enc]
             distill_infos["pred_pose_enc_list"] = last_pred_pose_enc
 
             # 复制成 [b, ctx_img_num, 3, 3]
@@ -1028,7 +928,9 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             # wrapper for GT camera supervision. Rendering may detach its own
             # camera copy later, but this tensor must remain attached.
             infos["pred_context_c2w"] = pred_all_extrinsic
-            infos["pred_context_pose_encoding"] = last_pred_pose_enc
+            # Supervise the same finite pose encoding used to build the
+            # differentiable camera matrices and intrinsics above.
+            infos["pred_context_pose_encoding"] = safe_pose_enc
 
             ctx_agg_token_list = [
                 token[:, :ctx_img_num, ...] for token in aggregated_tokens_list
@@ -1040,10 +942,22 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 image_size=(h, w),
             )
             del out_tmp
-            depth_for_loss = depth_map
+            # The DPT depth channel is exp(raw). Once raw becomes large, the
+            # exponential can overflow before the loss-level nan_to_num sees
+            # it. In that case the forward loss may look finite while exp's
+            # backward still produces inf * 0 -> NaN. Keep the depth attached
+            # for supervision, but make out-of-range values have zero local
+            # gradient before they reach either DAV3 or geometry.
+            depth_for_loss = torch.nan_to_num(
+                depth_map.float(),
+                nan=1e-4,
+                posinf=100.0,
+                neginf=1e-4,
+            ).clamp(1e-4, 100.0).to(depth_map.dtype)
+            depth_for_geometry = depth_for_loss
             depth_uncertainty = None
             if self.depth_refiner is not None:
-                depth_base = depth_map
+                depth_base = depth_for_geometry
                 depth_map, _, depth_uncertainty = self.depth_refiner(
                     out,
                     depth_base,
@@ -1052,6 +966,12 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                     intrinsics=gt_ix.detach(),
                     return_intermediate=False,
                 )
+                depth_for_geometry = torch.nan_to_num(
+                    depth_map.float(),
+                    nan=1e-4,
+                    posinf=100.0,
+                    neginf=1e-4,
+                ).clamp(1e-4, 100.0).to(depth_map.dtype)
 
         del aggregated_tokens_list, patch_start_idx
         torch.cuda.empty_cache()
@@ -1069,7 +989,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         )
         
         means = batchify_unproject_depth_map_to_point_map(
-            depth_map, gt_ex.detach(), gt_ix.detach()
+            depth_for_geometry, gt_ex.detach(), gt_ix.detach()
         )
         # means = means.reshape(b, v , h * w, 3).squeeze(0)
         # quats = quats.reshape(b, v , h * w, 4).squeeze(0)
@@ -1114,14 +1034,8 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         gaussians = {key_mapping.get(k, k): v for k, v in splats.items()}
         gaussians = Gaussians(**gaussians)
 
-        infos.update(
-            {
-                f"abot_alignment_{key}": value.mean()
-                for key, value in abot_alignment.items()
-            }
-        )
-        if self.cfg.gs_refine_enabled or self.cfg.gir_enabled:
-            infos["gs_refine"] = {
+        if self.cfg.gir_enabled:
+            infos["gir"] = {
                 "features": out,
                 "means": means_raw,
                 "quats": quats_raw,
@@ -1129,7 +1043,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 "opacities_raw": opacities_raw,
                 "res_sh_raw": res_sh_raw,
                 "base_sh": base_sh_raw,
-                "depth": depth_map,
+                "depth": depth_for_geometry,
                 "depth_conf": depth_conf,
                 "depth_uncertainty": depth_uncertainty,
                 "image_shape": (h, w),
@@ -1137,8 +1051,6 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 "sh_degree": self.sh_degree,
             }
         depth_dict = dict(depth=depth_for_loss)
-        if teacher_depth is not None:
-            depth_dict["teacher_depth"] = teacher_depth.detach()
         if depth_uncertainty is not None:
             depth_dict["depth_uncertainty"] = depth_uncertainty
 
@@ -1158,7 +1070,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         )
 
         if self.cfg.mode != "train":
-            if return_refine_data:
+            if return_gir_data:
                 return (
                     EncoderOutput(
                         gaussians=gaussians,

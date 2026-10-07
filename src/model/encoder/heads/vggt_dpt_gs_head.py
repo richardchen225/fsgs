@@ -9,6 +9,7 @@
 # for PixelwiseTask, the output will be of dimension B x num_channels x H x W
 # --------------------------------------------------------
 from typing import List
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -154,12 +155,15 @@ class VGGT_DPT_GS_Head(DPTHead):
         feat = out1.permute(0, 2, 3, 1)
         attr = feat[..., 0:1]
         # print(attr)
-        preds = torch.exp(attr)
+        # This head is trainable in fsgs-main. Bound the log-depth before the
+        # exponential so one outlier cannot create inf and poison every
+        # gradient through the shared DPT norm.
+        preds = torch.exp(attr.clamp(min=-10.0, max=math.log(100.0)))
         # print(preds)
         preds = preds.reshape(B, S, *preds.shape[1:])
         
         conf = feat[..., 1:2]
-        conf = 1 + conf.exp()
+        conf = 1 + torch.exp(conf.clamp(min=-10.0, max=math.log(100.0)))
         conf = conf.reshape(B, S, *conf.shape[1:])
         
         # off = feat[..., 2:]

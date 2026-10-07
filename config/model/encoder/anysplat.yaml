@@ -4,11 +4,8 @@ defaults:
 name: anysplat
 mode: ${mode}
 
-# Both branches use the same DPT, GS heads, MoGe intrinsics, and view order.
+# The encoder uses ZipMap features/cameras with the shared DPT and GS heads.
 reconstruction_backbone: zipmap
-abot_weights_path: weights/abot_recon.safetensors
-abot_pose_mode: two_pass
-abot_feature_layers: [7, 17, 25, 35]
 depth_teacher: ${oc.select:loss.depth.teacher,dav3}
 
 opacity_mapping:
@@ -81,6 +78,8 @@ gir_base_loss_weight: 1.0
 gir_current_loss_weight: 1.0
 gir_replay_loss_weight: 0.5
 gir_aux_loss_weight: 1.0
+gir_debug_numerics: false
+gir_debug_numerics_max_views: 2
 gir_historical_detach_mode: means
 gir_new_residual_enabled: false
 gir_residual_alpha_threshold: 0.02

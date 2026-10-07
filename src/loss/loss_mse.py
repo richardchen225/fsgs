@@ -34,6 +34,10 @@ class LossMse(Loss[LossMseCfg, LossMseCfgWrapper]):
     ) -> Float[Tensor, ""]:
         gt = (batch["context"]["image"] + 1) / 2
         pred = prediction.color
+        if self.cfg.weight_ctx == 0.0 and self.cfg.weight_novel == 0.0:
+            # Do not evaluate an RGB expression that may already contain a
+            # non-finite renderer value and only multiply it by zero later.
+            return torch.nan_to_num(pred).sum() * 0.0
         if pred.shape[:2] != gt.shape[:2]:
             raise ValueError(
                 "RGB prediction/context view count mismatch: "
@@ -54,11 +58,17 @@ class LossMse(Loss[LossMseCfg, LossMseCfgWrapper]):
                 f"source_views={source_views}, total_views={total_views}."
             )
 
-        source_loss = (pred[:, :source_views] - gt[:, :source_views]).square().mean()
+        if self.cfg.weight_ctx == 0.0:
+            source_loss = pred.new_zeros(())
+        else:
+            source_loss = (pred[:, :source_views] - gt[:, :source_views]).square().mean()
         if source_views < total_views:
-            heldout_loss = (
-                pred[:, source_views:] - gt[:, source_views:]
-            ).square().mean()
+            if self.cfg.weight_novel == 0.0:
+                heldout_loss = pred.new_zeros(())
+            else:
+                heldout_loss = (
+                    pred[:, source_views:] - gt[:, source_views:]
+                ).square().mean()
         else:
             heldout_loss = source_loss.new_zeros(())
 
