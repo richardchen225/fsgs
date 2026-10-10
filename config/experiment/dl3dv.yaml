@@ -33,7 +33,8 @@ model:
     gir_old_delete_temperature: 1.0
     gir_old_delete_min_observations: 2
     gir_old_delete_test_prune_enabled: true
-    gir_old_decay_enabled: false
+    # Predict one opacity-decay map for each of the top-4 contributors.
+    gir_old_decay_enabled: true
     gir_old_decay_topk: 4
     gir_old_decay_strength: 0.02
     gir_old_decay_prune_threshold: 0.005
@@ -146,6 +147,10 @@ loss:
   depth:
     teacher: dav3
     alignment: sequence_scale_only_log
+    # DAV3 is run independently per scene and aligned to that scene's GT
+    # camera trajectory scale before supervising predicted depth.
+    align_to_gt_camera_scale: true
+    absolute_log_scale_weight: 0.1
     weight: 1.0
     sigma_image: null
     use_second_derivative: false

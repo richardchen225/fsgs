@@ -62,6 +62,10 @@ class DominantGIR:
     dominant_weight: torch.Tensor
     contributor_ids: torch.Tensor | None = None
     contributor_weights: torch.Tensor | None = None
+    contributor_depth: torch.Tensor | None = None
+    contributor_opacity: torch.Tensor | None = None
+    contributor_scale: torch.Tensor | None = None
+    contributor_observation_count: torch.Tensor | None = None
 
     @classmethod
     def empty(
@@ -114,6 +118,7 @@ class GIRPrediction:
     rank_delta_opacity_logit: torch.Tensor | None = None
     rank_delta_harmonics: torch.Tensor | None = None
     rank_historical_gate: torch.Tensor | None = None
+    rank_decay_logits: torch.Tensor | None = None
 
 
 def apply_current_gaussian_residual(
@@ -480,19 +485,14 @@ class StreamingGaussianState:
         physical_prune: bool,
         prune_threshold: float,
     ) -> tuple["StreamingGaussianState", dict[str, torch.Tensor]]:
-        """Apply a soft, contributor-weighted opacity decay to old GS.
-
-        The pixel-level delete prediction is shared by all contributors of that
-        pixel. Contributor weights decide how much evidence each historical GS
-        receives; no historical geometry or appearance residual is written here.
-        """
+        """Apply contributor-conditioned soft opacity decay to historical GS."""
         b, n = self.gaussians.opacities.shape
         pixel_probability = torch.sigmoid(
             delete_logit.float() / max(float(temperature), 1e-4)
         )
-        if pixel_probability.shape[1] != 1:
+        if pixel_probability.dim() != 4 or pixel_probability.shape[0] != b:
             raise RuntimeError(
-                "Old-GS decay expects one pixel-level delete logit channel, "
+                "Old-GS decay expects logits shaped [B, K, H, W], "
                 f"got {tuple(pixel_probability.shape)}."
             )
 
@@ -503,7 +503,17 @@ class StreamingGaussianState:
             contributor_ids = gir.indices.unsqueeze(1)
             contributor_weights = gir.dominant_weight.unsqueeze(1)
 
+        requested_count = pixel_probability.shape[1]
         contributor_count = contributor_ids.shape[1]
+        if requested_count not in {1, contributor_count}:
+            if requested_count > contributor_count:
+                raise RuntimeError(
+                    "Old-GS decay received fewer contributors than decay maps: "
+                    f"maps={requested_count}, contributors={contributor_count}."
+                )
+            contributor_count = requested_count
+            contributor_ids = contributor_ids[:, :contributor_count]
+            contributor_weights = contributor_weights[:, :contributor_count]
         if contributor_weights.shape[:2] != contributor_ids.shape[:2]:
             raise RuntimeError(
                 "Old-GS decay contributor ID/weight shape mismatch: "
@@ -541,8 +551,14 @@ class StreamingGaussianState:
             )
             support = torch.where(valid, weights, torch.zeros_like(weights))
             safe_indices = point_indices.clamp_min(0).clamp_max(max(n - 1, 0))
-            pixel_probability_flat = pixel_probability[batch_idx, 0].reshape(1, -1)
-            pixel_probability_flat = pixel_probability_flat.expand_as(support)
+            if requested_count == 1:
+                pixel_probability_flat = pixel_probability[
+                    batch_idx, 0
+                ].reshape(1, -1).expand_as(support)
+            else:
+                pixel_probability_flat = pixel_probability[
+                    batch_idx, :contributor_count
+                ].reshape(contributor_count, -1)
 
             flat_indices = safe_indices.reshape(-1)
             flat_support = support.reshape(-1)
@@ -1078,6 +1094,18 @@ class GIRUpdateHead(nn.Module):
             kernel_size=1,
         )
         self.delete_prediction = nn.Conv2d(hidden_dim, 1, kernel_size=1)
+        contributor_evidence_dim = hidden_dim + 7
+        self.contributor_decay_prediction = nn.Sequential(
+            nn.Conv2d(
+                contributor_evidence_dim,
+                hidden_dim,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.GroupNorm(groups, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_dim, 1, kernel_size=1),
+        )
         nn.init.zeros_(self.prediction.weight)
         nn.init.zeros_(self.prediction.bias)
         with torch.no_grad():
@@ -1088,6 +1116,8 @@ class GIRUpdateHead(nn.Module):
         nn.init.zeros_(self.current_prediction.bias)
         nn.init.zeros_(self.delete_prediction.weight)
         nn.init.constant_(self.delete_prediction.bias, -4.0)
+        nn.init.zeros_(self.contributor_decay_prediction[-1].weight)
+        nn.init.constant_(self.contributor_decay_prediction[-1].bias, -4.0)
 
     def configure_historical_prediction_heads(self, num_heads: int) -> None:
         """Create independent historical heads for contributor ranks."""
@@ -1105,6 +1135,8 @@ class GIRUpdateHead(nn.Module):
         current_depth_confidence: torch.Tensor,
         gir: DominantGIR,
         num_historical_predictions: int = 1,
+        decay_gir: DominantGIR | None = None,
+        num_decay_predictions: int = 0,
     ) -> GIRPrediction:
         size = gir.depth.shape[-2:]
         current_feature = F.interpolate(
@@ -1123,31 +1155,39 @@ class GIRUpdateHead(nn.Module):
             align_corners=False,
         ).to(current_feature.dtype)
 
-        valid = gir.valid.to(current_feature.dtype)
-        historical_rgb = gir.rgb.to(current_feature.dtype)
-        historical_depth = (
-            gir.raster_depth if self.use_raster_evidence else gir.depth
-        ).to(current_feature.dtype)
-        relative_depth = (
-            (historical_depth - current_depth) / current_depth.clamp_min(1e-4)
-        ).clamp(-2.0, 2.0)
         log_depth = current_depth.clamp_min(1e-4).log().clamp(-8.0, 8.0)
-        evidence_parts = [
-            current_feature,
-            current_rgb,
-            historical_rgb,
-            current_rgb - historical_rgb,
-            log_depth,
-            relative_depth,
-            gir.opacity.to(current_feature.dtype),
-            gir.scale.to(current_feature.dtype),
-            current_depth_confidence,
-            valid,
-        ]
-        if self.use_raster_evidence:
-            evidence_parts.append(gir.raster_alpha.to(current_feature.dtype))
-        evidence = torch.cat(evidence_parts, dim=1)
-        encoded = self.encoder(evidence)
+
+        def encode_gir(evidence_gir: DominantGIR) -> torch.Tensor:
+            valid = evidence_gir.valid.to(current_feature.dtype)
+            historical_rgb = evidence_gir.rgb.to(current_feature.dtype)
+            historical_depth = (
+                evidence_gir.raster_depth
+                if self.use_raster_evidence
+                else evidence_gir.depth
+            ).to(current_feature.dtype)
+            relative_depth = (
+                (historical_depth - current_depth)
+                / current_depth.clamp_min(1e-4)
+            ).clamp(-2.0, 2.0)
+            evidence_parts = [
+                current_feature,
+                current_rgb,
+                historical_rgb,
+                current_rgb - historical_rgb,
+                log_depth,
+                relative_depth,
+                evidence_gir.opacity.to(current_feature.dtype),
+                evidence_gir.scale.to(current_feature.dtype),
+                current_depth_confidence,
+                valid,
+            ]
+            if self.use_raster_evidence:
+                evidence_parts.append(
+                    evidence_gir.raster_alpha.to(current_feature.dtype)
+                )
+            return self.encoder(torch.cat(evidence_parts, dim=1))
+
+        encoded = encode_gir(gir)
         base_prediction = self.prediction(encoded)
         base_splits = torch.split(
             base_prediction,
@@ -1193,10 +1233,105 @@ class GIRUpdateHead(nn.Module):
             dim=1,
         )
         delete_logit = self.delete_prediction(encoded)
+        rank_decay_logits = None
+        num_decay_predictions = max(0, int(num_decay_predictions))
+        if num_decay_predictions > 0:
+            decay_gir = gir if decay_gir is None else decay_gir
+            contributor_tensors = (
+                decay_gir.contributor_ids,
+                decay_gir.contributor_weights,
+                decay_gir.contributor_depth,
+                decay_gir.contributor_opacity,
+                decay_gir.contributor_scale,
+                decay_gir.contributor_observation_count,
+            )
+            if any(value is None for value in contributor_tensors):
+                raise RuntimeError(
+                    "Contributor-conditioned opacity decay requires per-rank "
+                    "IDs, weights, depth, opacity, scale, and observation count."
+                )
+            available_contributors = decay_gir.contributor_ids.shape[1]
+            if available_contributors < num_decay_predictions:
+                raise RuntimeError(
+                    "Opacity decay received fewer contributors than requested: "
+                    f"requested={num_decay_predictions}, "
+                    f"available={available_contributors}."
+                )
+
+            contributor_depth = decay_gir.contributor_depth[
+                :, :num_decay_predictions
+            ].to(current_feature.dtype)
+            contributor_opacity = decay_gir.contributor_opacity[
+                :, :num_decay_predictions
+            ].to(current_feature.dtype)
+            contributor_scale = decay_gir.contributor_scale[
+                :, :num_decay_predictions
+            ].to(current_feature.dtype)
+            contributor_weight = decay_gir.contributor_weights[
+                :, :num_decay_predictions
+            ].to(current_feature.dtype)
+            contributor_observations = decay_gir.contributor_observation_count[
+                :, :num_decay_predictions
+            ].to(current_feature.dtype)
+            contributor_valid = (
+                decay_gir.contributor_ids[:, :num_decay_predictions] >= 0
+            ).to(current_feature.dtype)
+            current_depth_rank = current_depth[:, 0].unsqueeze(1)
+            contributor_relative_depth = (
+                (contributor_depth - current_depth_rank)
+                / current_depth_rank.clamp_min(1e-4)
+            ).clamp(-2.0, 2.0)
+            contributor_features = torch.stack(
+                [
+                    contributor_depth.clamp_min(1e-4).log().clamp(-8.0, 8.0),
+                    contributor_relative_depth,
+                    contributor_opacity.clamp(0.0, 1.0),
+                    contributor_scale.clamp_min(1e-8).log().clamp(-12.0, 2.0),
+                    contributor_weight.clamp(0.0, 1.0),
+                    contributor_observations.clamp_min(0.0).log1p().clamp_max(8.0),
+                    contributor_valid,
+                ],
+                dim=2,
+            )
+            decay_encoded = (
+                encoded if decay_gir is gir else encode_gir(decay_gir)
+            )
+            batch_size, _, height, width = decay_encoded.shape
+            decay_encoded = decay_encoded[:, None].expand(
+                -1, num_decay_predictions, -1, -1, -1
+            )
+            decay_evidence = torch.cat(
+                [decay_encoded, contributor_features], dim=2
+            ).reshape(
+                batch_size * num_decay_predictions,
+                -1,
+                height,
+                width,
+            )
+            rank_decay_logits = self.contributor_decay_prediction(
+                decay_evidence
+            ).reshape(batch_size, num_decay_predictions, height, width)
+
         return GIRPrediction(
-            *historical_splits,
-            base_splits[6],
-            *current_splits,
-            delete_logit,
-            *rank_predictions,
+            delta_mean_camera=historical_splits[0],
+            delta_rotation=historical_splits[1],
+            delta_log_scale=historical_splits[2],
+            delta_opacity_logit=historical_splits[3],
+            delta_harmonics=historical_splits[4],
+            historical_gate=historical_splits[5],
+            add_logit=base_splits[6],
+            current_delta_mean_camera=current_splits[0],
+            current_delta_rotation=current_splits[1],
+            current_delta_log_scale=current_splits[2],
+            current_delta_opacity_logit=current_splits[3],
+            current_delta_harmonics=current_splits[4],
+            current_residual_gate=current_splits[5],
+            delete_logit=delete_logit,
+            rank_delta_mean_camera=rank_predictions[0],
+            rank_delta_rotation=rank_predictions[1],
+            rank_delta_log_scale=rank_predictions[2],
+            rank_delta_opacity_logit=rank_predictions[3],
+            rank_delta_harmonics=rank_predictions[4],
+            rank_historical_gate=rank_predictions[5],
+            rank_decay_logits=rank_decay_logits,
         )

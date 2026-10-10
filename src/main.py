@@ -31,6 +31,7 @@ def _print_gir_parameter_stats(model, enabled: bool) -> None:
         "prediction",
         "current_prediction",
         "delete_prediction",
+        "contributor_decay_prediction",
     ):
         module = getattr(gir_head, module_name, None)
         if module is None:
@@ -307,15 +308,23 @@ def train(cfg_dict: DictConfig):
             for key in model_state
             if any(key.startswith(prefix) for prefix in required_prefixes)
         }
-        delete_head_enabled = bool(
+        if not bool(
             getattr(cfg.model.encoder, "gir_old_delete_enabled", False)
-            or getattr(cfg.model.encoder, "gir_old_decay_enabled", False)
-        )
-        if not delete_head_enabled:
+        ):
             required_keys = {
                 key
                 for key in required_keys
                 if not key.startswith("gir_update_head.delete_prediction.")
+            }
+        if not bool(
+            getattr(cfg.model.encoder, "gir_old_decay_enabled", False)
+        ):
+            required_keys = {
+                key
+                for key in required_keys
+                if not key.startswith(
+                    "gir_update_head.contributor_decay_prediction."
+                )
             }
         missing_keys = sorted(required_keys - compatible_ckpt.keys())
         if missing_keys:

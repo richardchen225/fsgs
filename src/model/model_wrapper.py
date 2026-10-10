@@ -373,15 +373,19 @@ class ModelWrapper(LightningModule):
                     current_prediction.requires_grad_(False)
 
                 delete_prediction = getattr(gir_head, "delete_prediction", None)
+                if delete_prediction is not None and not old_delete_enabled:
+                    # The shared delete head is used only by hard deletion.
+                    # Soft decay has its own contributor-conditioned head.
+                    delete_prediction.requires_grad_(False)
+
+                contributor_decay_prediction = getattr(
+                    gir_head, "contributor_decay_prediction", None
+                )
                 if (
-                    delete_prediction is not None
-                    and not old_delete_enabled
+                    contributor_decay_prediction is not None
                     and not old_decay_enabled
                 ):
-                    # delete_logit is only consumed by the delete/decay
-                    # branches. The graph anchor used for DDP consistency is
-                    # deliberately zero and must not keep this head trainable.
-                    delete_prediction.requires_grad_(False)
+                    contributor_decay_prediction.requires_grad_(False)
 
                 if not new_residual_enabled or (
                     not old_delete_enabled and not old_decay_enabled
@@ -754,6 +758,16 @@ class ModelWrapper(LightningModule):
             self.log(
                 "loss/loss_depth_ctx",
                 loss_depth_ctx.item())
+            for component_name, component_value in getattr(
+                depth_loss_module, "last_depth_components", {}
+            ).items():
+                self.log(
+                    f"loss/{component_name}",
+                    component_value,
+                    on_step=True,
+                    on_epoch=False,
+                    sync_dist=True,
+                )
             # DAV3-vs-GT diagnostics are detached and are not part of the loss.
             # Lightning/W&B records these scalars as step curves automatically.
             for metric_name, metric_value in getattr(

@@ -29,6 +29,8 @@ class LossDepthCfg:
     dav3_weights_path: str | None = None
     teacher: Literal["dav3"] = "dav3"
     alignment: Literal["sequence_scale_only_log"] = "sequence_scale_only_log"
+    align_to_gt_camera_scale: bool = True
+    absolute_log_scale_weight: float = 0.1
 
 
 @dataclass
@@ -53,10 +55,26 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
                 "DAV3 depth supervision requires alignment="
                 "'sequence_scale_only_log'."
             )
-        print(f"Depth supervision: teacher={self.cfg.teacher}, {loss_kind}")
+        if self.cfg.absolute_log_scale_weight < 0:
+            raise ValueError("absolute_log_scale_weight must be non-negative.")
+        if (
+            self.cfg.absolute_log_scale_weight > 0
+            and not self.cfg.align_to_gt_camera_scale
+        ):
+            raise ValueError(
+                "absolute_log_scale_weight requires "
+                "align_to_gt_camera_scale=true; otherwise DAV3 depth has no "
+                "metric scale target."
+            )
+        print(
+            f"Depth supervision: teacher={self.cfg.teacher}, {loss_kind}, "
+            f"GT-camera-scale={self.cfg.align_to_gt_camera_scale}, "
+            f"absolute-log-scale-weight={self.cfg.absolute_log_scale_weight}"
+        )
         # Populated by ctx_depth_loss when the dataset provides context GT depth.
         # These detached values are diagnostics only and never enter the loss.
         self.last_teacher_gt_metrics: dict[str, torch.Tensor] = {}
+        self.last_depth_components: dict[str, torch.Tensor] = {}
         from .dav3.src.depth_anything_3.api import DepthAnything3
 
         if self.cfg.dav3_weights_path is None:
@@ -75,24 +93,88 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
     def _context_depth_target(self, depth_map: torch.Tensor, batch) -> torch.Tensor:
         B, V, _, H, W = batch["context"]["image"].shape
         ctx_num = depth_map.shape[1]
-        ctx_imgs = (
-            batch["context"]["image"][:, :ctx_num, ...]
-            .reshape(B * ctx_num, 3, H, W)
-            .float()
-        )
+        if ctx_num > V:
+            raise ValueError(
+                f"Requested {ctx_num} DAV3 views, but batch only has {V}."
+            )
+        ctx_imgs = batch["context"]["image"][:, :ctx_num].float()
+
+        gt_c2w = batch["context"].get("extrinsics")
+        gt_intrinsics = batch["context"].get("intrinsics")
+        if self.cfg.align_to_gt_camera_scale and (
+            gt_c2w is None or gt_intrinsics is None
+        ):
+            raise ValueError(
+                "GT-camera DAV3 alignment requires context extrinsics and "
+                "intrinsics in the batch."
+            )
 
         with torch.no_grad():
-            ctx_imgs_tmp = ctx_imgs.permute(0, 2, 3, 1).detach().cpu().numpy()
-            ctx_imgs_tmp = ((ctx_imgs_tmp + 1) / 2 * 255.0).astype(np.uint8)
-            ctx_imgs_list = [ctx_imgs_tmp[i] for i in range(ctx_imgs_tmp.shape[0])]
+            # DAV3 interprets its image list as one multiview sequence. Never
+            # flatten B and V here: with B=2 that would align two unrelated
+            # scenes to one camera trajectory and corrupt both depth scales.
+            scene_targets = []
+            for batch_idx in range(B):
+                scene_images = (
+                    ctx_imgs[batch_idx]
+                    .permute(0, 2, 3, 1)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+                scene_images = np.clip(
+                    (scene_images + 1.0) * 127.5, 0.0, 255.0
+                ).astype(np.uint8)
+                scene_image_list = [
+                    scene_images[view_idx] for view_idx in range(ctx_num)
+                ]
 
-            da_output, *ig = self.depth_anything.inference(ctx_imgs_list)
-            da_output = torch.from_numpy(da_output.depth).to(depth_map.device)
-            da_output = F.interpolate(
-                da_output[:, None], (H, W), mode="bilinear", align_corners=True
-            ).squeeze(1)
+                scene_w2c = None
+                scene_intrinsics_px = None
+                if self.cfg.align_to_gt_camera_scale:
+                    scene_c2w = gt_c2w[batch_idx, :ctx_num].detach().float()
+                    scene_w2c = torch.linalg.inv(scene_c2w).cpu().numpy()
+                    scene_intrinsics_px_tensor = (
+                        gt_intrinsics[batch_idx, :ctx_num]
+                        .detach()
+                        .float()
+                        .clone()
+                    )
+                    # Dataset intrinsics are normalized by image width/height;
+                    # DAV3's input processor expects pixel-space intrinsics.
+                    scene_intrinsics_px_tensor[:, 0, :] *= float(W)
+                    scene_intrinsics_px_tensor[:, 1, :] *= float(H)
+                    scene_intrinsics_px = scene_intrinsics_px_tensor.cpu().numpy()
 
-        return da_output
+                inference_output = self.depth_anything.inference(
+                    scene_image_list,
+                    extrinsics=scene_w2c,
+                    intrinsics=scene_intrinsics_px,
+                    align_to_input_ext_scale=self.cfg.align_to_gt_camera_scale,
+                )
+                prediction = (
+                    inference_output[0]
+                    if isinstance(inference_output, tuple)
+                    else inference_output
+                )
+                scene_depth = torch.from_numpy(prediction.depth).to(
+                    device=depth_map.device,
+                    dtype=torch.float32,
+                )
+                if scene_depth.shape[0] != ctx_num:
+                    raise RuntimeError(
+                        "DAV3 returned the wrong number of views for one "
+                        f"scene: expected={ctx_num}, got={scene_depth.shape[0]}."
+                    )
+                scene_depth = F.interpolate(
+                    scene_depth[:, None],
+                    (H, W),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(1)
+                scene_targets.append(scene_depth)
+
+        return torch.stack(scene_targets, dim=0)
 
     def ctx_depth_loss(
         self,
@@ -101,6 +183,7 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
         cxt_depth_weight: float = 0.01,
     ):
         self.last_teacher_gt_metrics = {}
+        self.last_depth_components = {}
         effective_weight = float(self.cfg.weight) * float(cxt_depth_weight)
 
         # Do not build the DAV3 graph when this branch is disabled. In
@@ -128,7 +211,7 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
                 "Expected depth_map with one channel, got "
                 f"{channels} channels."
             )
-        expected_shape = (batch_size * view_count, height, width)
+        expected_shape = (batch_size, view_count, height, width)
         if tuple(da_output.shape) != expected_shape:
             raise ValueError(
                 "DAV3 target shape does not match context depth shape: "
@@ -157,7 +240,18 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
             self.last_teacher_gt_metrics = self._teacher_gt_metrics(
                 target.detach().float(), gt_depth.detach().float()
             )
-        loss_local = self._sequence_scale_only_log_l1(prediction, target)
+        structure_loss, absolute_scale_loss = (
+            self._sequence_scale_only_log_components(prediction, target)
+        )
+        absolute_weight = float(self.cfg.absolute_log_scale_weight)
+        loss_local = structure_loss + absolute_weight * absolute_scale_loss
+        self.last_depth_components = {
+            "depth_structure": structure_loss.detach(),
+            "depth_absolute_log_scale": absolute_scale_loss.detach(),
+            "depth_absolute_log_scale_weighted": (
+                absolute_weight * absolute_scale_loss
+            ).detach(),
+        }
         return effective_weight * torch.nan_to_num(loss_local, nan=0.0)
 
     @staticmethod
@@ -270,6 +364,25 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
                 f"target={tuple(target.shape)}."
             )
 
+        structure_loss, _ = LossDepth._sequence_scale_only_log_components(
+            prediction, target
+        )
+        return structure_loss
+
+    @staticmethod
+    def _sequence_scale_only_log_components(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return scale-free structure and absolute sequence-scale losses."""
+        if prediction.shape != target.shape or prediction.dim() != 4:
+            raise ValueError(
+                "Expected prediction and target with matching shape "
+                "[B, V, H, W], got "
+                f"prediction={tuple(prediction.shape)}, "
+                f"target={tuple(target.shape)}."
+            )
+
         valid = (
             torch.isfinite(prediction)
             & torch.isfinite(target)
@@ -287,7 +400,23 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
             (log_error * valid_float).sum(dim=reduce_dims, keepdim=True) / count
         )
         centered_error = log_error - sequence_log_scale
-        return (centered_error.abs() * valid_float).sum() / valid_float.sum().clamp_min(1.0)
+        structure_loss = (
+            (centered_error.abs() * valid_float).sum()
+            / valid_float.sum().clamp_min(1.0)
+        )
+        valid_sequences = (
+            valid_float.sum(dim=reduce_dims, keepdim=True) > 0
+        ).to(log_error.dtype)
+        absolute_scale_loss = F.smooth_l1_loss(
+            sequence_log_scale,
+            torch.zeros_like(sequence_log_scale),
+            reduction="none",
+        )
+        absolute_scale_loss = (
+            (absolute_scale_loss * valid_sequences).sum()
+            / valid_sequences.sum().clamp_min(1.0)
+        )
+        return structure_loss, absolute_scale_loss
 
     def ctx_depth_sequence_loss(
         self,
@@ -307,9 +436,12 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
 
         losses = []
         for iter_idx in range(R):
-            loss_iter = self._sequence_scale_only_log_l1(
+            structure_loss, absolute_scale_loss = self._sequence_scale_only_log_components(
                 pred_depth[iter_idx].reshape(B, V, H, W),
                 da_output.reshape(B, V, H, W),
+            )
+            loss_iter = structure_loss + (
+                float(self.cfg.absolute_log_scale_weight) * absolute_scale_loss
             )
             losses.append(torch.nan_to_num(loss_iter, nan=0.0))
 

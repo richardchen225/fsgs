@@ -124,6 +124,8 @@ loss:
   depth:
     teacher: dav3
     alignment: sequence_scale_only_log
+    align_to_gt_camera_scale: true
+    absolute_log_scale_weight: 0.1
     weight: 1.0
     sigma_image: null
     use_second_derivative: false

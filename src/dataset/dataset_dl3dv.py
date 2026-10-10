@@ -133,18 +133,43 @@ class DatasetDL3DV(Dataset):
                 scene_path, images_8_path, transforms_path = self.resolve_scene_dir(
                     data_root, item
                 )
-                if os.path.exists(item_path) and \
-                   scene_path is not None and \
-                   len(os.listdir(images_8_path)) > 0 and \
-                   os.path.exists(transforms_path):
-                    with open(transforms_path, 'r') as f:
+                error = None
+                if not os.path.exists(item_path):
+                    error = f"scene item does not exist: {item_path}"
+                elif scene_path is None:
+                    error = (
+                        "could not find transforms.json and images_8 under "
+                        f"scene item: {item_path}"
+                    )
+                else:
+                    with open(transforms_path, "r", encoding="utf-8") as f:
                         transforms_data = json.load(f)
-                    if 'frames' in transforms_data:
-                        frames_length = len(transforms_data['frames'])
-                        images_8_files_count = len(os.listdir(images_8_path))
-                        if frames_length == images_8_files_count:
-                            scene_id = item.strip("/\\").replace("/", "_").replace("\\", "_")
-                            data_list.append((scene_path, scene_id))
+                    frames = transforms_data.get("frames")
+                    if not isinstance(frames, list) or not frames:
+                        error = f"no frames in {transforms_path}"
+                    else:
+                        missing_images = [
+                            str(image_8_path(Path(scene_path) / frame["file_path"]))
+                            for frame in frames
+                            if not image_8_path(
+                                Path(scene_path) / frame["file_path"]
+                            ).is_file()
+                        ]
+                        if missing_images:
+                            error = (
+                                f"missing {len(missing_images)} referenced images_8 "
+                                f"files; first missing file: {missing_images[0]}"
+                            )
+
+                if error is not None:
+                    if self.stage == "test":
+                        raise RuntimeError(
+                            f"Invalid DL3DV test scene {item!r}: {error}"
+                        )
+                    continue
+
+                scene_id = item.strip("/\\").replace("/", "_").replace("\\", "_")
+                data_list.append((scene_path, scene_id))
             return data_list
 
         if not scan_scenes:
@@ -177,6 +202,16 @@ class DatasetDL3DV(Dataset):
             f"DL3DV: {self.stage}: loaded {len(self.scene_ids)} scenes "
             f"({unique_scene_count} unique scene ids)"
         )
+        if (
+            self.stage == "test"
+            and cfg.test_expected_scenes is not None
+            and unique_scene_count != int(cfg.test_expected_scenes)
+        ):
+            raise RuntimeError(
+                "DL3DV test scene count mismatch: "
+                f"expected={cfg.test_expected_scenes}, "
+                f"loaded={len(self.scene_ids)}, unique={unique_scene_count}."
+            )
         if unique_scene_count != len(self.scene_ids):
             print(
                 f"WARNING: DL3DV {self.stage} has duplicated scene ids; "
@@ -339,8 +374,8 @@ class DatasetDL3DV(Dataset):
                 # Skip because the example doesn't have enough frames.
                 raise Exception("Not enough frames")
         else:
-            context_indices = self.cfg.ctx_list
-            target_indices = self.cfg.tgt_list
+            context_indices = torch.as_tensor(self.cfg.ctx_list, dtype=torch.long)
+            target_indices = torch.as_tensor(self.cfg.tgt_list, dtype=torch.long)
         
         if (get_fov(intrinsics).rad2deg() > self.cfg.max_fov).any():
             raise Exception("Field of view too wide")

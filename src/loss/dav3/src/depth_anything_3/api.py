@@ -206,7 +206,19 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         # Run model forward pass
         export_feat_layers = list(export_feat_layers) if export_feat_layers is not None else []
 
-        raw_output = self._run_model_forward(imgs, ex_t_norm, in_t, export_feat_layers, infer_gs)
+        # This local DAV3 build predicts cameras but does not instantiate the
+        # optional camera-conditioning encoder. Keep the input cameras for the
+        # post-inference scale alignment without feeding them into the backbone.
+        has_camera_encoder = getattr(self.model, "cam_enc", None) is not None
+        model_extrinsics = ex_t_norm if has_camera_encoder else None
+        model_intrinsics = in_t if has_camera_encoder else None
+        raw_output = self._run_model_forward(
+            imgs,
+            model_extrinsics,
+            model_intrinsics,
+            export_feat_layers,
+            infer_gs,
+        )
         pose_enc, c2w = raw_output.pose_enc, raw_output.c2w
         # Convert raw output to prediction
         prediction = self._convert_to_prediction(raw_output)

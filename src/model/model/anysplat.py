@@ -129,6 +129,42 @@ def _mask_gir(gir: DominantGIR, mask: torch.Tensor) -> DominantGIR:
                 torch.zeros_like(gir.contributor_weights),
             )
         ),
+        contributor_depth=(
+            None
+            if gir.contributor_depth is None
+            else torch.where(
+                mask,
+                gir.contributor_depth,
+                torch.zeros_like(gir.contributor_depth),
+            )
+        ),
+        contributor_opacity=(
+            None
+            if gir.contributor_opacity is None
+            else torch.where(
+                mask,
+                gir.contributor_opacity,
+                torch.zeros_like(gir.contributor_opacity),
+            )
+        ),
+        contributor_scale=(
+            None
+            if gir.contributor_scale is None
+            else torch.where(
+                mask,
+                gir.contributor_scale,
+                torch.zeros_like(gir.contributor_scale),
+            )
+        ),
+        contributor_observation_count=(
+            None
+            if gir.contributor_observation_count is None
+            else torch.where(
+                mask,
+                gir.contributor_observation_count,
+                torch.zeros_like(gir.contributor_observation_count),
+            )
+        ),
     )
 
 
@@ -341,6 +377,27 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 & (contributor_weights >= min_dominant_weight)
                 & (render_alpha > 1e-4)
             )
+            safe_contributor_ids = contributor_ids.clamp(
+                min=0, max=max(state.num_gaussians - 1, 0)
+            )
+            flat_contributor_ids = safe_contributor_ids.reshape(b, -1)
+
+            def gather_contributor_scalar(values: torch.Tensor) -> torch.Tensor:
+                return values.gather(1, flat_contributor_ids).reshape_as(
+                    safe_contributor_ids
+                )
+
+            means = state.gaussians.means.detach().float()
+            ones = torch.ones(
+                (b, state.num_gaussians, 1),
+                device=means.device,
+                dtype=means.dtype,
+            )
+            means_h = torch.cat([means, ones], dim=-1)
+            world_to_camera = torch.linalg.inv(camera_to_world.detach().float())
+            camera_points = torch.einsum("bij,bnj->bni", world_to_camera, means_h)
+            contributor_depth = gather_contributor_scalar(camera_points[..., 2])
+            contributor_valid = contributor_valid & (contributor_depth > 1e-5)
             gir.contributor_ids = torch.where(
                 contributor_valid,
                 contributor_ids,
@@ -351,6 +408,34 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 contributor_weights.to(gir.dominant_weight.dtype),
                 torch.zeros_like(contributor_weights).to(
                     gir.dominant_weight.dtype
+                ),
+            )
+            gir.contributor_depth = torch.where(
+                contributor_valid,
+                contributor_depth.to(gir.depth.dtype),
+                torch.zeros_like(contributor_depth).to(gir.depth.dtype),
+            )
+            gir.contributor_opacity = torch.where(
+                contributor_valid,
+                gather_contributor_scalar(state.gaussians.opacities).to(
+                    gir.opacity.dtype
+                ),
+                torch.zeros_like(contributor_weights).to(gir.opacity.dtype),
+            )
+            gir.contributor_scale = torch.where(
+                contributor_valid,
+                gather_contributor_scalar(
+                    state.gaussians.scales.norm(dim=-1)
+                ).to(gir.scale.dtype),
+                torch.zeros_like(contributor_weights).to(gir.scale.dtype),
+            )
+            gir.contributor_observation_count = torch.where(
+                contributor_valid,
+                gather_contributor_scalar(state.observation_count).to(
+                    gir.observation_count.dtype
+                ),
+                torch.zeros_like(contributor_weights).to(
+                    gir.observation_count.dtype
                 ),
             )
 
@@ -788,7 +873,10 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                         (low_h, low_w),
                         use_dominant_ids,
                         min_dominant_weight,
-                        residual_topk if old_residual_enabled else 1,
+                        max(
+                            residual_topk if old_residual_enabled else 1,
+                            old_decay_topk if old_decay_enabled else 1,
+                        ),
                     )
 
             if use_raster_evidence:
@@ -857,6 +945,12 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     residual_topk
                     if independent_residual_heads and old_residual_enabled
                     else 1
+                ),
+                decay_gir=gir,
+                num_decay_predictions=(
+                    old_decay_topk
+                    if old_decay_enabled and has_history
+                    else 0
                 ),
             )
             debug_view = debug_numerics and view_idx < debug_max_views
@@ -1058,9 +1152,14 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                         )
 
                 if old_decay_enabled:
+                    if prediction.rank_decay_logits is None:
+                        raise RuntimeError(
+                            "Top-k old-GS decay is enabled, but the GIR head "
+                            "did not return contributor-conditioned logits."
+                        )
                     state, decay_stats = state.decay_historical_opacity(
                         gir,
-                        prediction.delete_logit,
+                        prediction.rank_decay_logits,
                         min_observations=old_delete_min_observations,
                         temperature=old_delete_temperature,
                         decay_strength=old_decay_strength,

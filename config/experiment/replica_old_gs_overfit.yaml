@@ -1,0 +1,143 @@
+# @package _global_
+
+defaults:
+  - /dataset@_group_.dl3dv: dl3dv
+  - override /model/encoder: anysplat
+  - override /model/encoder/backbone: croco
+  - override /loss: [mse]
+
+mode: train
+
+model:
+  encoder:
+    mode: train
+    reconstruction_backbone: zipmap
+    zipmap_weights_path: weights/pre_zipmap.pt
+    gir_enabled: true
+    depth_refine_enabled: false
+    gir_render_scale: 1.0
+    gir_raster_evidence_enabled: true
+    gir_dominant_id_enabled: true
+    gir_dominant_min_weight: 1.0e-4
+    gir_old_residual_enabled: true
+    gir_old_delete_enabled: false
+    gir_old_decay_enabled: true
+    gir_old_decay_topk: 4
+    gir_old_decay_strength: 0.02
+    gir_old_decay_prune_threshold: 0.005
+    gir_add_gate_enabled: false
+
+toy:
+  # replica: RGB+EXR depth toy scene; dl3dv: RGB-only transforms.json scene.
+  dataset_type: replica
+  data_root: ${oc.env:REPLICA_TOY_ROOT,.}
+  transforms_path: null
+  image_dir: images_8
+  # DL3DV resize shape [height, width]. Both dimensions must be divisible by 14.
+  resize_shape: [252, 518]
+  checkpoint: weights/pre_wm.safetensors
+  dav3_weights_path: weights/pre_dav3.safetensors
+  train_frames: [28, 29]
+  # Each accepts one or more IDs. Loss frames receive gradients; test frames
+  # never do. The two groups should differ when measuring generalization.
+  heldout_loss_frame: [27]
+  heldout_test_frame: [27]
+  heldout_loss_enabled: true
+  max_replay_views: -1
+  max_steps: 3000
+  eval_every: 100
+  save_every: 500
+  save_checkpoints: false
+  mixed_precision: true
+  residual_enabled: true
+  # Scatter each pixel residual to its strongest K historical contributors.
+  # K=1 preserves the original dominant-GS update path.
+  residual_topk: 4
+  # Match the main pipeline: rank-specific residual heads and top-k write-back.
+  residual_contributor_conditioned: false
+  residual_independent_heads: true
+  residual_mean_enabled: true
+  residual_rotation_enabled: true
+  residual_scale_enabled: true
+  residual_opacity_enabled: true
+  residual_harmonics_enabled: true
+  raw_scale_residual: true
+  raw_opacity_residual: true
+  raw_rotation_residual: false
+  raw_harmonics_residual: false
+  # These switches control optimization. The source switches below independently
+  # choose which geometry is used to build and update the streaming GS map.
+  train_gaussian_param_head: true
+  train_gs_head: true
+  train_camera_head: true
+  train_depth_head: true
+  depth_loss_enabled: true
+  # gt: absolute metric Z-depth L1; dav3: structure + weak absolute log-scale.
+  depth_loss_target: dav3  # gt | dav3
+  dav3_align_to_gt_camera_scale: true
+  depth_absolute_log_scale_weight: 0.1
+  # Report DAV3 directly against Replica GT even when DAV3 is not the training target.
+  dav3_gt_metrics_enabled: true
+  camera_source: predicted  # gt | predicted
+  depth_source: predicted   # gt | predicted
+  detach_predicted_camera: false
+  detach_predicted_depth: false
+  # all: detach every historical GS parameter; means: detach positions only;
+  # none: preserve the complete cross-view graph. Current residual updates are
+  # applied after this boundary and remain differentiable for the current step.
+  historical_detach_mode: means  # all | means | none
+  # Append where the old map has no coverage or the current surface is closer.
+  append_new_gs_enabled: true
+  # logic: append uncovered/front surfaces only; all: append every valid pixel.
+  append_mode: all
+
+  # Contributor-conditioned top-4 soft opacity decay. Hard pruning is only
+  # applied during evaluation when explicitly enabled.
+  opacity_decay_enabled: true
+  opacity_decay_topk: 4
+  opacity_decay_strength: 0.02
+  opacity_decay_temperature: 1.0
+  opacity_decay_min_observations: 2
+  opacity_decay_target_ratio: 0.01
+  opacity_decay_budget_weight: 0.01
+  opacity_decay_warmup_steps: 1000
+  opacity_decay_test_prune_enabled: false
+  opacity_decay_prune_threshold: 0.005
+
+  gaussian_head_lr: 1.0e-5
+  gs_head_lr: 5.0e-5
+  residual_head_lr: 5.0e-5
+  camera_head_lr: 1.0e-5
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+
+  # The EXR must contain optical-axis Z depth. Use "ray" when it stores
+  # Euclidean camera-to-surface distance instead.
+  depth_type: z
+  alpha_threshold: 0.02
+  depth_relative_tolerance: 0.08
+  rgb_bad_threshold: 0.08
+  dominant_min_weight: 1.0e-4
+
+  loss_base_first: 1.0
+  loss_updated_current: 1.0
+  loss_new_holes: 1.0
+  loss_replay_history: 0.5
+  # Weight for either absolute GT depth or DAV3 structure + absolute log-scale.
+  loss_depth: 1.0e-2
+  loss_camera: 1.0
+  camera_translation_weight: 1.0
+  camera_rotation_weight: 1.0
+  camera_focal_weight: 1.0
+  loss_heldout: 1.0
+  loss_residual_regularization: 1.0e-4
+
+  mean_update_mode: absolute  # absolute | relative_depth
+  # Bounds used by the relative-depth mean mode and channels in bounded mode.
+  mean_relative_scale: 0.02
+  rotation_scale: 0.05
+  harmonics_scale: 0.10
+
+hydra:
+  run:
+    dir: outputs/replica_old_gs_overfit/${now:%Y-%m-%d_%H-%M-%S}
