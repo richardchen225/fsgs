@@ -37,7 +37,10 @@ from .utils.geometry import affine_inverse
 from .utils.io.input_processor import InputProcessor
 from .utils.io.output_processor import OutputProcessor
 from .utils.logger import logger
-from .utils.pose_align import align_poses_umeyama
+from .utils.pose_align import (
+    align_poses_umeyama,
+    estimate_scale_from_camera_baselines,
+)
 
 torch.backends.cudnn.benchmark = False
 # logger.info("CUDNN Benchmark Disabled")
@@ -348,18 +351,33 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         """Align depth map to input extrinsics"""
         if extrinsics is None:
             return prediction
-        prediction.intrinsics = intrinsics.numpy()
-        _, _, scale, aligned_extrinsics = align_poses_umeyama(
-            prediction.extrinsics,
-            extrinsics.numpy(),
-            ransac=len(extrinsics) >= ransac_view_thresh,
-            return_aligned=True,
-            random_state=42,
-        )
+        prediction.intrinsics = intrinsics.numpy() if intrinsics is not None else None
+        input_extrinsics = extrinsics.numpy()
         if align_to_input_ext_scale:
+            scale = estimate_scale_from_camera_baselines(
+                prediction.extrinsics,
+                input_extrinsics,
+            )
             prediction.extrinsics = extrinsics[..., :3, :].numpy()
-            prediction.depth /= scale
+            prediction.input_scale_alignment_valid = scale is not None
+            prediction.input_scale_alignment_scale = scale
+            if scale is None:
+                logger.warning(
+                    "Cannot align DAV3 depth to the input camera scale because "
+                    "the predicted or input camera trajectory has no valid "
+                    "baseline. Keeping the arbitrary DAV3 scale; callers must "
+                    "skip absolute-scale supervision for this sequence."
+                )
+            else:
+                prediction.depth /= scale
         else:
+            _, _, _, aligned_extrinsics = align_poses_umeyama(
+                prediction.extrinsics,
+                input_extrinsics,
+                ransac=len(extrinsics) >= ransac_view_thresh,
+                return_aligned=True,
+                random_state=42,
+            )
             prediction.extrinsics = aligned_extrinsics
         return prediction
 

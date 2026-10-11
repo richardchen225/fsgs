@@ -43,3 +43,5 @@ class Prediction:
     gaussians: Gaussians | None = None  # 3D gaussians
     aux: dict[str, Any] = None  #
     scale_factor: Optional[float] = None  # metric scale
+    input_scale_alignment_valid: bool = False
+    input_scale_alignment_scale: Optional[float] = None

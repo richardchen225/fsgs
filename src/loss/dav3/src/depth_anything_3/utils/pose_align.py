@@ -20,6 +20,66 @@ from evo.core.trajectory import PosePath3D
 from .geometry import affine_inverse, affine_inverse_np
 
 
+def estimate_scale_from_camera_baselines(
+    ext_ref: np.ndarray,
+    ext_est: np.ndarray,
+    eps: float = 1e-8,
+) -> float | None:
+    """Estimate the scale that maps ``ext_est`` camera centers to ``ext_ref``.
+
+    Unlike a full Umeyama alignment, this only uses pairwise camera-center
+    distances. It therefore remains well-defined for collinear or planar camera
+    trajectories, which are common in short multiview training samples.
+    """
+    ext_ref = np.asarray(ext_ref, dtype=np.float64)
+    ext_est = np.asarray(ext_est, dtype=np.float64)
+    if ext_ref.ndim != 3 or ext_est.ndim != 3 or len(ext_ref) != len(ext_est):
+        raise ValueError(
+            "Expected the same number of reference and estimated extrinsics, "
+            f"got ref={ext_ref.shape}, est={ext_est.shape}."
+        )
+    valid_shapes = ((3, 4), (4, 4))
+    if (
+        ext_ref.shape[-2:] not in valid_shapes
+        or ext_est.shape[-2:] not in valid_shapes
+    ):
+        raise ValueError(
+            "Expected extrinsics with shape [N, 3, 4] or [N, 4, 4], "
+            f"got ref={ext_ref.shape}, est={ext_est.shape}."
+        )
+    if len(ext_ref) < 2:
+        return None
+
+    def camera_centers(ext: np.ndarray) -> np.ndarray:
+        rotations = ext[:, :3, :3]
+        translations = ext[:, :3, 3]
+        return -np.einsum("nji,nj->ni", rotations, translations)
+
+    ref_centers = camera_centers(ext_ref)
+    est_centers = camera_centers(ext_est)
+    pair_i, pair_j = np.triu_indices(len(ext_ref), k=1)
+    ref_distances = np.linalg.norm(
+        ref_centers[pair_i] - ref_centers[pair_j], axis=-1
+    )
+    est_distances = np.linalg.norm(
+        est_centers[pair_i] - est_centers[pair_j], axis=-1
+    )
+    valid = (
+        np.isfinite(ref_distances)
+        & np.isfinite(est_distances)
+        & (ref_distances > eps)
+        & (est_distances > eps)
+    )
+    if not np.any(valid):
+        return None
+
+    ratios = ref_distances[valid] / est_distances[valid]
+    ratios = ratios[np.isfinite(ratios) & (ratios > eps)]
+    if ratios.size == 0:
+        return None
+    return float(np.median(ratios))
+
+
 def batch_apply_alignment_to_enc(
     rots: torch.Tensor, trans: torch.Tensor, scales: torch.Tensor, enc_list: List[torch.Tensor]
 ):
