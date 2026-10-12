@@ -79,6 +79,18 @@ def _normalize_checkpoint_state_dict(
     return normalized
 
 
+def _is_required_supervision_key(key: str) -> bool:
+    """Return whether a DAV3 parameter affects depth/camera supervision."""
+    if key.startswith(("backbone.", "cam_dec.")):
+        return True
+    if key.startswith("head."):
+        # The local DualDPT also predicts an auxiliary ray map.  LossDepth only
+        # consumes prediction.depth and the camera decoder output, so missing
+        # auxiliary-only parameters do not invalidate its teacher targets.
+        return "_aux" not in key
+    return False
+
+
 class DepthAnything3(nn.Module, PyTorchModelHubMixin):
     """
     Depth Anything 3 main API class.
@@ -140,7 +152,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             for prefix in required_prefixes
         }
         missing_required_keys = [
-            key for key in missing if key.startswith(required_prefixes)
+            key for key in missing if _is_required_supervision_key(key)
         ]
         if any(count == 0 for count in checkpoint_key_counts.values()) or (
             missing_required_keys
@@ -152,10 +164,14 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
                 f"missing_required_keys={missing_required_keys[:8]}"
             )
         if missing or unexpected:
+            missing_optional_keys = [
+                key for key in missing if not _is_required_supervision_key(key)
+            ]
             logger.info(
                 "Loaded DAV3 checkpoint with "
                 f"missing={len(missing)}, unexpected={len(unexpected)}; "
-                "all required branches are complete."
+                "all depth/camera supervision branches are complete. "
+                f"Missing optional keys={missing_optional_keys[:8]}"
             )
         self.model.eval()
         for param in self.model.parameters():

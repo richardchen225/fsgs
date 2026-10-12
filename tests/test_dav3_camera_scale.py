@@ -1,6 +1,7 @@
 import numpy as np
 
 from src.loss.dav3.src.depth_anything_3.api import (
+    _is_required_supervision_key,
     _normalize_checkpoint_state_dict,
 )
 from src.loss.dav3.src.depth_anything_3.utils.pose_align import (
@@ -24,6 +25,15 @@ def test_checkpoint_key_normalization_loads_legacy_camera_weights() -> None:
     assert normalized["backbone.pretrained.camera_token"] is trained_token
     assert "cam_dec.fc_qvec.weight" in normalized
     assert "cam_dec.backbone.0.weight" in normalized
+
+
+def test_auxiliary_ray_weights_are_optional_for_depth_supervision() -> None:
+    assert not _is_required_supervision_key(
+        "head.scratch.output_conv2_aux.3.2.weight"
+    )
+    assert _is_required_supervision_key("head.scratch.output_conv2.2.weight")
+    assert _is_required_supervision_key("cam_dec.fc_qvec.weight")
+    assert _is_required_supervision_key("backbone.pretrained.patch_embed.weight")
 
 
 def _w2c_from_centers(
