@@ -92,7 +92,7 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
 
     def _context_depth_target(
         self, depth_map: torch.Tensor, batch
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, V, _, H, W = batch["context"]["image"].shape
         ctx_num = depth_map.shape[1]
         if ctx_num > V:
@@ -117,6 +117,7 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
             # scenes to one camera trajectory and corrupt both depth scales.
             scene_targets = []
             scene_scale_valid = []
+            scene_scales = []
             for batch_idx in range(B):
                 scene_images = (
                     ctx_imgs[batch_idx]
@@ -169,6 +170,14 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
                         )
                     )
                 )
+                scene_scale = getattr(
+                    prediction,
+                    "input_scale_alignment_scale",
+                    None,
+                )
+                scene_scales.append(
+                    float(scene_scale) if scene_scale is not None else 0.0
+                )
                 scene_depth = torch.from_numpy(prediction.depth).to(
                     device=depth_map.device,
                     dtype=torch.float32,
@@ -192,6 +201,11 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
                 scene_scale_valid,
                 device=depth_map.device,
                 dtype=torch.bool,
+            ),
+            torch.tensor(
+                scene_scales,
+                device=depth_map.device,
+                dtype=torch.float32,
             ),
         )
 
@@ -223,8 +237,8 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
                 f"{self.cfg.alignment!r}."
             )
 
-        da_output, absolute_scale_valid = self._context_depth_target(
-            depth_map, batch
+        da_output, absolute_scale_valid, camera_scales = (
+            self._context_depth_target(depth_map, batch)
         )
         batch_size, view_count, height, width, channels = depth_map.shape
         if channels != 1:
@@ -270,6 +284,12 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
         )
         absolute_weight = float(self.cfg.absolute_log_scale_weight)
         loss_local = structure_loss + absolute_weight * absolute_scale_loss
+        valid_camera_scales = camera_scales[absolute_scale_valid]
+        camera_scale_median = (
+            valid_camera_scales.median()
+            if valid_camera_scales.numel() > 0
+            else camera_scales.new_zeros(())
+        )
         self.last_depth_components = {
             "depth_structure": structure_loss.detach(),
             "depth_absolute_log_scale": absolute_scale_loss.detach(),
@@ -278,6 +298,9 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
             ).detach(),
             "depth_camera_scale_alignment_valid_ratio": (
                 absolute_scale_valid.float().mean().detach()
+            ),
+            "depth_camera_scale_alignment_scale_median": (
+                camera_scale_median.detach()
             ),
         }
         return effective_weight * torch.nan_to_num(loss_local, nan=0.0)
@@ -470,7 +493,7 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
             return depth_iters.new_tensor(0.0)
 
         B, R, V, H, W, C = depth_iters.shape
-        da_output, absolute_scale_valid = self._context_depth_target(
+        da_output, absolute_scale_valid, _ = self._context_depth_target(
             depth_iters[:, -1], batch
         )
         pred_depth = depth_iters.permute(1, 0, 2, 3, 4, 5).reshape(R, B * V, H, W, C).squeeze(-1)

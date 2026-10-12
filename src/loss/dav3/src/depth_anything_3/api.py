@@ -39,6 +39,7 @@ from .utils.io.output_processor import OutputProcessor
 from .utils.logger import logger
 from .utils.pose_align import (
     align_poses_umeyama,
+    camera_trajectory_span,
     estimate_scale_from_camera_baselines,
 )
 
@@ -47,6 +48,35 @@ torch.backends.cudnn.benchmark = False
 
 SAFETENSORS_NAME = "model.safetensors"
 CONFIG_NAME = "config.json"
+
+
+def _normalize_checkpoint_state_dict(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Normalize both current and legacy DA3 checkpoint key layouts."""
+    normalized = {}
+    camera_token_overrides = {}
+    for key, value in state_dict.items():
+        while key.startswith(("module.", "model.")):
+            key = key.split(".", 1)[1]
+        is_camera_token_override = ".camera_token_extra" in key
+        key = key.replace(".camera_token_extra", ".camera_token")
+        if key.startswith("net."):
+            key = "backbone." + key[len("net.") :]
+        key = key.replace("all_heads.camera_cond_head", "cam_enc")
+        key = key.replace("all_heads.camera_head", "cam_dec")
+        key = key.replace("all_heads.head", "head")
+        key = key.replace(".more_mlps.", ".backbone.")
+        key = key.replace(".fc_rot.", ".fc_qvec.")
+        key = key.replace("output_conv2_additional.sky_mask", "sky_output_conv2")
+        key = key.replace("_ray.", "_aux.")
+        key = key.replace("gaussian_param_head.", "gs_head.")
+        if is_camera_token_override:
+            camera_token_overrides[key] = value
+        else:
+            normalized[key] = value
+    normalized.update(camera_token_overrides)
+    return normalized
 
 
 class DepthAnything3(nn.Module, PyTorchModelHubMixin):
@@ -102,15 +132,38 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         checkpoint_path = Path(checkpoint_path)
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"Depth Anything 3 checkpoint not found: {checkpoint_path}")
-        ckpt = load_file(str(checkpoint_path))
-        ckpt = {key.replace('model.', ''): value for key, value in ckpt.items()}
-        self.model.load_state_dict(ckpt, strict=False)
+        ckpt = _normalize_checkpoint_state_dict(load_file(str(checkpoint_path)))
+        missing, unexpected = self.model.load_state_dict(ckpt, strict=False)
+        required_prefixes = ("backbone.", "head.", "cam_dec.")
+        checkpoint_key_counts = {
+            prefix: sum(key.startswith(prefix) for key in ckpt)
+            for prefix in required_prefixes
+        }
+        missing_required_keys = [
+            key for key in missing if key.startswith(required_prefixes)
+        ]
+        if any(count == 0 for count in checkpoint_key_counts.values()) or (
+            missing_required_keys
+        ):
+            raise RuntimeError(
+                "DAV3 required weights were not fully loaded; depth supervision "
+                "or GT-camera scale alignment would be invalid. "
+                f"checkpoint_key_counts={checkpoint_key_counts}, "
+                f"missing_required_keys={missing_required_keys[:8]}"
+            )
+        if missing or unexpected:
+            logger.info(
+                "Loaded DAV3 checkpoint with "
+                f"missing={len(missing)}, unexpected={len(unexpected)}; "
+                "all required branches are complete."
+            )
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
  
         self.input_processor = InputProcessor()
         self.output_processor = OutputProcessor()
+        self._warned_invalid_input_scale = False
 
         # Device management (set by user)
         self.device = None
@@ -351,26 +404,48 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         """Align depth map to input extrinsics"""
         if extrinsics is None:
             return prediction
-        prediction.intrinsics = intrinsics.numpy() if intrinsics is not None else None
         input_extrinsics = extrinsics.numpy()
         if align_to_input_ext_scale:
-            scale = estimate_scale_from_camera_baselines(
-                prediction.extrinsics,
-                input_extrinsics,
+            scale = (
+                estimate_scale_from_camera_baselines(
+                    prediction.extrinsics,
+                    input_extrinsics,
+                )
+                if prediction.extrinsics is not None
+                else None
             )
-            prediction.extrinsics = extrinsics[..., :3, :].numpy()
             prediction.input_scale_alignment_valid = scale is not None
             prediction.input_scale_alignment_scale = scale
             if scale is None:
-                logger.warn(
-                    "Cannot align DAV3 depth to the input camera scale because "
-                    "the predicted or input camera trajectory has no valid "
-                    "baseline. Keeping the arbitrary DAV3 scale; callers must "
-                    "skip absolute-scale supervision for this sequence."
-                )
+                if not self._warned_invalid_input_scale:
+                    predicted_span = (
+                        camera_trajectory_span(prediction.extrinsics)
+                        if prediction.extrinsics is not None
+                        else None
+                    )
+                    input_span = camera_trajectory_span(input_extrinsics)
+                    logger.warn(
+                        "Cannot align DAV3 depth to the input camera scale "
+                        "because the predicted or input camera trajectory has "
+                        "no valid baseline "
+                        f"(predicted_span={predicted_span}, "
+                        f"input_span={input_span}). Keeping the complete DAV3 "
+                        "output "
+                        "in its original gauge; callers must skip absolute-scale "
+                        "supervision for such sequences. This warning is shown "
+                        "once per process."
+                    )
+                    self._warned_invalid_input_scale = True
             else:
+                prediction.intrinsics = (
+                    intrinsics.numpy() if intrinsics is not None else None
+                )
+                prediction.extrinsics = extrinsics[..., :3, :].numpy()
                 prediction.depth /= scale
         else:
+            prediction.intrinsics = (
+                intrinsics.numpy() if intrinsics is not None else None
+            )
             _, _, _, aligned_extrinsics = align_poses_umeyama(
                 prediction.extrinsics,
                 input_extrinsics,

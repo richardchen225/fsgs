@@ -20,6 +20,22 @@ from evo.core.trajectory import PosePath3D
 from .geometry import affine_inverse, affine_inverse_np
 
 
+def camera_trajectory_span(extrinsics: np.ndarray) -> float | None:
+    """Return the largest finite camera-center distance in a W2C trajectory."""
+    extrinsics = np.asarray(extrinsics, dtype=np.float64)
+    if extrinsics.ndim != 3 or extrinsics.shape[-2:] not in ((3, 4), (4, 4)):
+        return None
+    if len(extrinsics) < 2:
+        return 0.0
+    rotations = extrinsics[:, :3, :3]
+    translations = extrinsics[:, :3, 3]
+    centers = -np.einsum("nji,nj->ni", rotations, translations)
+    pair_i, pair_j = np.triu_indices(len(extrinsics), k=1)
+    distances = np.linalg.norm(centers[pair_i] - centers[pair_j], axis=-1)
+    distances = distances[np.isfinite(distances)]
+    return float(distances.max()) if distances.size else None
+
+
 def estimate_scale_from_camera_baselines(
     ext_ref: np.ndarray,
     ext_est: np.ndarray,
