@@ -362,7 +362,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             prediction.input_scale_alignment_valid = scale is not None
             prediction.input_scale_alignment_scale = scale
             if scale is None:
-                logger.warning(
+                logger.warn(
                     "Cannot align DAV3 depth to the input camera scale because "
                     "the predicted or input camera trajectory has no valid "
                     "baseline. Keeping the arbitrary DAV3 scale; callers must "
