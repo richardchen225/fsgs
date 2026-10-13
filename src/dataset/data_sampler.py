@@ -111,13 +111,13 @@ class BatchedRandomSampler:
 
 class DynamicBatchSampler(Sampler):
     """
-    A custom batch sampler that dynamically adjusts batch size, aspect ratio, and image number
-    for each sample. Batches within a sample share the same aspect ratio and image number.
+    A batch sampler that varies the view count while keeping the configured
+    image resolution fixed. Samples in one batch share the same view count.
     """
     def __init__(self,
                  sampler,
                  image_num_range,
-                 h_range,
+                 image_shape,
                  epoch=0,
                  seed=42,
                  max_img_per_gpu=48,
@@ -127,15 +127,25 @@ class DynamicBatchSampler(Sampler):
 
         Args:
             sampler: Instance of DynamicDistributedSampler.
-            aspect_ratio_range: List containing [min_aspect_ratio, max_aspect_ratio].
             image_num_range: List containing [min_images, max_images] per sample.
+            image_shape: Configured [height, width]. Both dimensions remain
+                fixed for every sampled batch.
             epoch: Current epoch number.
             seed: Random seed for reproducibility.
             max_img_per_gpu: Maximum number of images to fit in GPU memory.
         """
         self.sampler = sampler
         self.image_num_range = image_num_range
-        self.h_range = h_range
+        if len(image_shape) != 2:
+            raise ValueError(
+                f"image_shape must contain [height, width], got {image_shape}."
+            )
+        self.image_shape = tuple(int(value) for value in image_shape)
+        self.patch_height = self.image_shape[0] // 14
+        if self.patch_height <= 0:
+            raise ValueError(
+                f"Image height must be at least 14 pixels, got {self.image_shape[0]}."
+            )
         self.rng = random.Random()
         
         # Uniformly sample from the range of possible image numbers
@@ -180,9 +190,9 @@ class DynamicBatchSampler(Sampler):
   
         while True:
             try:
-                # Sample random image number and aspect ratio
+                # Sample the view count, but keep the configured image height.
                 # Use the sampler-local RNG so every DDP rank, seeded with the
-                # same epoch, executes the same view-count and resolution graph.
+                # same epoch, executes the same view-count graph.
                 random_image_num = int(
                     self.rng.choices(
                         self.possible_nums.tolist(),
@@ -190,15 +200,12 @@ class DynamicBatchSampler(Sampler):
                         k=1,
                     )[0]
                 )
-                random_ps_h = self.rng.randint(
-                    self.h_range[0] // 14,
-                    self.h_range[1] // 14,
-                )
+                patch_height = self.patch_height
 
                 # Update sampler parameters
                 self.sampler.update_parameters(
                     image_num=random_image_num,
-                    ps_h=random_ps_h
+                    ps_h=patch_height
                 )
                 
                 if self.fixed_batch_size is None:
@@ -232,8 +239,8 @@ class DynamicBatchSampler(Sampler):
 
 class DynamicDistributedSampler(DistributedSampler):
     """
-    Extends PyTorch's DistributedSampler to include dynamic aspect_ratio and image_num
-    parameters, which can be passed into the dataset's __getitem__ method.
+    Extends PyTorch's DistributedSampler with the sampled view count and fixed
+    patch height passed to the dataset's __getitem__ method.
     """
     def __init__(
         self,
@@ -257,7 +264,7 @@ class DynamicDistributedSampler(DistributedSampler):
 
     def __iter__(self):
         """
-        Yields a sequence of (index, image_num, aspect_ratio).
+        Yields a sequence of (index, image_num, patch_height).
         Relies on the parent class's logic for shuffling/distributing
         the indices across replicas, then attaches extra parameters.
         """
@@ -271,8 +278,8 @@ class DynamicDistributedSampler(DistributedSampler):
         Updates dynamic parameters for each new epoch or iteration.
 
         Args:
-            aspect_ratio: The aspect ratio to set.
             image_num: The number of images to set.
+            ps_h: The output height measured in 14-pixel patches.
         """
         self.image_num = image_num
         self.ps_h = ps_h

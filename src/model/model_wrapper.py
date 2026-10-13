@@ -34,6 +34,7 @@ from ..evaluation.benchmark_io import summarize_scenes, write_results
 from ..global_cfg import get_cfg
 from ..loss import Loss
 from ..misc.benchmarker import Benchmarker
+from ..misc.cuda_memory import log_cuda_memory, reset_cuda_peak_memory
 from ..misc.image_io import prep_image, save_image, save_video
 from ..misc.LocalLogger import LOG_PATH, LocalLogger
 from ..misc.nn_module_tools import convert_to_buffer
@@ -518,6 +519,16 @@ class ModelWrapper(LightningModule):
         batch: BatchedExample = self.data_shim(batch)
         b, v, c, h, w = batch["context"]["image"].shape
         context_image = (batch["context"]["image"] + 1) / 2
+        reset_cuda_peak_memory()
+        log_cuda_memory(
+            "training_step_start",
+            step=int(self.global_step),
+            batch=b,
+            views=v,
+            height=h,
+            width=w,
+            scene=batch.get("scene"),
+        )
         if (
             self.global_rank == 0
             and self.train_cfg.print_log_every_n_steps > 0
@@ -553,6 +564,11 @@ class ModelWrapper(LightningModule):
 
 #             return total_loss
         encoder_output, output = self.model(context_image, batch["context"]["index"], self.global_step)
+        log_cuda_memory(
+            "after_model_forward",
+            step=int(self.global_step),
+            map_gs=int(encoder_output.gaussians.means.shape[1]),
+        )
         gaussians, pred_pose_enc_list, depth_dict = (
             encoder_output.gaussians,
             encoder_output.pred_pose_enc_list,
@@ -815,6 +831,7 @@ class ModelWrapper(LightningModule):
                     * self.train_cfg.weight_depth
                 ),
             )
+            log_cuda_memory("after_depth_loss", step=int(self.global_step))
 
             self.log(
                 "loss/loss_depth_ctx",
@@ -858,6 +875,10 @@ class ModelWrapper(LightningModule):
                 if loss_fn.name == "depth":
                     break
                 loss = loss_fn.forward(output, batch, gaussians, depth_dict, self.global_step)
+                log_cuda_memory(
+                    f"after_{loss_fn.name}_loss",
+                    step=int(self.global_step),
+                )
                 self.log(f"loss/{loss_fn.name}", loss.item())
                 total_loss = total_loss + loss
 
@@ -996,9 +1017,11 @@ class ModelWrapper(LightningModule):
                     debug_losses[key] = float(value.detach().float().item())
             self._gir_debug_losses = debug_losses
         
+        log_cuda_memory("training_step_return", step=int(self.global_step))
         return total_loss
 
     def on_after_backward(self):
+        log_cuda_memory("after_backward", step=int(self.global_step))
         # Keep DDP's strict unused-parameter check enabled. If a future graph
         # change disconnects a trainable branch, print exact names before DDP
         # raises on the next forward pass.
@@ -1097,6 +1120,7 @@ class ModelWrapper(LightningModule):
 
         # 正常情况才 step
         optimizer.step(closure=optimizer_closure)
+        log_cuda_memory("after_optimizer_step", step=int(self.global_step))
         self._skip_optimizer_step = False
         self._bad_grad_name = None
     def optimizer_zero_grad(self, epoch, batch_idx, optimizer):

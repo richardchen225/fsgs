@@ -33,6 +33,7 @@ from src.model.encoder.anysplat import (
     EncoderAnySplatCfg,
     OpacityMappingCfg,
 )
+from src.misc.cuda_memory import log_cuda_memory
 
 
 def _group_count(channels: int, max_groups: int = 8) -> int:
@@ -1117,8 +1118,21 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                         getattr(cfg, "gir_projected_chunk_size", 65536)
                     ),
                 )
+                log_cuda_memory(
+                    "gir_projected_evidence",
+                    step=global_step,
+                    view=f"{view_idx + 1}/{source_views}",
+                    state_gs=state.num_gaussians,
+                    projected_candidates=int(projected_evidence.descriptor.shape[0]),
+                )
                 projected_prediction = self.gir_projected_update_head(
                     projected_evidence
+                )
+                log_cuda_memory(
+                    "gir_projected_prediction",
+                    step=global_step,
+                    view=f"{view_idx + 1}/{source_views}",
+                    projected_candidates=int(projected_evidence.descriptor.shape[0]),
                 )
 
             prediction = self.gir_update_head(
@@ -1843,6 +1857,13 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     point_map=refine_info["means"][:, view_idx],
                 )
 
+            log_cuda_memory(
+                "gir_after_append",
+                step=global_step,
+                view=f"{view_idx + 1}/{source_views}",
+                state_gs=state.num_gaussians,
+            )
+
             if debug_view:
                 _gir_debug_tensor(
                     f"step={global_step} view={view_idx} state.means",
@@ -1923,6 +1944,25 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     replay_rgb_losses.append(
                         difference[:, :-1].square().mean()
                     )
+
+            projected_candidate_count = (
+                int(projected_evidence.descriptor.shape[0])
+                if projected_evidence is not None
+                else 0
+            )
+            append_selected = (
+                int(point_append_mask.sum().item())
+                if point_append_mask is not None
+                else 0
+            )
+            log_cuda_memory(
+                "gir_view_end",
+                step=global_step,
+                view=f"{view_idx + 1}/{source_views}",
+                state_gs=state.num_gaussians,
+                projected_candidates=projected_candidate_count,
+                append_selected=append_selected,
+            )
 
             # Truncated BPTT for the streaming map. The loss for the current
             # view has already been built above, so cutting here prevents a
@@ -2335,6 +2375,12 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             global_step,
         )
         encoder_output.gaussians = gaussians
+        log_cuda_memory(
+            "before_final_render",
+            step=global_step,
+            map_gs=int(gaussians.means.shape[1]),
+            render_views=v,
+        )
 
         # num_context_view = ctx_img_num
         # pred_all_context_extrinsic, pred_all_target_extrinsic = (
@@ -2371,6 +2417,12 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             torch.ones(b, v, device=device) * far,
             (h, w),
             "depth",
+        )
+        log_cuda_memory(
+            "after_final_render",
+            step=global_step,
+            map_gs=int(gaussians.means.shape[1]),
+            render_views=v,
         )
         output.depth = output.depth[:, :ctx_img_num, ...]
 
