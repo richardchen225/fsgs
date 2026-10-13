@@ -46,6 +46,14 @@ scaffold: true
 gir_top1_confidence_mode: none
 gir_top1_confidence_floor: 0.25
 gir_old_residual_enabled: true
+gir_old_update_mode: pixel_topk
+gir_projected_hidden_dim: 128
+gir_projected_chunk_size: 65536
+gir_projected_min_radius: 0.1
+gir_projected_covariance_sigma: 3.0
+gir_projected_opacity_logit_scale: 1.0
+gir_projected_front_decay_strength: 0.02
+gir_projected_warmup_steps: 1000
 gir_old_delete_enabled: false
 gir_old_delete_warmup_steps: 1000
 gir_old_delete_target_ratio: 0.01
@@ -60,7 +68,8 @@ gir_old_decay_strength: 0.02
 gir_old_decay_prune_threshold: 0.005
 gir_residual_topk: 4
 gir_residual_independent_heads: true
-# Match the selected overfit residual parameterization.
+# Absolute means use raw camera-space output and ignore gir_mean_relative_scale;
+# relative_depth uses tanh(output) * gir_mean_relative_scale * depth.
 gir_mean_update_mode: absolute
 gir_raw_scale_residual: true
 gir_raw_opacity_residual: true
@@ -69,13 +78,18 @@ gir_raw_harmonics_residual: false
 gir_mean_relative_scale: 0.02
 gir_rotation_scale: 0.05
 gir_harmonics_scale: 0.10
-# Keep every valid current-view Gaussian when it is appended to the stream.
-# New-GS suppression is disabled for the current ablation.
+# New-GS append policy. point_map ignores Gaussian footprints and only appends
+# pixels without a depth-consistent historical point.
+gir_append_mode: all  # all | point_map | learned
+gir_point_append_depth_relative_tolerance: 0.08
+gir_point_append_dilation_radius: 1
+gir_point_append_chunk_size: 65536
 gir_add_gate_enabled: false
 gir_add_gate_warmup_steps: 1000
 gir_add_rate_loss_weight: 0.0
 gir_base_loss_weight: 1.0
 gir_current_loss_weight: 1.0
+gir_new_hole_loss_weight: 1.0
 gir_replay_loss_weight: 0.5
 gir_aux_loss_weight: 1.0
 gir_debug_numerics: false

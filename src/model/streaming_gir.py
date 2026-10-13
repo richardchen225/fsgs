@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.model.encoder import sh_utils
+from src.model.encoder.common.gaussians import build_covariance
 from src.model.types import Gaussians
 
 
@@ -121,6 +122,524 @@ class GIRPrediction:
     rank_decay_logits: torch.Tensor | None = None
 
 
+@dataclass
+class ProjectedGSEvidence:
+    descriptor: torch.Tensor
+    flat_candidate_indices: torch.Tensor
+    candidate_mask: torch.Tensor
+    surface_consistent: torch.Tensor
+    old_in_front: torch.Tensor
+    projected_radius: torch.Tensor
+    relative_depth: torch.Tensor
+    camera_depth: torch.Tensor
+
+
+@dataclass
+class ProjectedGSResidualPrediction:
+    delta_mean_camera: torch.Tensor
+    delta_rotation: torch.Tensor
+    delta_log_scale: torch.Tensor
+    delta_opacity_logit: torch.Tensor
+    delta_harmonics: torch.Tensor
+    front_decay_logit: torch.Tensor
+    update_gate_logit: torch.Tensor
+
+
+PROJECTED_GS_STATE_DIM = 30
+
+
+@torch.no_grad()
+def build_point_map_append_mask(
+    state: "StreamingGaussianState",
+    current_depth: torch.Tensor,
+    camera_to_world: torch.Tensor,
+    intrinsics: torch.Tensor,
+    depth_relative_tolerance: float = 0.08,
+    dilation_radius: int = 1,
+    chunk_size: int = 65536,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Find current pixels without a depth-consistent historical point.
+
+    Historical Gaussian centers are treated strictly as a point map. Gaussian
+    scale, opacity, covariance, and rasterized alpha do not affect coverage.
+    """
+    if current_depth.ndim == 3:
+        current_depth = current_depth.unsqueeze(1)
+    b, channels, h, w = current_depth.shape
+    if channels != 1 or state.batch_size != b:
+        raise ValueError(
+            "Point-map append expects depth [B,1,H,W] matching the state; "
+            f"got depth={tuple(current_depth.shape)}, batch={state.batch_size}."
+        )
+    if camera_to_world.shape != (b, 4, 4):
+        raise ValueError(
+            "Point-map append expects camera_to_world [B,4,4], got "
+            f"{tuple(camera_to_world.shape)}."
+        )
+    if intrinsics.shape != (b, 3, 3):
+        raise ValueError(
+            "Point-map append expects intrinsics [B,3,3], got "
+            f"{tuple(intrinsics.shape)}."
+        )
+
+    device = current_depth.device
+    depth = current_depth.detach().float()
+    valid_current = torch.isfinite(depth) & (depth > 1e-5)
+    depth_flat = depth[:, 0].reshape(b, h * w)
+    coverage_count = torch.zeros(
+        (b, h * w), device=device, dtype=torch.float32
+    )
+    world_to_camera = torch.linalg.inv(camera_to_world.detach().float())
+    fx = intrinsics[:, 0, 0].detach().float().unsqueeze(1) * w
+    fy = intrinsics[:, 1, 1].detach().float().unsqueeze(1) * h
+    cx = intrinsics[:, 0, 2].detach().float().unsqueeze(1) * w
+    cy = intrinsics[:, 1, 2].detach().float().unsqueeze(1) * h
+    tolerance = max(0.0, float(depth_relative_tolerance))
+    chunk_size = max(1, int(chunk_size))
+    point_count = state.num_gaussians
+
+    for start in range(0, point_count, chunk_size):
+        end = min(start + chunk_size, point_count)
+        point_map = (
+            state.point_map
+            if state.point_map is not None
+            else state.gaussians.means.detach()
+        )
+        points = point_map[:, start:end].detach().float()
+        ones = torch.ones(
+            (*points.shape[:2], 1), device=device, dtype=torch.float32
+        )
+        camera_points = torch.einsum(
+            "bij,bnj->bni",
+            world_to_camera,
+            torch.cat([points, ones], dim=-1),
+        )[..., :3]
+        z = camera_points[..., 2]
+        z_safe = z.clamp_min(1e-6)
+        u = fx * camera_points[..., 0] / z_safe + cx
+        v = fy * camera_points[..., 1] / z_safe + cy
+        pixel_x = u.round().long()
+        pixel_y = v.round().long()
+        in_image = (
+            torch.isfinite(camera_points).all(dim=-1)
+            & (z > 1e-5)
+            & (pixel_x >= 0)
+            & (pixel_x < w)
+            & (pixel_y >= 0)
+            & (pixel_y < h)
+            & (state.stable_ids[:, start:end] >= 0)
+        )
+        linear_index = (pixel_y.clamp(0, h - 1) * w + pixel_x.clamp(0, w - 1))
+        sampled_depth = depth_flat.gather(1, linear_index)
+        depth_consistent = (
+            in_image
+            & torch.isfinite(sampled_depth)
+            & (sampled_depth > 1e-5)
+            & (
+                (z - sampled_depth).abs()
+                <= tolerance * sampled_depth.clamp_min(1e-4)
+            )
+        )
+        coverage_count.scatter_add_(
+            1, linear_index, depth_consistent.to(coverage_count.dtype)
+        )
+
+    coverage = (coverage_count > 0).reshape(b, 1, h, w)
+    radius = max(0, int(dilation_radius))
+    if radius > 0:
+        kernel_size = 2 * radius + 1
+        coverage = F.max_pool2d(
+            coverage.float(),
+            kernel_size=kernel_size,
+            stride=1,
+            padding=radius,
+        ).bool()
+    append_mask = valid_current & ~coverage
+    return append_mask, coverage
+
+
+def _sample_at_projected_centers(
+    image: torch.Tensor,
+    grid: torch.Tensor,
+) -> torch.Tensor:
+    sampled = F.grid_sample(
+        image,
+        grid.unsqueeze(2),
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    return sampled.squeeze(-1).transpose(1, 2)
+
+
+def build_projected_gaussian_evidence(
+    state: "StreamingGaussianState",
+    current_feature: torch.Tensor,
+    current_rgb: torch.Tensor,
+    current_depth: torch.Tensor,
+    current_depth_confidence: torch.Tensor,
+    old_rgb: torch.Tensor,
+    old_depth: torch.Tensor,
+    old_alpha: torch.Tensor,
+    camera_to_world: torch.Tensor,
+    intrinsics: torch.Tensor,
+    alpha_threshold: float,
+    depth_relative_tolerance: float,
+    rgb_bad_threshold: float,
+    min_projected_radius: float,
+    covariance_extent_sigma: float,
+    chunk_size: int = 65536,
+) -> ProjectedGSEvidence:
+    """Build packed descriptors for revisable historical Gaussians."""
+    b, n = state.gaussians.means.shape[:2]
+    h, w = current_depth.shape[-2:]
+    if current_depth.shape[:2] != (b, 1):
+        raise ValueError(
+            "Projected GS evidence expects current_depth [B,1,H,W], got "
+            f"{tuple(current_depth.shape)}."
+        )
+
+    expected_dim = current_feature.shape[1] + PROJECTED_GS_STATE_DIM
+    chunk_size = max(1, int(chunk_size))
+    device = state.gaussians.means.device
+    candidate_mask = torch.zeros((b, n), device=device, dtype=torch.bool)
+    surface_consistent = torch.zeros_like(candidate_mask)
+    old_in_front = torch.zeros_like(candidate_mask)
+    projected_radius = torch.zeros((b, n), device=device, dtype=torch.float32)
+    relative_depth = torch.zeros_like(projected_radius)
+    camera_depth = torch.zeros_like(projected_radius)
+    packed_descriptors = []
+    packed_indices = []
+
+    with torch.no_grad():
+        world_to_camera = torch.linalg.inv(camera_to_world.detach().float())
+        rotation_w2c = world_to_camera[:, None, :3, :3]
+        camera_center = camera_to_world.detach().float()[:, None, :3, 3]
+        fx = intrinsics[:, 0, 0].detach().float().unsqueeze(1) * w
+        fy = intrinsics[:, 1, 1].detach().float().unsqueeze(1) * h
+        cx = intrinsics[:, 0, 2].detach().float().unsqueeze(1) * w
+        cy = intrinsics[:, 1, 2].detach().float().unsqueeze(1) * h
+        sigma = max(float(covariance_extent_sigma), 0.0)
+        harmonic_shape = state.gaussians.harmonics.shape
+        if harmonic_shape[-1] == 3:
+            # gsplat stores SH as [..., coefficient, RGB].
+            sh_coefficient_count = harmonic_shape[-2]
+            transpose_harmonics = True
+        elif harmonic_shape[-2] == 3:
+            # Also accept the annotated [..., RGB, coefficient] layout.
+            sh_coefficient_count = harmonic_shape[-1]
+            transpose_harmonics = False
+        else:
+            raise RuntimeError(
+                "Historical Gaussian SH must have an RGB dimension of size 3; "
+                f"got shape={tuple(harmonic_shape)}."
+            )
+        sh_degree = int(sh_coefficient_count**0.5) - 1
+        if (sh_degree + 1) ** 2 != sh_coefficient_count or not 0 <= sh_degree <= 4:
+            raise RuntimeError(
+                "Historical Gaussian SH coefficient count must be a supported "
+                f"square number, got {sh_coefficient_count}."
+            )
+
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        count = end - start
+        with torch.no_grad():
+            means = state.gaussians.means[:, start:end].detach().float()
+            scales = (
+                state.gaussians.scales[:, start:end]
+                .detach()
+                .float()
+                .clamp_min(1e-8)
+            )
+            rotations = state.gaussians.rotations[:, start:end].detach().float()
+            ones = torch.ones((b, count, 1), device=device, dtype=torch.float32)
+            camera_points = torch.einsum(
+                "bij,bnj->bni",
+                world_to_camera,
+                torch.cat([means, ones], dim=-1),
+            )[..., :3]
+            z = camera_points[..., 2]
+            z_safe = z.clamp_min(1e-6)
+            u = fx * camera_points[..., 0] / z_safe + cx
+            v = fy * camera_points[..., 1] / z_safe + cy
+            grid = torch.stack(
+                [
+                    2.0 * u / max(w - 1, 1) - 1.0,
+                    2.0 * v / max(h - 1, 1) - 1.0,
+                ],
+                dim=-1,
+            )
+
+            covariance_world = build_covariance(scales, rotations)
+            covariance_camera = (
+                rotation_w2c
+                @ covariance_world
+                @ rotation_w2c.transpose(-1, -2)
+            )
+            jacobian = torch.zeros(
+                (b, count, 2, 3), device=device, dtype=torch.float32
+            )
+            jacobian[..., 0, 0] = fx / z_safe
+            jacobian[..., 0, 2] = -fx * camera_points[..., 0] / z_safe.square()
+            jacobian[..., 1, 1] = fy / z_safe
+            jacobian[..., 1, 2] = -fy * camera_points[..., 1] / z_safe.square()
+            covariance_2d = (
+                jacobian @ covariance_camera @ jacobian.transpose(-1, -2)
+            )
+            cov_xx = covariance_2d[..., 0, 0].clamp_min(0.0)
+            cov_xy = covariance_2d[..., 0, 1]
+            cov_yy = covariance_2d[..., 1, 1].clamp_min(0.0)
+            max_eigenvalue = 0.5 * (
+                cov_xx
+                + cov_yy
+                + torch.sqrt(
+                    (cov_xx - cov_yy).square() + 4.0 * cov_xy.square()
+                )
+            ).clamp_min(0.0)
+            radius = sigma * torch.sqrt(max_eigenvalue + 1e-12)
+            depth_extent = sigma * torch.sqrt(
+                covariance_camera[..., 2, 2].clamp_min(0.0) + 1e-12
+            )
+            in_frustum = (
+                (z > 1e-5)
+                & (u >= 0.0)
+                & (u <= float(w - 1))
+                & (v >= 0.0)
+                & (v <= float(h - 1))
+                & (radius >= float(min_projected_radius))
+                & (
+                    state.gaussians.opacities[:, start:end].detach().float()
+                    > 1e-4
+                )
+            )
+
+        sampled_feature = _sample_at_projected_centers(current_feature, grid)
+        sampled_current_rgb = _sample_at_projected_centers(
+            current_rgb.float(), grid
+        )
+        sampled_current_depth = _sample_at_projected_centers(
+            current_depth.float(), grid
+        ).squeeze(-1)
+        sampled_depth_confidence = _sample_at_projected_centers(
+            current_depth_confidence.float(), grid
+        ).squeeze(-1)
+        sampled_old_rgb = _sample_at_projected_centers(old_rgb.float(), grid)
+        sampled_old_depth = _sample_at_projected_centers(
+            old_depth.float(), grid
+        ).squeeze(-1)
+        sampled_old_alpha = _sample_at_projected_centers(
+            old_alpha.float(), grid
+        ).squeeze(-1)
+
+        with torch.no_grad():
+            current_depth_detached = sampled_current_depth.detach()
+            old_depth_detached = sampled_old_depth.detach()
+            old_alpha_detached = sampled_old_alpha.detach()
+            valid_current_depth = torch.isfinite(current_depth_detached) & (
+                current_depth_detached > 1e-5
+            )
+            valid_old_depth = torch.isfinite(old_depth_detached) & (
+                old_depth_detached > 1e-5
+            )
+            current_tolerance = (
+                float(depth_relative_tolerance)
+                * current_depth_detached.clamp_min(1e-4)
+            )
+            old_tolerance = (
+                float(depth_relative_tolerance)
+                * old_depth_detached.clamp_min(1e-4)
+            )
+            consistent_chunk = (
+                (z - current_depth_detached).abs()
+                <= depth_extent + current_tolerance
+            )
+            front_chunk = (
+                z + depth_extent < current_depth_detached - current_tolerance
+            )
+            near_old_front = (
+                z - depth_extent <= old_depth_detached + old_tolerance
+            )
+            rgb_error = (
+                sampled_current_rgb.detach() - sampled_old_rgb.detach()
+            ).abs().mean(dim=-1)
+            candidate_chunk = (
+                in_frustum
+                & valid_current_depth
+                & valid_old_depth
+                & (old_alpha_detached >= float(alpha_threshold))
+                & near_old_front
+                & (
+                    front_chunk
+                    | (
+                        consistent_chunk
+                        & (rgb_error >= float(rgb_bad_threshold))
+                    )
+                )
+            )
+            consistent_chunk = consistent_chunk & candidate_chunk
+            front_chunk = front_chunk & candidate_chunk
+
+        current_depth_safe = sampled_current_depth.clamp_min(1e-4)
+        old_depth_safe = sampled_old_depth.clamp_min(1e-4)
+        relative_depth_chunk = (
+            z.to(current_depth_safe.dtype) - current_depth_safe
+        ) / current_depth_safe
+        relative_old_depth = (
+            z.to(old_depth_safe.dtype) - old_depth_safe
+        ) / old_depth_safe
+        camera_direction = F.normalize(camera_points, dim=-1, eps=1e-8)
+        world_direction = F.normalize(means - camera_center, dim=-1, eps=1e-8)
+        harmonics = (
+            state.gaussians.harmonics[:, start:end].detach().float()
+        )
+        if transpose_harmonics:
+            harmonics = harmonics.transpose(-1, -2)
+        sh_color = (
+            sh_utils.eval_sh(sh_degree, harmonics, world_direction) + 0.5
+        ).clamp(0.0, 1.0)
+        descriptor_chunk = torch.cat(
+            [
+                sampled_feature.float(),
+                sampled_current_rgb,
+                sampled_old_rgb,
+                sampled_current_rgb - sampled_old_rgb,
+                current_depth_safe.log().unsqueeze(-1).clamp(-8.0, 8.0),
+                z.clamp_min(1e-4).log().unsqueeze(-1).clamp(-8.0, 8.0),
+                relative_depth_chunk.unsqueeze(-1).clamp(-2.0, 2.0),
+                relative_old_depth.unsqueeze(-1).clamp(-2.0, 2.0),
+                sampled_depth_confidence.unsqueeze(-1).clamp(0.0, 1.0),
+                sampled_old_alpha.unsqueeze(-1).clamp(0.0, 1.0),
+                state.gaussians.opacities[:, start:end]
+                .detach()
+                .float()
+                .unsqueeze(-1),
+                scales.log().clamp(-12.0, 2.0),
+                camera_direction,
+                sh_color,
+                state.observation_count[:, start:end]
+                .detach()
+                .float()
+                .log1p()
+                .unsqueeze(-1)
+                .clamp_max(8.0),
+                radius.log1p().unsqueeze(-1),
+                (depth_extent / z_safe).unsqueeze(-1).clamp(0.0, 2.0),
+                consistent_chunk.float().unsqueeze(-1),
+                front_chunk.float().unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        descriptor_chunk = torch.nan_to_num(
+            descriptor_chunk, nan=0.0, posinf=8.0, neginf=-8.0
+        )
+        if descriptor_chunk.shape != (b, count, expected_dim):
+            raise RuntimeError(
+                "Projected GS descriptor shape mismatch: "
+                f"got={tuple(descriptor_chunk.shape)}, "
+                f"expected={(b, count, expected_dim)}."
+            )
+        flat_chunk_mask = candidate_chunk.reshape(-1)
+        packed_descriptors.append(
+            descriptor_chunk.reshape(-1, expected_dim)[flat_chunk_mask]
+        )
+        global_indices = (
+            torch.arange(b, device=device)[:, None] * n
+            + torch.arange(start, end, device=device)[None]
+        )
+        packed_indices.append(global_indices.reshape(-1)[flat_chunk_mask])
+        candidate_mask[:, start:end] = candidate_chunk
+        surface_consistent[:, start:end] = consistent_chunk
+        old_in_front[:, start:end] = front_chunk
+        projected_radius[:, start:end] = radius
+        relative_depth[:, start:end] = relative_depth_chunk.detach().float()
+        camera_depth[:, start:end] = z.detach().float()
+
+    descriptor = torch.cat(packed_descriptors, dim=0).to(current_feature.dtype)
+    flat_candidate_indices = torch.cat(packed_indices, dim=0)
+    return ProjectedGSEvidence(
+        descriptor=descriptor,
+        flat_candidate_indices=flat_candidate_indices,
+        candidate_mask=candidate_mask,
+        surface_consistent=surface_consistent,
+        old_in_front=old_in_front,
+        projected_radius=projected_radius,
+        relative_depth=relative_depth.detach(),
+        camera_depth=camera_depth,
+    )
+
+
+class ProjectedGSResidualHead(nn.Module):
+    """Shared pointwise decoder for GS-centric historical parameter updates."""
+
+    def __init__(
+        self,
+        feature_dim: int,
+        harmonic_dim: int,
+        hidden_dim: int = 128,
+        chunk_size: int = 65536,
+    ) -> None:
+        super().__init__()
+        input_dim = int(feature_dim) + PROJECTED_GS_STATE_DIM
+        self.input_dim = input_dim
+        self.harmonic_dim = int(harmonic_dim)
+        if self.harmonic_dim <= 0:
+            raise ValueError("Projected GS harmonic_dim must be positive.")
+        self.chunk_size = max(1, int(chunk_size))
+        self.decoder = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(inplace=True),
+        )
+        self.output_dim = 12 + self.harmonic_dim
+        self.output = nn.Linear(hidden_dim, self.output_dim)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+        with torch.no_grad():
+            self.output.bias[10 + self.harmonic_dim] = -4.0
+            self.output.bias[11 + self.harmonic_dim] = 2.0
+
+    def forward(self, evidence: ProjectedGSEvidence) -> ProjectedGSResidualPrediction:
+        descriptor = evidence.descriptor
+        if descriptor.ndim != 2 or descriptor.shape[-1] != self.input_dim:
+            raise RuntimeError(
+                "Projected GS head input mismatch: "
+                f"got={tuple(descriptor.shape)}, expected=[candidates,{self.input_dim}]."
+            )
+        batch_size, gaussian_count = evidence.candidate_mask.shape
+        candidate_indices = evidence.flat_candidate_indices
+        if descriptor.shape[0] != candidate_indices.numel():
+            raise RuntimeError(
+                "Projected GS packed evidence mismatch: "
+                f"descriptors={descriptor.shape[0]}, indices={candidate_indices.numel()}."
+            )
+        selected = descriptor
+        no_candidates = selected.shape[0] == 0
+        if no_candidates:
+            # Keep the shared head in the DDP graph even for views with no
+            # eligible old GS, while preserving an exact identity update.
+            selected = descriptor.new_zeros((1, self.input_dim))
+        selected_outputs = []
+        for start in range(0, selected.shape[0], self.chunk_size):
+            chunk = selected[start : start + self.chunk_size]
+            selected_outputs.append(self.output(self.decoder(chunk)))
+        selected_output = torch.cat(selected_outputs, dim=0)
+        if no_candidates:
+            selected_output = selected_output[:0] + selected_output.sum() * 0.0
+        harmonic_end = 10 + self.harmonic_dim
+        return ProjectedGSResidualPrediction(
+            delta_mean_camera=selected_output[:, 0:3],
+            delta_rotation=selected_output[:, 3:6],
+            delta_log_scale=selected_output[:, 6:9],
+            delta_opacity_logit=selected_output[:, 9],
+            delta_harmonics=selected_output[:, 10:harmonic_end],
+            front_decay_logit=selected_output[:, harmonic_end],
+            update_gate_logit=selected_output[:, harmonic_end + 1],
+        )
+
+
 def apply_current_gaussian_residual(
     current: Gaussians,
     prediction: GIRPrediction,
@@ -196,6 +715,7 @@ class StreamingGaussianState:
     gaussians: Gaussians
     stable_ids: torch.Tensor
     observation_count: torch.Tensor
+    point_map: torch.Tensor | None = None
 
     @property
     def batch_size(self) -> int:
@@ -216,6 +736,9 @@ class StreamingGaussianState:
             ),
             stable_ids=self.stable_ids,
             observation_count=self.observation_count.detach(),
+            point_map=(
+                None if self.point_map is None else self.point_map.detach()
+            ),
         )
 
     def detach_means(self) -> "StreamingGaussianState":
@@ -236,6 +759,7 @@ class StreamingGaussianState:
             ),
             stable_ids=self.stable_ids,
             observation_count=self.observation_count,
+            point_map=self.point_map,
         )
 
     @classmethod
@@ -243,8 +767,14 @@ class StreamingGaussianState:
         cls,
         current: Gaussians,
         add_gate: torch.Tensor,
+        point_map: torch.Tensor | None = None,
     ) -> "StreamingGaussianState":
         b, n = current.means.shape[:2]
+        if point_map is not None and point_map.shape != current.means.shape:
+            raise ValueError(
+                "Initial point map must match Gaussian means; got "
+                f"{tuple(point_map.shape)} and {tuple(current.means.shape)}."
+            )
         gate = add_gate.reshape(b, n).to(current.opacities.dtype)
         ids = torch.arange(n, device=current.means.device, dtype=torch.long)
         ids = ids.unsqueeze(0).expand(b, -1)
@@ -260,6 +790,11 @@ class StreamingGaussianState:
             observation_count=torch.ones(
                 (b, n), device=current.means.device, dtype=current.means.dtype
             ),
+            point_map=(
+                current.means.detach()
+                if point_map is None
+                else point_map.detach()
+            ),
         )
 
     def append(
@@ -267,28 +802,109 @@ class StreamingGaussianState:
         current: Gaussians,
         add_gate: torch.Tensor,
         prune_threshold: float = 0.0,
+        append_mask: torch.Tensor | None = None,
+        point_map: torch.Tensor | None = None,
     ) -> "StreamingGaussianState":
         b, n = current.means.shape[:2]
-        gate = add_gate.reshape(b, n).to(current.opacities.dtype)
-        if prune_threshold > 0.0:
-            if b != 1:
-                raise RuntimeError(
-                    "Test-only GIR gate pruning currently requires batch size 1."
-                )
-            keep = gate[0] >= prune_threshold
-            current = Gaussians(
-                means=current.means[:, keep],
-                harmonics=current.harmonics[:, keep],
-                opacities=current.opacities[:, keep],
-                scales=current.scales[:, keep],
-                rotations=current.rotations[:, keep],
+        if point_map is not None and point_map.shape != current.means.shape:
+            raise ValueError(
+                "Appended point map must match Gaussian means; got "
+                f"{tuple(point_map.shape)} and {tuple(current.means.shape)}."
             )
-            gate = gate[:, keep]
-            n = int(keep.sum().item())
+        new_point_map = (
+            current.means.detach()
+            if point_map is None
+            else point_map.detach()
+        )
+        gate = add_gate.reshape(b, n).to(current.opacities.dtype)
+        selection = None
+        if append_mask is not None:
+            selection = append_mask.reshape(b, n).bool()
+        if prune_threshold > 0.0:
+            gate_selection = gate >= float(prune_threshold)
+            selection = (
+                gate_selection
+                if selection is None
+                else selection & gate_selection
+            )
+
+        valid_new = None
+        if selection is not None:
+            counts = selection.sum(dim=1)
+            max_count = int(counts.max().item())
+            if max_count == 0:
+                return self
+            gather_indices = torch.zeros(
+                (b, max_count), device=current.means.device, dtype=torch.long
+            )
+            valid_new = torch.zeros(
+                (b, max_count), device=current.means.device, dtype=torch.bool
+            )
+            for batch_idx in range(b):
+                selected = torch.nonzero(
+                    selection[batch_idx], as_tuple=False
+                ).squeeze(1)
+                count = int(selected.numel())
+                if count:
+                    gather_indices[batch_idx, :count] = selected
+                    valid_new[batch_idx, :count] = True
+
+            def gather(values: torch.Tensor) -> torch.Tensor:
+                index = gather_indices
+                for _ in range(values.ndim - 2):
+                    index = index.unsqueeze(-1)
+                index = index.expand(*gather_indices.shape, *values.shape[2:])
+                return values.gather(1, index)
+
+            current = Gaussians(
+                means=gather(current.means),
+                harmonics=gather(current.harmonics),
+                opacities=gather(current.opacities),
+                scales=gather(current.scales),
+                rotations=gather(current.rotations),
+            )
+            new_point_map = gather(new_point_map)
+            gate = gate.gather(1, gather_indices)
+            n = max_count
+            valid_scalar = valid_new.to(current.means.dtype)
+            valid_vector = valid_scalar.unsqueeze(-1)
+            valid_harmonics = valid_vector.unsqueeze(-1)
+            padding_rotation = torch.zeros_like(current.rotations)
+            padding_rotation[..., 3] = 1.0
+            current = Gaussians(
+                means=current.means * valid_vector,
+                harmonics=current.harmonics * valid_harmonics,
+                opacities=current.opacities * valid_scalar,
+                scales=torch.where(
+                    valid_vector.bool(),
+                    current.scales,
+                    torch.full_like(current.scales, 1e-6),
+                ),
+                rotations=torch.where(
+                    valid_vector.bool(), current.rotations, padding_rotation
+                ),
+            )
+            new_point_map = new_point_map * valid_vector
 
         first_new_id = self.stable_ids.max(dim=1, keepdim=True).values + 1
         offsets = torch.arange(n, device=current.means.device, dtype=torch.long)
         new_ids = first_new_id + offsets.unsqueeze(0)
+        new_observation_count = torch.ones(
+            (b, n),
+            device=current.means.device,
+            dtype=self.observation_count.dtype,
+        )
+        if valid_new is not None:
+            gate = gate * valid_new.to(gate.dtype)
+            new_ids = torch.where(valid_new, new_ids, torch.full_like(new_ids, -1))
+            new_observation_count = new_observation_count * valid_new.to(
+                new_observation_count.dtype
+            )
+        old_point_map = (
+            self.point_map
+            if self.point_map is not None
+            else self.gaussians.means.detach()
+        )
         return StreamingGaussianState(
             gaussians=Gaussians(
                 means=torch.cat([self.gaussians.means, current.means], dim=1),
@@ -305,15 +921,11 @@ class StreamingGaussianState:
             ),
             stable_ids=torch.cat([self.stable_ids, new_ids], dim=1),
             observation_count=torch.cat(
-                [
-                    self.observation_count,
-                    torch.ones(
-                        (b, n),
-                        device=current.means.device,
-                        dtype=self.observation_count.dtype,
-                    ),
-                ],
+                [self.observation_count, new_observation_count],
                 dim=1,
+            ),
+            point_map=torch.cat(
+                [old_point_map, new_point_map], dim=1
             ),
         )
 
@@ -338,6 +950,9 @@ class StreamingGaussianState:
             ),
             stable_ids=self.stable_ids[:, keep],
             observation_count=self.observation_count[:, keep],
+            point_map=(
+                None if self.point_map is None else self.point_map[:, keep]
+            ),
         )
 
     def delete_historical(
@@ -433,6 +1048,7 @@ class StreamingGaussianState:
             ),
             stable_ids=self.stable_ids,
             observation_count=self.observation_count,
+            point_map=self.point_map,
         )
 
         pruned_count = delete_hard.sum()
@@ -622,6 +1238,7 @@ class StreamingGaussianState:
                 ),
                 stable_ids=self.stable_ids,
                 observation_count=self.observation_count,
+                point_map=self.point_map,
             )
             if physical_keep is not None:
                 state = state.select(physical_keep)
@@ -666,6 +1283,7 @@ class StreamingGaussianState:
                 ),
                 stable_ids=self.stable_ids,
                 observation_count=self.observation_count,
+                point_map=self.point_map,
             )
 
         decay_soft = torch.stack(decay_probabilities)
@@ -684,6 +1302,279 @@ class StreamingGaussianState:
             / torch.stack(map_counts_before).mean().clamp_min(1.0),
             "map_count_before": torch.stack(map_counts_before).mean(),
             "map_count_after": torch.stack(map_counts_after).mean(),
+        }
+
+    def update_projected_historical(
+        self,
+        evidence: ProjectedGSEvidence,
+        prediction: ProjectedGSResidualPrediction,
+        camera_to_world: torch.Tensor,
+        opacity_logit_scale: float,
+        front_decay_strength: float,
+        decay_schedule: float = 1.0,
+        mean_update_mode: str = "relative_depth",
+        raw_scale_residual: bool = False,
+        raw_opacity_residual: bool = False,
+        raw_rotation_residual: bool = False,
+        raw_harmonics_residual: bool = False,
+        mean_relative_scale: float = 0.02,
+        rotation_scale: float = 0.05,
+        harmonics_scale: float = 0.10,
+    ) -> tuple["StreamingGaussianState", dict[str, torch.Tensor]]:
+        """Apply shared-decoder residuals directly to selected historical GS."""
+        b, n = self.gaussians.opacities.shape
+        expected_shape = (b, n)
+        for name, value in (
+            ("candidate_mask", evidence.candidate_mask),
+            ("surface_consistent", evidence.surface_consistent),
+            ("old_in_front", evidence.old_in_front),
+            ("camera_depth", evidence.camera_depth),
+        ):
+            if value.shape != expected_shape:
+                raise RuntimeError(
+                    f"Projected GS {name} shape mismatch: "
+                    f"got={tuple(value.shape)}, expected={expected_shape}."
+                )
+        mean_update_mode = str(mean_update_mode).lower()
+        if mean_update_mode not in {"absolute", "relative_depth"}:
+            raise ValueError(
+                "mean_update_mode must be absolute or relative_depth; "
+                f"got {mean_update_mode!r}."
+            )
+
+        flat_indices = evidence.flat_candidate_indices.long()
+        candidate_count_int = flat_indices.numel()
+        harmonic_dim = self.gaussians.harmonics.shape[-2] * (
+            self.gaussians.harmonics.shape[-1]
+        )
+        vector_shapes = (
+            ("delta_mean_camera", prediction.delta_mean_camera, 3),
+            ("delta_rotation", prediction.delta_rotation, 3),
+            ("delta_log_scale", prediction.delta_log_scale, 3),
+            ("delta_harmonics", prediction.delta_harmonics, harmonic_dim),
+        )
+        for name, value, channels in vector_shapes:
+            if value.shape != (candidate_count_int, channels):
+                raise RuntimeError(
+                    f"Projected GS {name} shape mismatch: got={tuple(value.shape)}, "
+                    f"expected={(candidate_count_int, channels)}."
+                )
+        for name, value in (
+            ("delta_opacity_logit", prediction.delta_opacity_logit),
+            ("front_decay_logit", prediction.front_decay_logit),
+            ("update_gate_logit", prediction.update_gate_logit),
+        ):
+            if value.shape != (candidate_count_int,):
+                raise RuntimeError(
+                    f"Projected GS {name} shape mismatch: got={tuple(value.shape)}, "
+                    f"expected={(candidate_count_int,)}."
+                )
+        if candidate_count_int and (
+            int(flat_indices.min()) < 0 or int(flat_indices.max()) >= b * n
+        ):
+            raise RuntimeError("Projected GS candidate indices are out of range.")
+
+        flat_consistent = evidence.surface_consistent.reshape(-1)
+        flat_old_in_front = evidence.old_in_front.reshape(-1)
+        consistent = flat_consistent.index_select(0, flat_indices).float()
+        old_in_front = flat_old_in_front.index_select(0, flat_indices).float()
+        gate = prediction.update_gate_logit.float().sigmoid()
+        flat_observation_count = self.observation_count.reshape(-1)
+        damping = (
+            flat_observation_count.detach()
+            .float()
+            .index_select(0, flat_indices)
+            .add(1.0)
+            .rsqrt()
+        )
+        update_weight = gate * damping
+        consistent_weight = update_weight * consistent
+
+        raw_mean = prediction.delta_mean_camera.float()
+        if mean_update_mode == "relative_depth":
+            camera_depth = (
+                evidence.camera_depth.reshape(-1)
+                .index_select(0, flat_indices)
+                .float()
+                .clamp_min(1e-4)
+            )
+            delta_mean_camera = (
+                raw_mean.tanh()
+                * min(max(float(mean_relative_scale), 0.0), 0.999)
+                * camera_depth.unsqueeze(-1)
+            )
+        else:
+            delta_mean_camera = raw_mean
+        delta_mean_camera = delta_mean_camera * consistent_weight.unsqueeze(-1)
+        batch_indices = torch.div(flat_indices, n, rounding_mode="floor")
+        camera_rotation = camera_to_world.detach().float()[
+            batch_indices, :3, :3
+        ]
+        delta_mean_world = torch.bmm(
+            delta_mean_camera.unsqueeze(1),
+            camera_rotation.transpose(1, 2),
+        ).squeeze(1)
+
+        raw_rotation = prediction.delta_rotation.float()
+        delta_rotation = (
+            raw_rotation
+            if raw_rotation_residual
+            else raw_rotation.tanh()
+            * min(max(float(rotation_scale), 0.0), 0.999)
+        )
+        delta_rotation = delta_rotation * consistent_weight.unsqueeze(-1)
+
+        raw_scale = prediction.delta_log_scale.float()
+        delta_log_scale = (
+            raw_scale if raw_scale_residual else raw_scale.tanh()
+        ) * consistent_weight.unsqueeze(-1)
+
+        raw_opacity = prediction.delta_opacity_logit.float()
+        delta_opacity = (
+            raw_opacity if raw_opacity_residual else raw_opacity.tanh()
+        )
+        delta_opacity = (
+            delta_opacity
+            * max(0.0, float(opacity_logit_scale))
+            * consistent_weight
+        )
+
+        raw_harmonics = prediction.delta_harmonics.float()
+        delta_harmonics = (
+            raw_harmonics
+            if raw_harmonics_residual
+            else raw_harmonics.tanh()
+            * min(max(float(harmonics_scale), 0.0), 0.999)
+        )
+        delta_harmonics = delta_harmonics * consistent_weight.unsqueeze(-1)
+
+        means_flat = self.gaussians.means.reshape(-1, 3)
+        selected_means = means_flat.index_select(0, flat_indices)
+        updated_means_selected = selected_means.float() + delta_mean_world
+
+        rotations_flat = self.gaussians.rotations.reshape(-1, 4)
+        selected_rotations = rotations_flat.index_select(0, flat_indices)
+        delta_quaternion = _axis_angle_to_quaternion_xyzw(delta_rotation)
+        updated_rotations_selected = _quat_multiply_xyzw(
+            delta_quaternion, selected_rotations.float()
+        )
+        updated_rotations_selected = F.normalize(
+            updated_rotations_selected, dim=-1, eps=1e-8
+        )
+
+        scales_flat = self.gaussians.scales.reshape(-1, 3)
+        selected_scales = scales_flat.index_select(0, flat_indices)
+        updated_scales_selected = selected_scales.float() * torch.exp(
+            delta_log_scale.clamp(-2.0, 2.0)
+        )
+        updated_scales_selected = updated_scales_selected.clamp(1e-6, 0.1)
+
+        harmonics_flat = _flatten_harmonics(self.gaussians.harmonics).reshape(
+            b * n, harmonic_dim
+        )
+        selected_harmonics = harmonics_flat.index_select(0, flat_indices)
+        updated_harmonics_selected = selected_harmonics.float() + delta_harmonics
+
+        opacities_flat = self.gaussians.opacities.reshape(-1)
+        selected_opacities = opacities_flat.index_select(0, flat_indices)
+        opacity_logit = torch.logit(
+            selected_opacities.float().clamp(1e-5, 1.0 - 1e-5)
+        )
+        updated_opacities_selected = torch.sigmoid(opacity_logit + delta_opacity)
+
+        front_decay_probability = prediction.front_decay_logit.float().sigmoid()
+        decay_fraction = (
+            max(0.0, float(front_decay_strength))
+            * max(0.0, min(1.0, float(decay_schedule)))
+            * front_decay_probability
+            * update_weight
+            * old_in_front
+        ).clamp(0.0, 0.95)
+        updated_opacities_selected = updated_opacities_selected * (
+            1.0 - decay_fraction
+        )
+
+        residual_energy = (
+            raw_mean.square().sum(dim=-1)
+            + raw_rotation.square().sum(dim=-1)
+            + raw_scale.square().sum(dim=-1)
+            + raw_opacity.square()
+            + raw_harmonics.square().mean(dim=-1)
+        )
+        candidate_count = prediction.update_gate_logit.new_tensor(
+            float(candidate_count_int)
+        ).clamp_min(1.0)
+        regularization = (
+            residual_energy * consistent
+            + front_decay_probability.square() * old_in_front
+        ).sum() / candidate_count
+
+        means = means_flat.index_copy(
+            0, flat_indices, updated_means_selected.to(means_flat.dtype)
+        ).reshape_as(self.gaussians.means)
+        rotations = rotations_flat.index_copy(
+            0,
+            flat_indices,
+            updated_rotations_selected.to(rotations_flat.dtype),
+        ).reshape_as(self.gaussians.rotations)
+        scales = scales_flat.index_copy(
+            0, flat_indices, updated_scales_selected.to(scales_flat.dtype)
+        ).reshape_as(self.gaussians.scales)
+        harmonics = harmonics_flat.index_copy(
+            0,
+            flat_indices,
+            updated_harmonics_selected.to(harmonics_flat.dtype),
+        ).reshape_as(self.gaussians.harmonics)
+        opacities = opacities_flat.index_copy(
+            0,
+            flat_indices,
+            updated_opacities_selected.to(opacities_flat.dtype),
+        ).reshape_as(self.gaussians.opacities)
+
+        observation_count = flat_observation_count.clone()
+        observation_count.index_add_(
+            0, flat_indices, consistent.to(observation_count.dtype)
+        )
+
+        mean_shift = delta_mean_world.norm(dim=-1)
+        rotation_shift = delta_rotation.norm(dim=-1)
+        scale_relative_shift = (
+            updated_scales_selected
+            / selected_scales.float().clamp_min(1e-8)
+            - 1.0
+        ).abs().mean(dim=-1)
+        opacity_shift = (
+            updated_opacities_selected - selected_opacities.float()
+        ).abs()
+        harmonics_shift = delta_harmonics.abs().mean(dim=-1)
+        state = StreamingGaussianState(
+            gaussians=Gaussians(
+                means=means,
+                harmonics=harmonics,
+                opacities=opacities,
+                scales=scales,
+                rotations=rotations,
+            ),
+            stable_ids=self.stable_ids,
+            observation_count=observation_count.reshape_as(self.observation_count),
+            point_map=self.point_map,
+        )
+        return state, {
+            "regularization": regularization,
+            "candidate_ratio": evidence.candidate_mask.float().mean(),
+            "surface_consistent_ratio": evidence.surface_consistent.float().mean(),
+            "old_in_front_ratio": evidence.old_in_front.float().mean(),
+            "gate_mean": gate.sum() / candidate_count,
+            "mean_shift_mean": mean_shift.sum() / candidate_count,
+            "rotation_shift_mean": rotation_shift.sum() / candidate_count,
+            "scale_relative_shift_mean": scale_relative_shift.sum()
+            / candidate_count,
+            "opacity_shift_mean": opacity_shift.sum() / candidate_count,
+            "harmonics_shift_mean": harmonics_shift.sum() / candidate_count,
+            "front_decay_probability_mean": (
+                front_decay_probability * old_in_front
+            ).sum()
+            / old_in_front.sum().clamp_min(1.0),
         }
 
     def update_historical(
@@ -940,6 +1831,7 @@ class StreamingGaussianState:
             stable_ids=self.stable_ids,
             observation_count=self.observation_count
             + torch.stack(observation_increments),
+            point_map=self.point_map,
         )
 
 

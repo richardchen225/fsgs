@@ -28,7 +28,12 @@ from src.model.encoder import act_gs, sh_utils
 from src.model.encoder.vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from src.model.model import get_model
 from src.model.ply_export import export_ply
-from src.model.streaming_gir import DominantGIR, StreamingGaussianState
+from src.model.streaming_gir import (
+    build_point_map_append_mask,
+    build_projected_gaussian_evidence,
+    DominantGIR,
+    StreamingGaussianState,
+)
 from src.model.types import Gaussians
 from src.experiments.plot_replica_overfit_metrics import (
     plot_metrics,
@@ -680,6 +685,7 @@ def _load_checkpoint(model: torch.nn.Module, checkpoint: str | None) -> dict[str
         "encoder.gs_head.",
         "encoder.camera_head.",
         "gir_update_head.",
+        "gir_projected_update_head.",
     )
     loaded_heads = sum(key.startswith(prefixes) for key in compatible)
     print(
@@ -699,6 +705,7 @@ def _load_checkpoint(model: torch.nn.Module, checkpoint: str | None) -> dict[str
 def _configure_trainable_modules(
     model: torch.nn.Module,
     residual_enabled: bool,
+    residual_mode: str,
     train_gaussian_param_head: bool,
     train_gs_head: bool,
     train_depth_head: bool,
@@ -712,17 +719,32 @@ def _configure_trainable_modules(
     )
     model.encoder.camera_head.requires_grad_(train_camera_head)
     model.encoder.gs_head.requires_grad_(train_gs_head)
-    gir_trainable = residual_enabled or opacity_decay_enabled
+    residual_mode = str(residual_mode).lower()
+    if residual_mode not in {"pixel_topk", "projected_shared"}:
+        raise ValueError(
+            "residual_mode must be pixel_topk or projected_shared; "
+            f"got {residual_mode!r}."
+        )
+    projected_trainable = residual_enabled and residual_mode == "projected_shared"
+    pixel_residual_trainable = residual_enabled and residual_mode == "pixel_topk"
+    gir_trainable = pixel_residual_trainable or opacity_decay_enabled
     model.gir_update_head.encoder.requires_grad_(gir_trainable)
-    model.gir_update_head.prediction.requires_grad_(residual_enabled)
+    model.gir_update_head.prediction.requires_grad_(pixel_residual_trainable)
     model.gir_update_head.additional_historical_predictions.requires_grad_(
-        residual_enabled
+        pixel_residual_trainable
     )
     model.gir_update_head.current_prediction.requires_grad_(False)
     model.gir_update_head.delete_prediction.requires_grad_(False)
     model.gir_update_head.contributor_decay_prediction.requires_grad_(
         opacity_decay_enabled
     )
+    projected_head = getattr(model, "gir_projected_update_head", None)
+    if projected_trainable and projected_head is None:
+        raise RuntimeError(
+            "projected_shared residual mode requires gir_projected_update_head."
+        )
+    if projected_head is not None:
+        projected_head.requires_grad_(projected_trainable)
 
     groups = []
     if train_gaussian_param_head:
@@ -742,12 +764,12 @@ def _configure_trainable_modules(
                     *model.gir_update_head.encoder.parameters(),
                     *(
                         model.gir_update_head.prediction.parameters()
-                        if residual_enabled
+                        if pixel_residual_trainable
                         else []
                     ),
                     *(
                         model.gir_update_head.additional_historical_predictions.parameters()
-                        if residual_enabled
+                        if pixel_residual_trainable
                         else []
                     ),
                     *(
@@ -756,6 +778,13 @@ def _configure_trainable_modules(
                         else []
                     ),
                 ],
+            }
+        )
+    if projected_trainable:
+        groups.append(
+            {
+                "name": "projected_old_residual_head",
+                "params": list(projected_head.parameters()),
             }
         )
     if train_camera_head:
@@ -848,6 +877,7 @@ def _make_state(gaussians: Gaussians) -> StreamingGaussianState:
         observation_count=torch.zeros(
             (batch, count), device=gaussians.means.device, dtype=gaussians.means.dtype
         ),
+        point_map=gaussians.means.detach(),
     )
 
 
@@ -1067,6 +1097,270 @@ def _residual_update_stats(
     return stats
 
 
+def _predict_projected_updated_state(
+    model,
+    cfg: DictConfig,
+    state: StreamingGaussianState,
+    current_feature: torch.Tensor,
+    current_rgb: torch.Tensor,
+    current_depth: torch.Tensor,
+    current_c2w: torch.Tensor,
+    current_intrinsic: torch.Tensor,
+    image_shape: tuple[int, int],
+    global_step: int,
+):
+    batch, height, width = current_rgb.shape[0], *image_shape
+    raster = model.decoder.render_projected_gs_evidence(
+        state.gaussians,
+        current_c2w,
+        current_intrinsic,
+        image_shape,
+    )
+    old_rgb = torch.nan_to_num(
+        raster.color.float(), nan=0.0, posinf=0.0, neginf=0.0
+    ).clamp(0.0, 1.0)
+    old_alpha = torch.nan_to_num(
+        raster.alpha.float(), nan=0.0, posinf=0.0, neginf=0.0
+    ).clamp(0.0, 1.0)
+    old_depth = torch.nan_to_num(
+        raster.expected_depth.float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    old_depth = torch.where(
+        old_alpha > 1e-4,
+        old_depth.clamp_min(1e-6),
+        torch.zeros_like(old_depth),
+    )
+    with torch.no_grad():
+        valid_depth = current_depth[:, None] > 0
+        old_coverage = old_alpha >= float(cfg.alpha_threshold)
+        relative_depth_delta = (
+            old_depth - current_depth[:, None]
+        ) / current_depth[:, None].clamp_min(1e-4)
+        depth_consistent = (
+            old_coverage
+            & valid_depth
+            & (
+                relative_depth_delta.abs()
+                <= float(cfg.depth_relative_tolerance)
+            )
+        )
+        current_in_front = (
+            old_coverage
+            & valid_depth
+            & (relative_depth_delta > float(cfg.depth_relative_tolerance))
+        )
+        old_in_front = (
+            old_coverage
+            & valid_depth
+            & (relative_depth_delta < -float(cfg.depth_relative_tolerance))
+        )
+        overlap = depth_consistent
+        append_mode = str(cfg.get("append_mode", "point_map")).lower()
+        if append_mode == "all":
+            append_mask = valid_depth
+        elif append_mode in {"logic", "point_map"}:
+            append_mask, _ = build_point_map_append_mask(
+                state=state,
+                current_depth=current_depth[:, None],
+                camera_to_world=current_c2w,
+                intrinsics=current_intrinsic,
+                depth_relative_tolerance=float(
+                    cfg.get(
+                        "point_append_depth_relative_tolerance",
+                        cfg.depth_relative_tolerance,
+                    )
+                ),
+                dilation_radius=int(cfg.get("point_append_dilation_radius", 1)),
+                chunk_size=int(cfg.get("point_append_chunk_size", 65536)),
+            )
+        else:
+            raise ValueError(
+                "toy.append_mode must be point_map or all; "
+                f"got {append_mode!r}."
+            )
+        rgb_error = (old_rgb - current_rgb.float()).abs().mean(
+            dim=1, keepdim=True
+        )
+        rgb_bad = rgb_error >= float(cfg.rgb_bad_threshold)
+        bad_mask = (depth_consistent & rgb_bad) | old_in_front
+
+    confidence = torch.ones_like(current_depth[:, None])
+    evidence = build_projected_gaussian_evidence(
+        state=state,
+        current_feature=current_feature.float(),
+        current_rgb=current_rgb.float(),
+        current_depth=current_depth[:, None].float(),
+        current_depth_confidence=confidence.float(),
+        old_rgb=old_rgb,
+        old_depth=old_depth,
+        old_alpha=old_alpha,
+        camera_to_world=current_c2w,
+        intrinsics=current_intrinsic,
+        alpha_threshold=float(cfg.alpha_threshold),
+        depth_relative_tolerance=float(cfg.depth_relative_tolerance),
+        rgb_bad_threshold=float(cfg.rgb_bad_threshold),
+        min_projected_radius=float(cfg.get("projected_min_radius", 0.1)),
+        covariance_extent_sigma=float(
+            cfg.get("projected_covariance_sigma", 3.0)
+        ),
+        chunk_size=int(cfg.get("projected_chunk_size", 65536)),
+    )
+    with torch.autocast("cuda", enabled=False):
+        prediction = model.gir_projected_update_head(evidence)
+    warmup_steps = max(0, int(cfg.get("projected_warmup_steps", 0)))
+    schedule = (
+        1.0
+        if warmup_steps == 0
+        else min(1.0, max(0.0, float(global_step) / warmup_steps))
+    )
+    before = state
+    if bool(cfg.residual_enabled):
+        updated, projected_stats = state.update_projected_historical(
+            evidence,
+            prediction,
+            current_c2w,
+            opacity_logit_scale=float(
+                cfg.get("projected_opacity_logit_scale", 1.0)
+            ),
+            front_decay_strength=float(
+                cfg.get("projected_front_decay_strength", 0.02)
+            ),
+            decay_schedule=schedule,
+            mean_update_mode=str(
+                cfg.get("mean_update_mode", "relative_depth")
+            ),
+            raw_scale_residual=bool(cfg.get("raw_scale_residual", False)),
+            raw_opacity_residual=bool(cfg.get("raw_opacity_residual", False)),
+            raw_rotation_residual=bool(
+                cfg.get("raw_rotation_residual", False)
+            ),
+            raw_harmonics_residual=bool(
+                cfg.get("raw_harmonics_residual", False)
+            ),
+            mean_relative_scale=float(cfg.get("mean_relative_scale", 0.02)),
+            rotation_scale=float(cfg.get("rotation_scale", 0.05)),
+            harmonics_scale=float(cfg.get("harmonics_scale", 0.10)),
+        )
+    else:
+        updated = state
+        projected_stats = {
+            "regularization": current_feature.new_zeros(()),
+            "candidate_ratio": evidence.candidate_mask.float().mean(),
+            "surface_consistent_ratio": evidence.surface_consistent.float().mean(),
+            "old_in_front_ratio": evidence.old_in_front.float().mean(),
+            "gate_mean": current_feature.new_zeros(()),
+            "mean_shift_mean": current_feature.new_zeros(()),
+            "rotation_shift_mean": current_feature.new_zeros(()),
+            "scale_relative_shift_mean": current_feature.new_zeros(()),
+            "opacity_shift_mean": current_feature.new_zeros(()),
+            "harmonics_shift_mean": current_feature.new_zeros(()),
+            "front_decay_probability_mean": current_feature.new_zeros(()),
+        }
+
+    update_stats = _empty_residual_update_stats(
+        current_feature, max(1, int(cfg.get("residual_topk", 1)))
+    )
+    mean_shift = (
+        updated.gaussians.means - before.gaussians.means
+    ).norm(dim=-1)
+    rotation_shift = (
+        updated.gaussians.rotations - before.gaussians.rotations
+    ).norm(dim=-1)
+    scale_relative = (
+        updated.gaussians.scales
+        / before.gaussians.scales.clamp_min(1e-8)
+        - 1.0
+    ).abs().amax(dim=-1)
+    opacity_shift = (
+        updated.gaussians.opacities - before.gaussians.opacities
+    ).abs()
+    harmonics_shift = (
+        updated.gaussians.harmonics - before.gaussians.harmonics
+    ).flatten(2).square().mean(dim=-1).sqrt()
+    changed = (
+        (mean_shift > 1e-10)
+        | (rotation_shift > 1e-10)
+        | (scale_relative > 1e-10)
+        | (opacity_shift > 1e-10)
+        | (harmonics_shift > 1e-10)
+    )
+    changed_float = changed.float()
+    changed_count = changed_float.sum().clamp_min(1.0)
+    update_stats["map_updated_ratio"] = changed_float.mean()
+    for key, value in (
+        ("mean_shift", mean_shift),
+        ("rotation", rotation_shift),
+        ("scale_relative", scale_relative),
+        ("opacity", opacity_shift),
+        ("harmonics", harmonics_shift),
+    ):
+        update_stats[f"map_{key}_mean"] = (
+            value * changed_float
+        ).sum() / changed_count
+        update_stats[f"map_{key}_max"] = value.max()
+
+    candidate_count_int = evidence.flat_candidate_indices.numel()
+    candidate_count = current_feature.new_tensor(
+        float(candidate_count_int)
+    ).clamp_min(1.0)
+    gate = prediction.update_gate_logit.float().sigmoid()
+    old_count = before.observation_count.reshape(-1).index_select(
+        0, evidence.flat_candidate_indices
+    )
+    consistent = evidence.surface_consistent.reshape(-1).index_select(
+        0, evidence.flat_candidate_indices
+    ).float()
+    multiplier = gate * old_count.float().add(1.0).rsqrt() * consistent
+    update_stats["rank_valid_ratio"][0] = evidence.candidate_mask.float().mean()
+    update_stats["rank_contribution_weight"][0] = 1.0
+    update_stats["rank_relative_weight"][0] = 1.0
+    update_stats["rank_update_multiplier"][0] = (
+        multiplier.sum() / candidate_count
+    )
+    raw_values = {
+        "mean_shift": prediction.delta_mean_camera.float().norm(dim=-1),
+        "rotation": prediction.delta_rotation.float().norm(dim=-1),
+        "log_scale": prediction.delta_log_scale.float().norm(dim=-1),
+        "opacity_logit": prediction.delta_opacity_logit.float().abs(),
+        "harmonics": prediction.delta_harmonics.float().square().mean(
+            dim=-1
+        ).sqrt(),
+    }
+    for name, magnitude in raw_values.items():
+        update_stats[f"rank_raw_{name}"][0] = magnitude.sum() / candidate_count
+        update_stats[f"rank_effective_{name}"][0] = (
+            magnitude * multiplier
+        ).sum() / candidate_count
+
+    updated_indices = evidence.flat_candidate_indices
+    stats = {
+        "overlap": overlap,
+        "old_coverage": old_coverage,
+        "depth_consistent": depth_consistent,
+        "current_in_front": current_in_front,
+        "old_in_front": old_in_front,
+        "bad_mask": bad_mask,
+        "rgb_error": rgb_error,
+        "bad_ratio": bad_mask.float().mean(),
+        "overlap_ratio": overlap.float().mean(),
+        "old_coverage_ratio": old_coverage.float().mean(),
+        "depth_consistent_ratio": depth_consistent.float().mean(),
+        "current_in_front_ratio": current_in_front.float().mean(),
+        "old_in_front_ratio": old_in_front.float().mean(),
+        "append_mask": append_mask,
+        "unique_gs": torch.unique(updated_indices).numel(),
+        "updated_indices": updated_indices.detach(),
+        "residual_regularization": projected_stats["regularization"],
+        "opacity_decay_candidate_probability": projected_stats[
+            "front_decay_probability_mean"
+        ],
+        "opacity_decay_candidate_count": evidence.old_in_front.float().sum(),
+        "opacity_decay_mass_ratio": projected_stats["opacity_shift_mean"],
+        **update_stats,
+    }
+    return updated, stats
+
+
 def _predict_updated_state(
     model,
     cfg: DictConfig,
@@ -1079,6 +1373,25 @@ def _predict_updated_state(
     image_shape: tuple[int, int],
     global_step: int,
 ):
+    residual_mode = str(cfg.get("residual_mode", "pixel_topk")).lower()
+    if residual_mode == "projected_shared":
+        return _predict_projected_updated_state(
+            model,
+            cfg,
+            state,
+            current_feature,
+            current_rgb,
+            current_depth,
+            current_c2w,
+            current_intrinsic,
+            image_shape,
+            global_step,
+        )
+    if residual_mode != "pixel_topk":
+        raise ValueError(
+            "toy.residual_mode must be pixel_topk or projected_shared; "
+            f"got {residual_mode!r}."
+        )
     batch = state.gaussians.means.shape[0]
     height, width = image_shape
     residual_topk = max(1, int(cfg.get("residual_topk", 1)))
@@ -1095,10 +1408,10 @@ def _predict_updated_state(
             "toy.mean_update_mode must be 'relative_depth' or 'absolute', "
             f"got {mean_update_mode!r}."
         )
-    append_mode = str(cfg.get("append_mode", "logic")).lower()
-    if append_mode not in {"logic", "all"}:
+    append_mode = str(cfg.get("append_mode", "point_map")).lower()
+    if append_mode not in {"logic", "point_map", "all"}:
         raise ValueError(
-            "toy.append_mode must be 'logic' or 'all', "
+            "toy.append_mode must be 'point_map' or 'all', "
             f"got {append_mode!r}."
         )
     gir = DominantGIR.empty(batch, height, width, current_feature.device, current_feature.dtype)
@@ -1142,12 +1455,23 @@ def _predict_updated_state(
             & (relative_depth_delta < -float(cfg.depth_relative_tolerance))
         )
         overlap = depth_consistent
-        # Keep the geometric rule by default. The all mode is an explicit
-        # ablation that appends every valid current-frame Gaussian.
         if append_mode == "all":
             append_mask = valid_depth
         else:
-            append_mask = valid_depth & (~old_coverage | current_in_front)
+            append_mask, _ = build_point_map_append_mask(
+                state=state,
+                current_depth=current_depth[:, None],
+                camera_to_world=current_c2w,
+                intrinsics=current_intrinsic,
+                depth_relative_tolerance=float(
+                    cfg.get(
+                        "point_append_depth_relative_tolerance",
+                        cfg.depth_relative_tolerance,
+                    )
+                ),
+                dilation_radius=int(cfg.get("point_append_dilation_radius", 1)),
+                chunk_size=int(cfg.get("point_append_chunk_size", 65536)),
+            )
         rgb_error = (gir.rgb.float() - current_rgb.float()).abs().mean(dim=1, keepdim=True)
         rgb_bad = rgb_error >= float(cfg.rgb_bad_threshold)
         bad_mask = (depth_consistent & rgb_bad) | old_in_front
@@ -1901,8 +2225,9 @@ def _forward_experiment(
             )
             state = state.append(
                 current_gaussians,
-                stats["append_mask"].to(current_gaussians.opacities.dtype),
-                prune_threshold=0.5,
+                torch.ones_like(current_gaussians.opacities),
+                append_mask=stats["append_mask"],
+                point_map=current_gaussians.means,
             )
             appended_gs = state.num_gaussians - previous_gs_count
         else:
@@ -2040,6 +2365,8 @@ def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_d
     model.encoder.camera_head.eval()
     model.encoder.gs_head.eval()
     model.gir_update_head.eval()
+    if model.gir_projected_update_head is not None:
+        model.gir_projected_update_head.eval()
     result = _forward_experiment(
         model,
         cfg,
@@ -2091,7 +2418,7 @@ def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_d
         "residual_contributor_conditioned": bool(
             cfg.get("residual_contributor_conditioned", False)
         ),
-        "append_mode": str(cfg.get("append_mode", "logic")).lower(),
+        "append_mode": str(cfg.get("append_mode", "point_map")).lower(),
         "mean_update_mode": str(
             cfg.get("mean_update_mode", "relative_depth")
         ).lower(),
@@ -2316,9 +2643,19 @@ def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_d
     model.encoder.camera_head.train(bool(cfg.train_camera_head))
     model.encoder.gs_head.train(bool(cfg.get("train_gs_head", True)))
     model.gir_update_head.train(
-        bool(cfg.residual_enabled)
+        (
+            bool(cfg.residual_enabled)
+            and str(cfg.get("residual_mode", "pixel_topk")).lower()
+            == "pixel_topk"
+        )
         or bool(cfg.get("opacity_decay_enabled", False))
     )
+    if model.gir_projected_update_head is not None:
+        model.gir_projected_update_head.train(
+            bool(cfg.residual_enabled)
+            and str(cfg.get("residual_mode", "pixel_topk")).lower()
+            == "projected_shared"
+        )
     return metrics
 
 
@@ -2329,6 +2666,10 @@ def _save_checkpoint(model, optimizer, scheduler, scaler, step: int, output_dir:
         ("encoder.gs_head", model.encoder.gs_head),
         ("gir_update_head", model.gir_update_head),
     ]
+    if model.gir_projected_update_head is not None:
+        modules.append(
+            ("gir_projected_update_head", model.gir_projected_update_head)
+        )
     if any(parameter.requires_grad for parameter in model.encoder.camera_head.parameters()):
         modules.append(("encoder.camera_head", model.encoder.camera_head))
     for prefix, module in modules:
@@ -2479,6 +2820,12 @@ def main(cfg_dict: DictConfig) -> None:
     OmegaConf.save(cfg_dict, output_dir / "resolved_config.yaml", resolve=True)
 
     residual_enabled = bool(toy_cfg.residual_enabled)
+    residual_mode = str(toy_cfg.get("residual_mode", "pixel_topk")).lower()
+    if residual_mode not in {"pixel_topk", "projected_shared"}:
+        raise ValueError(
+            "toy.residual_mode must be pixel_topk or projected_shared; "
+            f"got {residual_mode!r}."
+        )
     residual_topk = max(1, int(toy_cfg.get("residual_topk", 1)))
     residual_independent_heads = bool(
         toy_cfg.get("residual_independent_heads", False)
@@ -2494,6 +2841,11 @@ def main(cfg_dict: DictConfig) -> None:
     opacity_decay_enabled = bool(
         toy_cfg.get("opacity_decay_enabled", False)
     )
+    if residual_mode == "projected_shared" and opacity_decay_enabled:
+        raise ValueError(
+            "projected_shared includes front-surface opacity decay; set "
+            "toy.opacity_decay_enabled=false."
+        )
     raw_scale_residual = bool(toy_cfg.get("raw_scale_residual", False))
     raw_opacity_residual = bool(toy_cfg.get("raw_opacity_residual", False))
     raw_rotation_residual = bool(toy_cfg.get("raw_rotation_residual", False))
@@ -2510,7 +2862,21 @@ def main(cfg_dict: DictConfig) -> None:
         )
     root_cfg = load_typed_root_config(cfg_dict)
     model = get_model(root_cfg.model.encoder, root_cfg.model.decoder)
-    if residual_enabled and residual_independent_heads:
+    model_residual_mode = str(
+        getattr(model.encoder.cfg, "gir_old_update_mode", "pixel_topk")
+    ).lower()
+    if model_residual_mode != residual_mode:
+        raise ValueError(
+            "The overfit rollout and model must use the same old-GS update "
+            "mode: toy.residual_mode="
+            f"{residual_mode!r}, model.encoder.gir_old_update_mode="
+            f"{model_residual_mode!r}."
+        )
+    if (
+        residual_mode == "pixel_topk"
+        and residual_enabled
+        and residual_independent_heads
+    ):
         model.gir_update_head.configure_historical_prediction_heads(
             residual_topk
         )
@@ -2541,15 +2907,25 @@ def main(cfg_dict: DictConfig) -> None:
     train_camera_head = bool(toy_cfg.train_camera_head)
     heldout_loss_enabled = bool(toy_cfg.heldout_loss_enabled)
     print(f"Old-GS residual enabled: {residual_enabled}")
-    print(
-        "Old-GS residual contributors per pixel: "
-        f"{residual_topk}"
-    )
-    print(f"Independent contributor residual heads: {residual_independent_heads}")
-    print(
-        "Shared contributor-conditioned residual head: "
-        f"{residual_contributor_conditioned}"
-    )
+    print(f"Old-GS residual mode: {residual_mode}")
+    if residual_mode == "pixel_topk":
+        print(
+            "Old-GS residual contributors per pixel: "
+            f"{residual_topk}"
+        )
+        print(
+            "Independent contributor residual heads: "
+            f"{residual_independent_heads}"
+        )
+        print(
+            "Shared contributor-conditioned residual head: "
+            f"{residual_contributor_conditioned}"
+        )
+    else:
+        print(
+            "Projected shared residual: one all-parameter update per "
+            "eligible old GS; pixel top-k heads are inactive"
+        )
     print(
         "Contributor-conditioned opacity decay: "
         f"enabled={opacity_decay_enabled}, "
@@ -2559,25 +2935,39 @@ def main(cfg_dict: DictConfig) -> None:
         f"budget_weight={float(toy_cfg.get('opacity_decay_budget_weight', 0.0)):g}, "
         f"warmup_steps={int(toy_cfg.get('opacity_decay_warmup_steps', 0))}"
     )
-    print(f"Historical mean update mode: {mean_update_mode}")
-    if mean_update_mode == "absolute":
-        print("Absolute mean mode: toy.mean_relative_scale is ignored.")
-    print(
-        "Raw historical residuals: "
-        f"mean={mean_update_mode == 'absolute'}, "
-        f"rotation={raw_rotation_residual}, "
-        f"scale={raw_scale_residual}, "
-        f"opacity={raw_opacity_residual}, "
-        f"harmonics={raw_harmonics_residual}"
-    )
-    print(
-        "Enabled historical residual channels: "
-        f"mean={bool(toy_cfg.get('residual_mean_enabled', True))}, "
-        f"rotation={bool(toy_cfg.get('residual_rotation_enabled', True))}, "
-        f"scale={bool(toy_cfg.get('residual_scale_enabled', True))}, "
-        f"opacity={bool(toy_cfg.get('residual_opacity_enabled', True))}, "
-        f"harmonics={bool(toy_cfg.get('residual_harmonics_enabled', True))}"
-    )
+    if residual_mode == "projected_shared":
+        print(
+            "Enabled projected residual channels for surface-consistent RGB "
+            "errors: mean/rotation/scale/opacity/harmonics=true; front errors "
+            "use opacity decay only"
+        )
+        print(
+            "Projected mean parameterization: "
+            f"mode={mean_update_mode}, relative_scale="
+            f"{float(toy_cfg.mean_relative_scale):g}"
+        )
+        if mean_update_mode == "absolute":
+            print("Absolute mean mode: toy.mean_relative_scale is ignored.")
+    else:
+        print(f"Historical mean update mode: {mean_update_mode}")
+        if mean_update_mode == "absolute":
+            print("Absolute mean mode: toy.mean_relative_scale is ignored.")
+        print(
+            "Raw historical residuals: "
+            f"mean={mean_update_mode == 'absolute'}, "
+            f"rotation={raw_rotation_residual}, "
+            f"scale={raw_scale_residual}, "
+            f"opacity={raw_opacity_residual}, "
+            f"harmonics={raw_harmonics_residual}"
+        )
+        print(
+            "Enabled historical residual channels: "
+            f"mean={bool(toy_cfg.get('residual_mean_enabled', True))}, "
+            f"rotation={bool(toy_cfg.get('residual_rotation_enabled', True))}, "
+            f"scale={bool(toy_cfg.get('residual_scale_enabled', True))}, "
+            f"opacity={bool(toy_cfg.get('residual_opacity_enabled', True))}, "
+            f"harmonics={bool(toy_cfg.get('residual_harmonics_enabled', True))}"
+        )
     print(f"Train Gaussian feature/depth head: {train_gaussian_param_head}")
     print(f"Train base GS parameter head: {train_gs_head}")
     print(f"Train depth output head: {train_depth_head}")
@@ -2608,8 +2998,9 @@ def main(cfg_dict: DictConfig) -> None:
     )
     print(
         "Append mode: "
-        f"{str(toy_cfg.get('append_mode', 'logic')).lower()} "
-        "(logic=uncovered/front surface, all=every valid current pixel)"
+        f"{str(toy_cfg.get('append_mode', 'point_map')).lower()} "
+        "(point_map=no depth-consistent historical point, "
+        "all=every valid current pixel)"
     )
     if depth_loss_enabled and not train_depth_head:
         raise ValueError(
@@ -2623,6 +3014,7 @@ def main(cfg_dict: DictConfig) -> None:
     group_defs = _configure_trainable_modules(
         model,
         residual_enabled,
+        residual_mode,
         train_gaussian_param_head,
         train_gs_head,
         train_depth_head,
@@ -2685,6 +3077,7 @@ def main(cfg_dict: DictConfig) -> None:
         "gaussian_param_head": float(toy_cfg.gaussian_head_lr),
         "gs_head": float(toy_cfg.gs_head_lr),
         "old_residual_head": float(toy_cfg.residual_head_lr),
+        "projected_old_residual_head": float(toy_cfg.residual_head_lr),
         "camera_head": float(toy_cfg.camera_head_lr),
     }
     optimizer_groups = [
@@ -2720,7 +3113,13 @@ def main(cfg_dict: DictConfig) -> None:
     model.encoder.gaussian_param_head.train(train_gaussian_param_head)
     model.encoder.camera_head.train(train_camera_head)
     model.encoder.gs_head.train(train_gs_head)
-    model.gir_update_head.train()
+    model.gir_update_head.train(
+        residual_mode == "pixel_topk" or opacity_decay_enabled
+    )
+    if model.gir_projected_update_head is not None:
+        model.gir_projected_update_head.train(
+            residual_enabled and residual_mode == "projected_shared"
+        )
 
     _inherit_resume_logs(resume_state, output_dir)
     csv_path = output_dir / "metrics.csv"

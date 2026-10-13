@@ -20,8 +20,16 @@ model:
     gir_dominant_id_enabled: true
     gir_dominant_min_weight: 1.0e-4
     gir_old_residual_enabled: true
+    gir_old_update_mode: projected_shared
+    gir_projected_hidden_dim: 128
+    gir_projected_chunk_size: 65536
+    gir_projected_min_radius: 0.1
+    gir_projected_covariance_sigma: 3.0
+    gir_projected_opacity_logit_scale: 1.0
+    gir_projected_front_decay_strength: 0.02
+    gir_projected_warmup_steps: 1000
     gir_old_delete_enabled: false
-    gir_old_decay_enabled: true
+    gir_old_decay_enabled: false
     gir_old_decay_topk: 4
     gir_old_decay_strength: 0.02
     gir_old_decay_prune_threshold: 0.005
@@ -50,12 +58,22 @@ toy:
   save_checkpoints: false
   mixed_precision: true
   residual_enabled: true
+  # Keep head construction and the overfit rollout on the same implementation.
+  residual_mode: ${model.encoder.gir_old_update_mode}  # pixel_topk | projected_shared
+  projected_hidden_dim: 128
+  projected_chunk_size: 65536
+  projected_min_radius: 0.1
+  projected_covariance_sigma: 3.0
+  projected_opacity_logit_scale: 1.0
+  projected_front_decay_strength: 0.02
+  projected_warmup_steps: 1000
   # Scatter each pixel residual to its strongest K historical contributors.
   # K=1 preserves the original dominant-GS update path.
   residual_topk: 4
   # Match the main pipeline: rank-specific residual heads and top-k write-back.
   residual_contributor_conditioned: false
   residual_independent_heads: true
+  # projected_shared updates every channel for surface-consistent RGB errors.
   residual_mean_enabled: true
   residual_rotation_enabled: true
   residual_scale_enabled: true
@@ -85,15 +103,17 @@ toy:
   # all: detach every historical GS parameter; means: detach positions only;
   # none: preserve the complete cross-view graph. Current residual updates are
   # applied after this boundary and remain differentiable for the current step.
-  historical_detach_mode: means  # all | means | none
-  # Append where the old map has no coverage or the current surface is closer.
+  historical_detach_mode: none  # all | means | none
+  # Append where no historical point projects to a depth-consistent surface.
   append_new_gs_enabled: true
-  # logic: append uncovered/front surfaces only; all: append every valid pixel.
-  append_mode: all
+  append_mode: point_map  # point_map | all
+  point_append_depth_relative_tolerance: 0.08
+  point_append_dilation_radius: 1
+  point_append_chunk_size: 65536
 
   # Contributor-conditioned top-4 soft opacity decay. Hard pruning is only
   # applied during evaluation when explicitly enabled.
-  opacity_decay_enabled: true
+  opacity_decay_enabled: false
   opacity_decay_topk: 4
   opacity_decay_strength: 0.02
   opacity_decay_temperature: 1.0
@@ -132,6 +152,8 @@ toy:
   loss_heldout: 1.0
   loss_residual_regularization: 1.0e-4
 
+  # absolute uses the raw camera-space output and ignores mean_relative_scale;
+  # relative_depth uses tanh(output) * mean_relative_scale * depth.
   mean_update_mode: absolute  # absolute | relative_depth
   # Bounds used by the relative-depth mean mode and channels in bounded mode.
   mean_relative_scale: 0.02

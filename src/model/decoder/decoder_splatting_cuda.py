@@ -45,6 +45,13 @@ class GIRRasterizationOutput:
     contributor_weights: Tensor | None = None
 
 
+@dataclass
+class ProjectedGSRasterizationOutput:
+    color: Tensor
+    expected_depth: Tensor
+    alpha: Tensor
+
+
 @torch.no_grad()
 def _rasterize_top_contributor_fallback(
     means2d: Tensor,
@@ -222,6 +229,62 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             "background_color",
             torch.tensor(cfg.background_color, dtype=torch.float32),
             persistent=False,
+        )
+
+    @torch.no_grad()
+    def render_projected_gs_evidence(
+        self,
+        gaussians: Gaussians,
+        extrinsics: Float[Tensor, "batch 4 4"],
+        intrinsics: Float[Tensor, "batch 3 3"],
+        image_shape: tuple[int, int],
+    ) -> ProjectedGSRasterizationOutput:
+        """Render old-map evidence without querying per-pixel contributor IDs."""
+        b = gaussians.means.shape[0]
+        h, w = image_shape
+        colors = []
+        expected_depths = []
+        alphas = []
+
+        for batch_idx in range(b):
+            xyz = gaussians.means[batch_idx].float()
+            features = gaussians.harmonics[batch_idx].float()
+            scales = gaussians.scales[batch_idx].float()
+            rotations = gaussians.rotations[batch_idx].float()
+            opacities = gaussians.opacities[batch_idx].float()
+            world_to_camera = extrinsics[batch_idx : batch_idx + 1].float().inverse()
+            intrinsics_px = intrinsics[batch_idx : batch_idx + 1].float().clone()
+            intrinsics_px[:, 0] *= w
+            intrinsics_px[:, 1] *= h
+            sh_degree = int(sqrt(features.shape[-2])) - 1
+
+            rendering, alpha, _ = rasterization(
+                xyz,
+                rotations,
+                scales,
+                opacities,
+                features,
+                world_to_camera,
+                intrinsics_px,
+                w,
+                h,
+                sh_degree=sh_degree,
+                render_mode="RGB+ED",
+                packed=False,
+                near_plane=1e-10,
+                backgrounds=self.background_color.unsqueeze(0),
+                radius_clip=0.1,
+                rasterize_mode="classic",
+            )
+            rgb, depth = torch.split(rendering, [3, 1], dim=-1)
+            colors.append(rgb[0].permute(2, 0, 1).clamp(0.0, 1.0))
+            expected_depths.append(depth[0].permute(2, 0, 1))
+            alphas.append(alpha[0].permute(2, 0, 1))
+
+        return ProjectedGSRasterizationOutput(
+            color=torch.stack(colors),
+            expected_depth=torch.stack(expected_depths),
+            alpha=torch.stack(alphas),
         )
 
     @torch.no_grad()

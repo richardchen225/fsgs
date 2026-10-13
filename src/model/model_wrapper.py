@@ -327,41 +327,72 @@ class ModelWrapper(LightningModule):
                 )
 
         gir_head = getattr(self.model, "gir_update_head", None)
+        projected_gir_head = getattr(
+            self.model, "gir_projected_update_head", None
+        )
         gir_enabled = bool(getattr(self.model.encoder.cfg, "gir_enabled", False))
-        if train_gir and (not gir_enabled or gir_head is None):
+        if train_gir and (
+            not gir_enabled or (gir_head is None and projected_gir_head is None)
+        ):
             raise ValueError(
                 "optimizer.train_gir=true requires model.encoder.gir_enabled=true."
             )
+        old_update_mode = str(
+            getattr(
+                self.model.encoder.cfg,
+                "gir_old_update_mode",
+                "pixel_topk",
+            )
+        ).lower()
+        projected_update_enabled = bool(
+            getattr(self.model.encoder.cfg, "gir_old_residual_enabled", True)
+        ) and old_update_mode == "projected_shared"
+        if projected_gir_head is not None:
+            projected_gir_head.requires_grad_(
+                train_gir and projected_update_enabled
+            )
         if gir_head is not None:
-            gir_head.requires_grad_(train_gir)
+            new_residual_enabled = bool(
+                getattr(
+                    self.model.encoder.cfg,
+                    "gir_new_residual_enabled",
+                    True,
+                )
+            )
+            old_delete_enabled = bool(
+                getattr(
+                    self.model.encoder.cfg,
+                    "gir_old_delete_enabled",
+                    False,
+                )
+            )
+            old_decay_enabled = bool(
+                getattr(
+                    self.model.encoder.cfg,
+                    "gir_old_decay_enabled",
+                    False,
+                )
+            )
+            add_gate_enabled = bool(
+                getattr(self.model.encoder.cfg, "gir_add_gate_enabled", True)
+            )
+            pixel_residual_enabled = bool(
+                getattr(self.model.encoder.cfg, "gir_old_residual_enabled", True)
+            ) and old_update_mode == "pixel_topk"
+            pixel_head_needed = (
+                pixel_residual_enabled
+                or new_residual_enabled
+                or old_delete_enabled
+                or old_decay_enabled
+                or add_gate_enabled
+            )
+            gir_head.requires_grad_(train_gir and pixel_head_needed)
 
-            if train_gir:
+            if train_gir and pixel_head_needed:
                 # Keep the optimizer/DDP parameter set consistent with the
                 # streaming branches that are actually enabled.  The GIR
                 # head contains several independent output heads, but the
                 # current experiment trains only historical residuals.
-                new_residual_enabled = bool(
-                    getattr(
-                        self.model.encoder.cfg,
-                        "gir_new_residual_enabled",
-                        True,
-                    )
-                )
-                old_delete_enabled = bool(
-                    getattr(
-                        self.model.encoder.cfg,
-                        "gir_old_delete_enabled",
-                        False,
-                    )
-                )
-                old_decay_enabled = bool(
-                    getattr(
-                        self.model.encoder.cfg,
-                        "gir_old_decay_enabled",
-                        False,
-                    )
-                )
-
                 current_prediction = getattr(
                     gir_head, "current_prediction", None
                 )
@@ -397,6 +428,25 @@ class ModelWrapper(LightningModule):
                         f"delete={old_delete_enabled or old_decay_enabled}; "
                         "disabled GIR heads are frozen"
                     )
+
+        if train_gir and projected_update_enabled:
+            print(
+                "GIR old-map update: projected_shared residuals for "
+                "mean/rotation/scale/opacity/SH; front errors decay opacity "
+                "only; pixel rank heads and top-k decay are disabled"
+            )
+        append_mode = str(
+            getattr(self.model.encoder.cfg, "gir_append_mode", "all")
+        ).lower()
+        print(
+            "GIR new-GS append mode: "
+            f"{append_mode}"
+            + (
+                " (depth-consistent global point-map coverage)"
+                if append_mode == "point_map"
+                else ""
+            )
+        )
 
         if not train_base_heads and not train_gir:
             raise ValueError(
@@ -517,6 +567,9 @@ class ModelWrapper(LightningModule):
             )
             for metric_name in (
                 "gir_add_gate_enabled",
+                "gir_append_mode_code",
+                "gir_point_coverage_ratio",
+                "gir_point_append_ratio",
                 "gir_add_gate_learned",
                 "gir_add_gate_warmup_progress",
                 "gir_add_rate",
@@ -603,8 +656,15 @@ class ModelWrapper(LightningModule):
                 )
             for metric_name in (
                 "gir_old_residual_enabled",
+                "gir_old_update_mode_code",
                 "gir_residual_topk",
                 "gir_residual_independent_heads",
+                "gir_projected_candidate_ratio",
+                "gir_projected_consistent_ratio",
+                "gir_projected_front_ratio",
+                "gir_projected_gate_mean",
+                "gir_projected_opacity_shift",
+                "gir_projected_front_decay_probability",
                 "gir_old_delete_target_ratio",
                 "gir_old_delete_candidate_probability",
                 "gir_old_delete_candidate_count",
@@ -651,6 +711,7 @@ class ModelWrapper(LightningModule):
             for metric_name in (
                 "gir_base_rgb_loss",
                 "gir_current_rgb_loss",
+                "gir_new_hole_rgb_loss",
                 "gir_replay_rgb_loss",
             ):
                 if metric_name in encoder_output.infos:
@@ -927,6 +988,7 @@ class ModelWrapper(LightningModule):
                 "gir_aux_loss",
                 "gir_base_rgb_loss",
                 "gir_current_rgb_loss",
+                "gir_new_hole_rgb_loss",
                 "gir_replay_rgb_loss",
             ):
                 value = (encoder_output.infos or {}).get(key)
@@ -1213,6 +1275,9 @@ class ModelWrapper(LightningModule):
             info_keys = (
                 "gir_old_residual_enabled",
                 "gir_add_gate",
+                "gir_append_mode_code",
+                "gir_point_coverage_ratio",
+                "gir_point_append_ratio",
                 "gir_add_gate_learned",
                 "gir_add_gate_warmup_progress",
                 "gir_add_rate",
@@ -1801,6 +1866,7 @@ class ModelWrapper(LightningModule):
         scratch_keys = (
             "model.encoder.depth_refiner",
             "model.gir_update_head",
+            "model.gir_projected_update_head",
         )
 
         for name, param in self.named_parameters():

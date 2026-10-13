@@ -53,6 +53,18 @@ def _print_gir_parameter_stats(model, enabled: bool) -> None:
                     f"[GIR DEBUG] init {module_name}.{parameter_name}: "
                     f"finite=0/{value.numel()}"
                 )
+    projected_head = getattr(model, "gir_projected_update_head", None)
+    if projected_head is not None:
+        for parameter_name, parameter in projected_head.named_parameters():
+            value = parameter.detach().float()
+            finite = torch.isfinite(value)
+            finite_values = value[finite]
+            print(
+                "[GIR DEBUG] init projected_shared."
+                f"{parameter_name}: finite={int(finite.sum().item())}/"
+                f"{value.numel()} absmax="
+                f"{finite_values.abs().max().item() if finite_values.numel() else float('nan'):.6e}"
+            )
 
 # Configure beartype and jaxtyping.
 with install_import_hook(
@@ -209,6 +221,7 @@ def train(cfg_dict: DictConfig):
                 "encoder.cam_dec.",
                 "encoder.depth_refiner.",
                 "gir_update_head.",
+                "gir_projected_update_head.",
             )
             model_state = model.state_dict()
             compatible_ckpt = {
@@ -279,6 +292,7 @@ def train(cfg_dict: DictConfig):
             or "cam_dec" in key
             or "depth_refiner" in key
             or "gir_update_head" in key
+            or "gir_projected_update_head" in key
         }
 
         model_state = model.state_dict()
@@ -303,6 +317,17 @@ def train(cfg_dict: DictConfig):
         ]
         if getattr(cfg.model.encoder, "gir_enabled", False):
             required_prefixes.append("gir_update_head.")
+            if (
+                str(
+                    getattr(
+                        cfg.model.encoder,
+                        "gir_old_update_mode",
+                        "pixel_topk",
+                    )
+                ).lower()
+                == "projected_shared"
+            ):
+                required_prefixes.append("gir_projected_update_head.")
         required_keys = {
             key
             for key in model_state

@@ -112,6 +112,14 @@ class EncoderAnySplatCfg:
     gir_top1_confidence_mode: Literal["none", "floor_sqrt", "sqrt"] = "none"
     gir_top1_confidence_floor: float = 0.25
     gir_old_residual_enabled: bool = True
+    gir_old_update_mode: Literal["pixel_topk", "projected_shared"] = "pixel_topk"
+    gir_projected_hidden_dim: int = 128
+    gir_projected_chunk_size: int = 65536
+    gir_projected_min_radius: float = 0.1
+    gir_projected_covariance_sigma: float = 3.0
+    gir_projected_opacity_logit_scale: float = 1.0
+    gir_projected_front_decay_strength: float = 0.02
+    gir_projected_warmup_steps: int = 1000
     gir_old_delete_enabled: bool = False
     gir_old_delete_warmup_steps: int = 1000
     gir_old_delete_target_ratio: float = 0.01
@@ -140,12 +148,17 @@ class EncoderAnySplatCfg:
     gir_aux_loss_weight: float = 1.0
     gir_base_loss_weight: float = 1.0
     gir_current_loss_weight: float = 1.0
+    gir_new_hole_loss_weight: float = 1.0
     gir_replay_loss_weight: float = 0.5
     gir_history_adapt_weight: float = 0.05
     gir_history_preserve_weight: float = 0.10
     gir_history_loss_interval: int = 4
     gir_history_preserve_margin: float = 0.002
     gir_history_replay_views: int = 1
+    gir_append_mode: Literal["all", "point_map", "learned"] = "all"
+    gir_point_append_depth_relative_tolerance: float = 0.08
+    gir_point_append_dilation_radius: int = 1
+    gir_point_append_chunk_size: int = 65536
     gir_add_gate_enabled: bool = True
     gir_add_gate_warmup_steps: int = 1000
     gir_add_rate_loss_weight: float = 0.01
@@ -924,9 +937,8 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             pred_all_extrinsic = torch.cat(
                 [pred_all_extrinsic, extrinsic_padding], dim=2
             ).inverse()
-            # Keep the differentiable predicted context poses available to the
-            # wrapper for GT camera supervision. Rendering may detach its own
-            # camera copy later, but this tensor must remain attached.
+            # Keep predicted poses attached so camera supervision and RGB
+            # rendering losses can both train the camera head.
             infos["pred_context_c2w"] = pred_all_extrinsic
             # Supervise the same finite pose encoding used to build the
             # differentiable camera matrices and intrinsics above.
@@ -962,8 +974,8 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                     out,
                     depth_base,
                     depth_conf,
-                    extrinsics_c2w=gt_ex.detach(),
-                    intrinsics=gt_ix.detach(),
+                    extrinsics_c2w=gt_ex,
+                    intrinsics=gt_ix,
                     return_intermediate=False,
                 )
                 depth_for_geometry = torch.nan_to_num(
@@ -989,7 +1001,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         )
         
         means = batchify_unproject_depth_map_to_point_map(
-            depth_for_geometry, gt_ex.detach(), gt_ix.detach()
+            depth_for_geometry, gt_ex, gt_ix
         )
         # means = means.reshape(b, v , h * w, 3).squeeze(0)
         # quats = quats.reshape(b, v , h * w, 4).squeeze(0)
