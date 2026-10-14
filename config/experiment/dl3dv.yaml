@@ -77,8 +77,10 @@ model:
     gir_history_loss_interval: 4
     gir_history_preserve_margin: 0.002
     gir_history_replay_views: -1
-    # Append only where the historical point map has no depth-consistent point.
+    # Projection-only append: any valid historical point covers its pixel.
     gir_append_mode: point_map
+    gir_point_append_depth_check_enabled: false
+    # Used only when depth checking is enabled.
     gir_point_append_depth_relative_tolerance: 0.08
     gir_point_append_dilation_radius: 1
     gir_point_append_chunk_size: 65536
@@ -151,7 +153,7 @@ train:
   pose_loss_delta: 1.0
   camera_focal_weight: 1.0
   cxt_depth_weight: 1.0
-  weight_pose: 1.0
+  weight_pose: 10.0
   weight_depth: 1.0
   weight_normal: 0.1
 
@@ -177,7 +179,7 @@ loss:
     # camera trajectory scale before supervising predicted depth.
     align_to_gt_camera_scale: true
     absolute_log_scale_weight: 0.1
-    weight: 0.01
+    weight: 1.0
     sigma_image: null
     use_second_derivative: false
     dav3_weights_path: weights/pre_dav3.safetensors

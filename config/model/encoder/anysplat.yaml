@@ -81,6 +81,8 @@ gir_harmonics_scale: 0.10
 # New-GS append policy. point_map ignores Gaussian footprints and only appends
 # pixels without a depth-consistent historical point.
 gir_append_mode: all  # all | point_map | learned
+# False uses projection coverage only; True also requires depth consistency.
+gir_point_append_depth_check_enabled: true
 gir_point_append_depth_relative_tolerance: 0.08
 gir_point_append_dilation_radius: 1
 gir_point_append_chunk_size: 65536

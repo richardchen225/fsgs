@@ -156,6 +156,7 @@ class EncoderAnySplatCfg:
     gir_history_preserve_margin: float = 0.002
     gir_history_replay_views: int = 1
     gir_append_mode: Literal["all", "point_map", "learned"] = "all"
+    gir_point_append_depth_check_enabled: bool = True
     gir_point_append_depth_relative_tolerance: float = 0.08
     gir_point_append_dilation_radius: int = 1
     gir_point_append_chunk_size: int = 65536

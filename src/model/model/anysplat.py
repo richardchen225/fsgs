@@ -766,6 +766,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             raise ValueError(
                 "gir_append_mode=learned requires gir_add_gate_enabled=true."
             )
+        point_append_depth_check = bool(
+            getattr(cfg, "gir_point_append_depth_check_enabled", True)
+        )
         point_append_tolerance = float(
             getattr(cfg, "gir_point_append_depth_relative_tolerance", 0.08)
         )
@@ -1688,6 +1691,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     depth_relative_tolerance=point_append_tolerance,
                     dilation_radius=point_append_dilation,
                     chunk_size=point_append_chunk_size,
+                    depth_check_enabled=point_append_depth_check,
                 )
                 point_coverage_ratios.append(point_coverage.float().mean())
                 point_append_ratios.append(point_append_mask.float().mean())
@@ -2068,6 +2072,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 device=features.device,
             )
             if point_coverage_ratios:
+                encoder_output.infos["gir_point_append_depth_check_enabled"] = (
+                    features.new_tensor(float(point_append_depth_check))
+                )
                 encoder_output.infos["gir_point_coverage_ratio"] = torch.stack(
                     point_coverage_ratios
                 ).mean()

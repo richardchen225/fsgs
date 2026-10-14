@@ -322,6 +322,68 @@ def test_point_map_append_ignores_depth_inconsistent_floaters() -> None:
     assert torch.equal(append_mask, ~coverage)
 
 
+def test_projection_only_append_is_batch_safe_and_ignores_depth_mismatch() -> None:
+    state = _make_state()
+    # Different covered pixels in each scene; one point is in front of the
+    # current surface, the other behind it. Neither matches the current depth.
+    state.point_map = torch.tensor([
+        [[0.0, 0.0, 1.0], [0.0, 0.0, -1.0], [float("nan"), 0.0, 2.0]],
+        [[0.4, 0.0, 4.0], [100.0, 0.0, 2.0], [-0.4, 0.0, 2.0]],
+    ])
+    state.stable_ids[1, 2] = -1
+    depth = torch.full((2, 1, 10, 10), 2.0)
+    depth[0, 0, 0, 0] = 0.0
+    depth[1, 0, 0, 0] = float("nan")
+    depth.requires_grad_()
+    c2w = torch.eye(4).expand(2, -1, -1).clone().requires_grad_()
+    intrinsics = torch.tensor([
+        [1.0, 0.0, 0.5], [0.0, 1.0, 0.5], [0.0, 0.0, 1.0],
+    ]).expand(2, -1, -1).clone()
+    valid = torch.isfinite(depth) & (depth > 0)
+
+    for radius in (0, 1):
+        expected = torch.zeros_like(depth, dtype=torch.bool)
+        expected[0, 0, 5-radius:6+radius, 5-radius:6+radius] = True
+        expected[1, 0, 5-radius:6+radius, 6-radius:7+radius] = True
+        for chunk_size in (1, 65536):
+            append_mask, coverage = build_point_map_append_mask(
+                state, depth, c2w, intrinsics,
+                dilation_radius=radius, chunk_size=chunk_size,
+                depth_check_enabled=False,
+            )
+            assert torch.equal(coverage, expected)
+            assert torch.equal(append_mask, valid & ~expected)
+            assert not coverage.requires_grad and not append_mask.requires_grad
+
+    # The original depth-consistent mode still treats these surfaces as holes.
+    append_mask, coverage = build_point_map_append_mask(
+        state, depth, c2w, intrinsics, depth_check_enabled=True,
+    )
+    assert not coverage.any()
+    assert torch.equal(append_mask, valid)
+
+
+def test_projection_only_coverage_does_not_depend_on_current_depth_values() -> None:
+    state = _make_state()
+    c2w = torch.eye(4).expand(2, -1, -1).clone()
+    intrinsics = torch.eye(3).expand(2, -1, -1).clone()
+    intrinsics[:, :2, 2] = 0.5
+    depth = torch.full((2, 1, 10, 10), 2.0)
+    _, reference = build_point_map_append_mask(
+        state, depth, c2w, intrinsics, depth_check_enabled=False,
+    )
+    depth.fill_(20.0)
+    # Even an invalid current sample must not erase historical coverage or
+    # create valid neighboring appends through a change in the dilation mask.
+    depth[:, :, 5, 5] = float("nan")
+    append_mask, coverage = build_point_map_append_mask(
+        state, depth, c2w, intrinsics,
+        depth_relative_tolerance=0.0, depth_check_enabled=False,
+    )
+    assert torch.equal(coverage, reference)
+    assert torch.equal(append_mask, torch.isfinite(depth) & ~reference)
+
+
 def test_masked_append_is_physical_and_batch_safe() -> None:
     state = _make_state()
     means = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)

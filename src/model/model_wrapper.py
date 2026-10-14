@@ -584,6 +584,7 @@ class ModelWrapper(LightningModule):
             for metric_name in (
                 "gir_add_gate_enabled",
                 "gir_append_mode_code",
+                "gir_point_append_depth_check_enabled",
                 "gir_point_coverage_ratio",
                 "gir_point_append_ratio",
                 "gir_add_gate_learned",
@@ -1300,6 +1301,7 @@ class ModelWrapper(LightningModule):
                 "gir_old_residual_enabled",
                 "gir_add_gate",
                 "gir_append_mode_code",
+                "gir_point_append_depth_check_enabled",
                 "gir_point_coverage_ratio",
                 "gir_point_append_ratio",
                 "gir_add_gate_learned",

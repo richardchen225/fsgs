@@ -1172,6 +1172,9 @@ def _predict_projected_updated_state(
                 ),
                 dilation_radius=int(cfg.get("point_append_dilation_radius", 1)),
                 chunk_size=int(cfg.get("point_append_chunk_size", 65536)),
+                depth_check_enabled=bool(
+                    cfg.get("point_append_depth_check_enabled", True)
+                ),
             )
         else:
             raise ValueError(
@@ -1471,6 +1474,9 @@ def _predict_updated_state(
                 ),
                 dilation_radius=int(cfg.get("point_append_dilation_radius", 1)),
                 chunk_size=int(cfg.get("point_append_chunk_size", 65536)),
+                depth_check_enabled=bool(
+                    cfg.get("point_append_depth_check_enabled", True)
+                ),
             )
         rgb_error = (gir.rgb.float() - current_rgb.float()).abs().mean(dim=1, keepdim=True)
         rgb_bad = rgb_error >= float(cfg.rgb_bad_threshold)
@@ -2419,6 +2425,9 @@ def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_d
             cfg.get("residual_contributor_conditioned", False)
         ),
         "append_mode": str(cfg.get("append_mode", "point_map")).lower(),
+        "point_append_depth_check_enabled": bool(
+            cfg.get("point_append_depth_check_enabled", True)
+        ),
         "mean_update_mode": str(
             cfg.get("mean_update_mode", "relative_depth")
         ).lower(),
@@ -2999,8 +3008,13 @@ def main(cfg_dict: DictConfig) -> None:
     print(
         "Append mode: "
         f"{str(toy_cfg.get('append_mode', 'point_map')).lower()} "
-        "(point_map=no depth-consistent historical point, "
+        "(point_map=uncovered historical point projection, "
         "all=every valid current pixel)"
+    )
+    print(
+        "Point-map append depth check: "
+        f"{bool(toy_cfg.get('point_append_depth_check_enabled', True))} "
+        "(False=projection coverage only; True=depth-consistent coverage)"
     )
     if depth_loss_enabled and not train_depth_head:
         raise ValueError(

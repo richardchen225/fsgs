@@ -157,11 +157,15 @@ def build_point_map_append_mask(
     depth_relative_tolerance: float = 0.08,
     dilation_radius: int = 1,
     chunk_size: int = 65536,
+    depth_check_enabled: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Find current pixels without a depth-consistent historical point.
+    """Find current pixels not covered by projected historical points.
 
     Historical Gaussian centers are treated strictly as a point map. Gaussian
     scale, opacity, covariance, and rasterized alpha do not affect coverage.
+    With depth checking disabled, any valid projected point provides coverage,
+    regardless of its depth relative to the current surface. Current depth must
+    still be valid at pixels selected for append.
     """
     if current_depth.ndim == 3:
         current_depth = current_depth.unsqueeze(1)
@@ -230,18 +234,20 @@ def build_point_map_append_mask(
             & (state.stable_ids[:, start:end] >= 0)
         )
         linear_index = (pixel_y.clamp(0, h - 1) * w + pixel_x.clamp(0, w - 1))
-        sampled_depth = depth_flat.gather(1, linear_index)
-        depth_consistent = (
-            in_image
-            & torch.isfinite(sampled_depth)
-            & (sampled_depth > 1e-5)
-            & (
-                (z - sampled_depth).abs()
-                <= tolerance * sampled_depth.clamp_min(1e-4)
+        covered = in_image
+        if depth_check_enabled:
+            sampled_depth = depth_flat.gather(1, linear_index)
+            covered = (
+                in_image
+                & torch.isfinite(sampled_depth)
+                & (sampled_depth > 1e-5)
+                & (
+                    (z - sampled_depth).abs()
+                    <= tolerance * sampled_depth.clamp_min(1e-4)
+                )
             )
-        )
         coverage_count.scatter_add_(
-            1, linear_index, depth_consistent.to(coverage_count.dtype)
+            1, linear_index, covered.to(coverage_count.dtype)
         )
 
     coverage = (coverage_count > 0).reshape(b, 1, h, w)

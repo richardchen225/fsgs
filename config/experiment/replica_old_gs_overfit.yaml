@@ -104,9 +104,11 @@ toy:
   # none: preserve the complete cross-view graph. Current residual updates are
   # applied after this boundary and remain differentiable for the current step.
   historical_detach_mode: none  # all | means | none
-  # Append where no historical point projects to a depth-consistent surface.
+  # Append where no historical point projects, ignoring depth disagreement.
   append_new_gs_enabled: true
   append_mode: point_map  # point_map | all
+  point_append_depth_check_enabled: false
+  # Used only when depth checking is enabled.
   point_append_depth_relative_tolerance: 0.08
   point_append_dilation_radius: 1
   point_append_chunk_size: 65536
