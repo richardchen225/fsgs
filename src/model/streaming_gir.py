@@ -154,18 +154,43 @@ def build_point_map_append_mask(
     current_depth: torch.Tensor,
     camera_to_world: torch.Tensor,
     intrinsics: torch.Tensor,
-    depth_relative_tolerance: float = 0.08,
-    dilation_radius: int = 1,
+    current_rgb: torch.Tensor | None = None,
+    old_rgb: torch.Tensor | None = None,
+    old_depth: torch.Tensor | None = None,
+    old_alpha: torch.Tensor | None = None,
+    current_depth_confidence: torch.Tensor | None = None,
+    depth_relative_tolerance: float = 0.15,
+    rgb_bad_threshold: float = 0.08,
+    old_alpha_threshold: float = 0.10,
+    min_depth_confidence: float = 0.0,
+    dilation_radius: int = 2,
     chunk_size: int = 65536,
     depth_check_enabled: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    hybrid_enabled: bool = False,
+    append_current_in_front_enabled: bool = True,
+    append_history_in_front_enabled: bool = True,
+    front_conflict_confirm_views: int = 1,
+    max_append_ratio: float = 1.0,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     """Find current pixels not covered by projected historical points.
 
     Historical Gaussian centers are treated strictly as a point map. Gaussian
-    scale, opacity, covariance, and rasterized alpha do not affect coverage.
-    With depth checking disabled, any valid projected point provides coverage,
-    regardless of its depth relative to the current surface. Current depth must
-    still be valid at pixels selected for append.
+    scale and covariance do not affect coverage; effectively transparent
+    entries are ignored when deciding whether a front conflict is reliable.
+    Hybrid mode aligns current depth to the rendered historical depth per
+    scene and performs immediate layered fusion. Any historical point near the
+    current depth is a match and suppresses duplicate append. Historical points
+    in front of the current surface are opacity-decay candidates. If no match
+    exists, the current Gaussian is appended regardless of whether history is
+    in front, behind, or absent. The current-in-front and history-in-front
+    cases can be disabled independently as ablations. RGB does not decide
+    geometry in this mode.
     """
     if current_depth.ndim == 3:
         current_depth = current_depth.unsqueeze(1)
@@ -189,10 +214,76 @@ def build_point_map_append_mask(
     device = current_depth.device
     depth = current_depth.detach().float()
     valid_current = torch.isfinite(depth) & (depth > 1e-5)
-    depth_flat = depth[:, 0].reshape(b, h * w)
-    coverage_count = torch.zeros(
+    reliable_current = valid_current.clone()
+    if current_depth_confidence is not None:
+        confidence = current_depth_confidence.detach().float()
+        if confidence.ndim == 3:
+            confidence = confidence.unsqueeze(1)
+        if confidence.shape[-2:] != (h, w):
+            confidence = F.interpolate(
+                confidence, size=(h, w), mode="bilinear", align_corners=False
+            )
+        if confidence.shape != depth.shape:
+            raise ValueError(
+                "Point-map append depth confidence must match depth; got "
+                f"{tuple(confidence.shape)} and {tuple(depth.shape)}."
+            )
+        reliable_current &= torch.isfinite(confidence) & (
+            confidence >= float(min_depth_confidence)
+        )
+    confidence_score = torch.ones_like(depth)
+    if current_depth_confidence is not None:
+        confidence_score = torch.nan_to_num(
+            confidence, nan=0.0, posinf=0.0, neginf=0.0
+        ).clamp(0.0, 1.0)
+
+    def prepare_single_channel(
+        name: str,
+        value: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if value is None:
+            return None
+        value = value.detach().float()
+        if value.ndim == 3:
+            value = value.unsqueeze(1)
+        if value.ndim != 4 or value.shape[:2] != (b, 1):
+            raise ValueError(
+                f"{name} must have shape [B,1,H,W], got {tuple(value.shape)}."
+            )
+        if value.shape[-2:] != (h, w):
+            value = F.interpolate(
+                value, size=(h, w), mode="nearest"
+            )
+        return value
+
+    prepared_old_depth = prepare_single_channel("old_depth", old_depth)
+    prepared_old_alpha = prepare_single_channel("old_alpha", old_alpha)
+    depth_scale = torch.ones((b,), device=device, dtype=torch.float32)
+    if prepared_old_depth is not None and prepared_old_alpha is not None:
+        trusted = (
+            reliable_current
+            & torch.isfinite(prepared_old_depth)
+            & (prepared_old_depth > 1e-5)
+            & torch.isfinite(prepared_old_alpha)
+            & (prepared_old_alpha >= max(0.0, float(old_alpha_threshold)))
+        )
+        for batch_idx in range(b):
+            ratios = (
+                prepared_old_depth[batch_idx][trusted[batch_idx]]
+                / depth[batch_idx][trusted[batch_idx]].clamp_min(1e-5)
+            )
+            if ratios.numel() >= 32:
+                log_scale = ratios.log().median().clamp(-2.3, 2.3)
+                depth_scale[batch_idx] = log_scale.exp()
+
+    aligned_depth = depth * depth_scale[:, None, None, None]
+    depth_flat = aligned_depth[:, 0].reshape(b, h * w)
+    reliable_flat = reliable_current[:, 0].reshape(b, h * w)
+    projection_count = torch.zeros(
         (b, h * w), device=device, dtype=torch.float32
     )
+    consistent_count = torch.zeros_like(projection_count)
+    nearest_depth = torch.full_like(projection_count, float("inf"))
     world_to_camera = torch.linalg.inv(camera_to_world.detach().float())
     fx = intrinsics[:, 0, 0].detach().float().unsqueeze(1) * w
     fy = intrinsics[:, 1, 1].detach().float().unsqueeze(1) * h
@@ -201,14 +292,14 @@ def build_point_map_append_mask(
     tolerance = max(0.0, float(depth_relative_tolerance))
     chunk_size = max(1, int(chunk_size))
     point_count = state.num_gaussians
+    point_map = (
+        state.point_map
+        if state.point_map is not None
+        else state.gaussians.means.detach()
+    )
 
     for start in range(0, point_count, chunk_size):
         end = min(start + chunk_size, point_count)
-        point_map = (
-            state.point_map
-            if state.point_map is not None
-            else state.gaussians.means.detach()
-        )
         points = point_map[:, start:end].detach().float()
         ones = torch.ones(
             (*points.shape[:2], 1), device=device, dtype=torch.float32
@@ -232,36 +323,201 @@ def build_point_map_append_mask(
             & (pixel_y >= 0)
             & (pixel_y < h)
             & (state.stable_ids[:, start:end] >= 0)
+            & (state.gaussians.opacities[:, start:end].detach().float() > 1e-4)
         )
         linear_index = (pixel_y.clamp(0, h - 1) * w + pixel_x.clamp(0, w - 1))
-        covered = in_image
-        if depth_check_enabled:
-            sampled_depth = depth_flat.gather(1, linear_index)
-            covered = (
-                in_image
-                & torch.isfinite(sampled_depth)
-                & (sampled_depth > 1e-5)
-                & (
-                    (z - sampled_depth).abs()
-                    <= tolerance * sampled_depth.clamp_min(1e-4)
-                )
-            )
-        coverage_count.scatter_add_(
-            1, linear_index, covered.to(coverage_count.dtype)
+        sampled_depth = depth_flat.gather(1, linear_index)
+        sampled_reliable = reliable_flat.gather(1, linear_index)
+        depth_tolerance = tolerance * sampled_depth.clamp_min(1e-4)
+        consistent = (
+            in_image
+            & sampled_reliable
+            & ((z - sampled_depth).abs() <= depth_tolerance)
+        )
+        projection_count.scatter_add_(
+            1, linear_index, in_image.to(projection_count.dtype)
+        )
+        consistent_count.scatter_add_(
+            1, linear_index, consistent.to(consistent_count.dtype)
+        )
+        nearest_depth.scatter_reduce_(
+            1,
+            linear_index,
+            torch.where(in_image, z, torch.full_like(z, float("inf"))),
+            reduce="amin",
+            include_self=True,
         )
 
-    coverage = (coverage_count > 0).reshape(b, 1, h, w)
+    has_projection = projection_count > 0
+    same_surface = consistent_count > 0
+    tolerance_flat = tolerance * depth_flat.clamp_min(1e-4)
+    history_in_front = (
+        has_projection
+        & reliable_flat
+        & (nearest_depth < depth_flat - tolerance_flat)
+    )
+    current_in_front = (
+        has_projection
+        & reliable_flat
+        & (nearest_depth > depth_flat + tolerance_flat)
+    )
+    raw_front_conflict_gaussians = torch.zeros(
+        (b, point_count), device=device, dtype=torch.bool
+    )
+    observed_front_gaussians = torch.zeros_like(raw_front_conflict_gaussians)
+    if hybrid_enabled:
+        # Every projected historical point is classified independently. This
+        # preserves a matching deeper layer while fading all floaters in front.
+        for start in range(0, point_count, chunk_size):
+            end = min(start + chunk_size, point_count)
+            points = point_map[:, start:end].detach().float()
+            ones = torch.ones(
+                (*points.shape[:2], 1), device=device, dtype=torch.float32
+            )
+            camera_points = torch.einsum(
+                "bij,bnj->bni",
+                world_to_camera,
+                torch.cat([points, ones], dim=-1),
+            )[..., :3]
+            z = camera_points[..., 2]
+            z_safe = z.clamp_min(1e-6)
+            u = fx * camera_points[..., 0] / z_safe + cx
+            v = fy * camera_points[..., 1] / z_safe + cy
+            pixel_x = u.round().long()
+            pixel_y = v.round().long()
+            in_image = (
+                torch.isfinite(camera_points).all(dim=-1)
+                & (z > 1e-5)
+                & (pixel_x >= 0)
+                & (pixel_x < w)
+                & (pixel_y >= 0)
+                & (pixel_y < h)
+                & (state.stable_ids[:, start:end] >= 0)
+                & (
+                    state.gaussians.opacities[:, start:end].detach().float()
+                    > 1e-4
+                )
+            )
+            linear_index = (
+                pixel_y.clamp(0, h - 1) * w + pixel_x.clamp(0, w - 1)
+            )
+            sampled_depth = depth_flat.gather(1, linear_index)
+            sampled_tolerance = tolerance * sampled_depth.clamp_min(1e-4)
+            observed = (
+                in_image
+                & reliable_flat.gather(1, linear_index)
+            )
+            observed_front_gaussians[:, start:end] = observed
+            raw_front_conflict_gaussians[:, start:end] = (
+                observed
+                & (z < sampled_depth - sampled_tolerance)
+            )
+
+    previous_conflict_count = state.front_conflict_count
+    if previous_conflict_count is None:
+        previous_conflict_count = torch.zeros(
+            (b, point_count), device=device, dtype=torch.uint8
+        )
+    elif previous_conflict_count.shape != (b, point_count):
+        raise ValueError(
+            "Historical front-conflict counts must match the streaming map; "
+            f"got {tuple(previous_conflict_count.shape)} and {(b, point_count)}."
+        )
+    else:
+        previous_conflict_count = previous_conflict_count.detach().to(torch.uint8)
+
+    confirm_views = min(255, max(1, int(front_conflict_confirm_views)))
+    next_conflict_count = previous_conflict_count.clone()
+    next_conflict_count = torch.where(
+        observed_front_gaussians & ~raw_front_conflict_gaussians,
+        torch.zeros_like(next_conflict_count),
+        next_conflict_count,
+    )
+    next_conflict_count = torch.where(
+        raw_front_conflict_gaussians,
+        (previous_conflict_count.to(torch.int16) + 1)
+        .clamp_max(confirm_views)
+        .to(torch.uint8),
+        next_conflict_count,
+    )
+    confirmed_front_conflicts = (
+        raw_front_conflict_gaussians
+        & (next_conflict_count >= confirm_views)
+    )
+
+    if hybrid_enabled:
+        # Matching is checked across every projected depth layer, not just the
+        # nearest point. Every reliable unmatched current pixel is appended.
+        coverage_flat = torch.where(reliable_flat, same_surface, has_projection)
+        force_append_flat = reliable_flat & ~same_surface
+    elif depth_check_enabled:
+        coverage_flat = same_surface
+        force_append_flat = torch.zeros_like(coverage_flat)
+    else:
+        coverage_flat = has_projection
+        force_append_flat = torch.zeros_like(coverage_flat)
+
     radius = max(0, int(dilation_radius))
+    projection_coverage = has_projection.reshape(b, 1, h, w)
+    coverage = coverage_flat.reshape(b, 1, h, w)
     if radius > 0:
         kernel_size = 2 * radius + 1
-        coverage = F.max_pool2d(
-            coverage.float(),
-            kernel_size=kernel_size,
-            stride=1,
-            padding=radius,
+        projection_coverage = F.max_pool2d(
+            projection_coverage.float(), kernel_size, stride=1, padding=radius
         ).bool()
-    append_mask = valid_current & ~coverage
-    return append_mask, coverage
+        coverage = F.max_pool2d(
+            coverage.float(), kernel_size, stride=1, padding=radius
+        ).bool()
+    force_append = force_append_flat.reshape(b, 1, h, w)
+    coverage &= ~force_append
+    append_valid = reliable_current if hybrid_enabled else valid_current
+    append_candidates = append_valid & ~coverage
+    current_in_front_image = current_in_front.reshape(b, 1, h, w)
+    front_without_match = (history_in_front & ~same_surface).reshape(
+        b, 1, h, w
+    )
+    if hybrid_enabled and not append_current_in_front_enabled:
+        append_candidates &= ~current_in_front_image
+    if hybrid_enabled and not append_history_in_front_enabled:
+        append_candidates &= ~front_without_match
+
+    append_mask = torch.zeros_like(append_candidates)
+    max_ratio = max(0.0, min(1.0, float(max_append_ratio)))
+    no_projection = ~projection_coverage
+    priority = confidence_score * 0.01
+    priority = priority + no_projection.float() * 3.0
+    priority = priority + current_in_front_image.float() * 2.0
+    priority = priority + front_without_match.float()
+    pixel_index = torch.arange(h * w, device=device, dtype=torch.long)
+    tie_breaker = (
+        (pixel_index * 1103515245 + 12345).remainder(2147483647).float()
+        / 2147483647.0
+    ).reshape(1, 1, h, w)
+    priority = priority + tie_breaker * 1e-4
+    for batch_idx in range(b):
+        candidate_indices = torch.nonzero(
+            append_candidates[batch_idx].reshape(-1), as_tuple=False
+        ).squeeze(1)
+        valid_count = int(append_valid[batch_idx].sum().item())
+        max_count = min(
+            int(candidate_indices.numel()),
+            int(valid_count * max_ratio + 0.999999),
+        )
+        if max_count <= 0:
+            continue
+        candidate_priority = priority[batch_idx].reshape(-1)[candidate_indices]
+        selected = candidate_indices[
+            candidate_priority.topk(max_count, sorted=False).indices
+        ]
+        append_mask[batch_idx].view(-1)[selected] = True
+
+    return (
+        append_mask,
+        coverage,
+        confirmed_front_conflicts,
+        next_conflict_count,
+        depth_scale,
+    )
 
 
 def _sample_at_projected_centers(
@@ -722,6 +978,7 @@ class StreamingGaussianState:
     stable_ids: torch.Tensor
     observation_count: torch.Tensor
     point_map: torch.Tensor | None = None
+    front_conflict_count: torch.Tensor | None = None
 
     @property
     def batch_size(self) -> int:
@@ -745,6 +1002,11 @@ class StreamingGaussianState:
             point_map=(
                 None if self.point_map is None else self.point_map.detach()
             ),
+            front_conflict_count=(
+                None
+                if self.front_conflict_count is None
+                else self.front_conflict_count.detach()
+            ),
         )
 
     def detach_means(self) -> "StreamingGaussianState":
@@ -766,6 +1028,58 @@ class StreamingGaussianState:
             stable_ids=self.stable_ids,
             observation_count=self.observation_count,
             point_map=self.point_map,
+            front_conflict_count=self.front_conflict_count,
+        )
+
+    def with_front_conflict_count(
+        self,
+        front_conflict_count: torch.Tensor,
+    ) -> "StreamingGaussianState":
+        if front_conflict_count.shape != self.stable_ids.shape:
+            raise ValueError(
+                "Front-conflict counts must match stable IDs; got "
+                f"{tuple(front_conflict_count.shape)} and "
+                f"{tuple(self.stable_ids.shape)}."
+            )
+        return StreamingGaussianState(
+            gaussians=self.gaussians,
+            stable_ids=self.stable_ids,
+            observation_count=self.observation_count,
+            point_map=self.point_map,
+            front_conflict_count=front_conflict_count.detach().to(torch.uint8),
+        )
+
+    def decay_masked_opacity(
+        self,
+        mask: torch.Tensor,
+        decay_fraction: float,
+    ) -> "StreamingGaussianState":
+        """Apply a fixed multiplicative opacity decay to selected old GS."""
+        if mask.shape != self.gaussians.opacities.shape:
+            raise ValueError(
+                "Opacity decay mask must match historical opacities; got "
+                f"{tuple(mask.shape)} and {tuple(self.gaussians.opacities.shape)}."
+            )
+        fraction = max(0.0, min(0.95, float(decay_fraction)))
+        if fraction == 0.0 or not bool(mask.any()):
+            return self
+        multiplier = torch.where(
+            mask,
+            self.gaussians.opacities.new_full((), 1.0 - fraction),
+            self.gaussians.opacities.new_ones(()),
+        )
+        return StreamingGaussianState(
+            gaussians=Gaussians(
+                means=self.gaussians.means,
+                harmonics=self.gaussians.harmonics,
+                opacities=self.gaussians.opacities * multiplier,
+                scales=self.gaussians.scales,
+                rotations=self.gaussians.rotations,
+            ),
+            stable_ids=self.stable_ids,
+            observation_count=self.observation_count,
+            point_map=self.point_map,
+            front_conflict_count=self.front_conflict_count,
         )
 
     @classmethod
@@ -800,6 +1114,9 @@ class StreamingGaussianState:
                 current.means.detach()
                 if point_map is None
                 else point_map.detach()
+            ),
+            front_conflict_count=torch.zeros(
+                (b, n), device=current.means.device, dtype=torch.uint8
             ),
         )
 
@@ -900,6 +1217,14 @@ class StreamingGaussianState:
             device=current.means.device,
             dtype=self.observation_count.dtype,
         )
+        old_front_conflict_count = self.front_conflict_count
+        if old_front_conflict_count is None:
+            old_front_conflict_count = torch.zeros_like(
+                self.stable_ids, dtype=torch.uint8
+            )
+        new_front_conflict_count = torch.zeros(
+            (b, n), device=current.means.device, dtype=torch.uint8
+        )
         if valid_new is not None:
             gate = gate * valid_new.to(gate.dtype)
             new_ids = torch.where(valid_new, new_ids, torch.full_like(new_ids, -1))
@@ -933,6 +1258,9 @@ class StreamingGaussianState:
             point_map=torch.cat(
                 [old_point_map, new_point_map], dim=1
             ),
+            front_conflict_count=torch.cat(
+                [old_front_conflict_count, new_front_conflict_count], dim=1
+            ),
         )
 
     def select(self, keep: torch.Tensor) -> "StreamingGaussianState":
@@ -958,6 +1286,11 @@ class StreamingGaussianState:
             observation_count=self.observation_count[:, keep],
             point_map=(
                 None if self.point_map is None else self.point_map[:, keep]
+            ),
+            front_conflict_count=(
+                None
+                if self.front_conflict_count is None
+                else self.front_conflict_count[:, keep]
             ),
         )
 
@@ -1055,6 +1388,7 @@ class StreamingGaussianState:
             stable_ids=self.stable_ids,
             observation_count=self.observation_count,
             point_map=self.point_map,
+            front_conflict_count=self.front_conflict_count,
         )
 
         pruned_count = delete_hard.sum()
@@ -1245,6 +1579,7 @@ class StreamingGaussianState:
                 stable_ids=self.stable_ids,
                 observation_count=self.observation_count,
                 point_map=self.point_map,
+                front_conflict_count=self.front_conflict_count,
             )
             if physical_keep is not None:
                 state = state.select(physical_keep)
@@ -1290,6 +1625,7 @@ class StreamingGaussianState:
                 stable_ids=self.stable_ids,
                 observation_count=self.observation_count,
                 point_map=self.point_map,
+                front_conflict_count=self.front_conflict_count,
             )
 
         decay_soft = torch.stack(decay_probabilities)
@@ -1564,6 +1900,7 @@ class StreamingGaussianState:
             stable_ids=self.stable_ids,
             observation_count=observation_count.reshape_as(self.observation_count),
             point_map=self.point_map,
+            front_conflict_count=self.front_conflict_count,
         )
         return state, {
             "regularization": regularization,
@@ -1838,6 +2175,7 @@ class StreamingGaussianState:
             observation_count=self.observation_count
             + torch.stack(observation_increments),
             point_map=self.point_map,
+            front_conflict_count=self.front_conflict_count,
         )
 
 

@@ -305,7 +305,7 @@ def test_point_map_append_ignores_depth_inconsistent_floaters() -> None:
         ]
     )
 
-    append_mask, coverage = build_point_map_append_mask(
+    append_mask, coverage, conflicts, _, _ = build_point_map_append_mask(
         state,
         depth,
         camera_to_world,
@@ -320,6 +320,7 @@ def test_point_map_append_ignores_depth_inconsistent_floaters() -> None:
     assert coverage[0].any()
     assert not coverage[1].any()
     assert torch.equal(append_mask, ~coverage)
+    assert not conflicts.any()
 
 
 def test_projection_only_append_is_batch_safe_and_ignores_depth_mismatch() -> None:
@@ -346,21 +347,23 @@ def test_projection_only_append_is_batch_safe_and_ignores_depth_mismatch() -> No
         expected[0, 0, 5-radius:6+radius, 5-radius:6+radius] = True
         expected[1, 0, 5-radius:6+radius, 6-radius:7+radius] = True
         for chunk_size in (1, 65536):
-            append_mask, coverage = build_point_map_append_mask(
+            append_mask, coverage, conflicts, _, _ = build_point_map_append_mask(
                 state, depth, c2w, intrinsics,
                 dilation_radius=radius, chunk_size=chunk_size,
                 depth_check_enabled=False,
             )
             assert torch.equal(coverage, expected)
             assert torch.equal(append_mask, valid & ~expected)
+            assert not conflicts.any()
             assert not coverage.requires_grad and not append_mask.requires_grad
 
     # The original depth-consistent mode still treats these surfaces as holes.
-    append_mask, coverage = build_point_map_append_mask(
+    append_mask, coverage, conflicts, _, _ = build_point_map_append_mask(
         state, depth, c2w, intrinsics, depth_check_enabled=True,
     )
     assert not coverage.any()
     assert torch.equal(append_mask, valid)
+    assert not conflicts.any()
 
 
 def test_projection_only_coverage_does_not_depend_on_current_depth_values() -> None:
@@ -369,19 +372,191 @@ def test_projection_only_coverage_does_not_depend_on_current_depth_values() -> N
     intrinsics = torch.eye(3).expand(2, -1, -1).clone()
     intrinsics[:, :2, 2] = 0.5
     depth = torch.full((2, 1, 10, 10), 2.0)
-    _, reference = build_point_map_append_mask(
+    _, reference, _, _, _ = build_point_map_append_mask(
         state, depth, c2w, intrinsics, depth_check_enabled=False,
     )
     depth.fill_(20.0)
     # Even an invalid current sample must not erase historical coverage or
     # create valid neighboring appends through a change in the dilation mask.
     depth[:, :, 5, 5] = float("nan")
-    append_mask, coverage = build_point_map_append_mask(
+    append_mask, coverage, conflicts, _, _ = build_point_map_append_mask(
         state, depth, c2w, intrinsics,
         depth_relative_tolerance=0.0, depth_check_enabled=False,
     )
     assert torch.equal(coverage, reference)
     assert torch.equal(append_mask, torch.isfinite(depth) & ~reference)
+    assert not conflicts.any()
+
+
+def test_hybrid_append_uses_all_projected_depth_layers() -> None:
+    state = _make_state()
+    state.point_map = torch.tensor([
+        # Batch zero has both a front floater and a matching layer at the same
+        # pixel. Batch one has only a front floater at that pixel.
+        [[0.0, 0.0, 1.0], [0.0, 0.0, 2.0], [100.0, 0.0, 2.0]],
+        [[0.0, 0.0, 1.0], [0.4, 0.0, 2.0], [100.0, 0.0, 2.0]],
+    ])
+    depth = torch.full((2, 1, 5, 5), 2.0)
+    camera_to_world = torch.eye(4).expand(2, -1, -1).clone()
+    intrinsics = torch.tensor([
+        [0.5, 0.0, 0.5],
+        [0.0, 0.5, 0.5],
+        [0.0, 0.0, 1.0],
+    ]).expand(2, -1, -1).clone()
+
+    append_mask, coverage, conflicts, counts, _ = build_point_map_append_mask(
+        state=state,
+        current_depth=depth,
+        camera_to_world=camera_to_world,
+        intrinsics=intrinsics,
+        current_depth_confidence=torch.ones_like(depth),
+        depth_relative_tolerance=0.08,
+        dilation_radius=0,
+        hybrid_enabled=True,
+        front_conflict_confirm_views=1,
+    )
+
+    # The matching deeper layer suppresses duplicate append, while the front
+    # floater is still selected for immediate opacity decay.
+    assert not append_mask[0, 0, 2, 2]
+    assert coverage[0, 0, 2, 2]
+    assert conflicts[0, 0]
+    assert not conflicts[0, 1:].any()
+    assert counts[0, 0] == 1
+
+    # Without a matching layer, the current surface is appended immediately
+    # and the old front floater is decayed in the same update.
+    assert append_mask[1, 0, 2, 2]
+    assert not coverage[1, 0, 2, 2]
+    assert conflicts[1, 0]
+    assert counts[1, 0] == 1
+
+    disabled_append_mask, _, disabled_conflicts, _, _ = (
+        build_point_map_append_mask(
+            state=state,
+            current_depth=depth,
+            camera_to_world=camera_to_world,
+            intrinsics=intrinsics,
+            current_depth_confidence=torch.ones_like(depth),
+            depth_relative_tolerance=0.08,
+            dilation_radius=0,
+            hybrid_enabled=True,
+            append_history_in_front_enabled=False,
+            front_conflict_confirm_views=1,
+        )
+    )
+    assert not disabled_append_mask[1, 0, 2, 2]
+    assert disabled_conflicts[1, 0]
+
+    decayed = state.decay_masked_opacity(conflicts, 0.30)
+    assert torch.allclose(
+        decayed.gaussians.opacities[0, 0],
+        state.gaussians.opacities[0, 0] * 0.70,
+    )
+    assert torch.allclose(
+        decayed.gaussians.opacities[1, 0],
+        state.gaussians.opacities[1, 0] * 0.70,
+    )
+
+
+def test_hybrid_append_keeps_old_layers_behind_current_surface() -> None:
+    state = _make_state()
+    state.point_map = torch.tensor([
+        [[0.0, 0.0, 3.0], [0.4, 0.0, 3.0], [100.0, 0.0, 3.0]],
+        [[0.0, 0.0, 4.0], [0.4, 0.0, 4.0], [100.0, 0.0, 4.0]],
+    ])
+    depth = torch.full((2, 1, 5, 5), 2.0)
+    c2w = torch.eye(4).expand(2, -1, -1).clone()
+    intrinsics = torch.tensor([
+        [0.5, 0.0, 0.5],
+        [0.0, 0.5, 0.5],
+        [0.0, 0.0, 1.0],
+    ]).expand(2, -1, -1).clone()
+
+    append_mask, coverage, conflicts, _, _ = build_point_map_append_mask(
+        state=state,
+        current_depth=depth,
+        camera_to_world=c2w,
+        intrinsics=intrinsics,
+        dilation_radius=0,
+        hybrid_enabled=True,
+    )
+
+    assert append_mask[:, 0, 2, 2].all()
+    assert not coverage[:, 0, 2, 2].any()
+    assert not conflicts.any()
+
+    disabled_append_mask, _, disabled_conflicts, _, _ = (
+        build_point_map_append_mask(
+            state=state,
+            current_depth=depth,
+            camera_to_world=c2w,
+            intrinsics=intrinsics,
+            dilation_radius=0,
+            hybrid_enabled=True,
+            append_current_in_front_enabled=False,
+        )
+    )
+    assert not disabled_append_mask[:, 0, 2, 2].any()
+    assert not disabled_conflicts.any()
+
+
+def test_hybrid_append_aligns_depth_scale_per_batch() -> None:
+    state = _make_state()
+    depth = torch.stack([
+        torch.full((1, 10, 10), 4.0),
+        torch.full((1, 10, 10), 0.5),
+    ])
+    old_depth = torch.stack([
+        torch.full((1, 10, 10), 2.0),
+        torch.full((1, 10, 10), 1.0),
+    ])
+    old_alpha = torch.ones_like(old_depth)
+    c2w = torch.eye(4).expand(2, -1, -1).clone()
+    intrinsics = torch.eye(3).expand(2, -1, -1).clone()
+    intrinsics[:, :2, 2] = 0.5
+
+    _, coverage, conflicts, _, scales = build_point_map_append_mask(
+        state=state,
+        current_depth=depth,
+        camera_to_world=c2w,
+        intrinsics=intrinsics,
+        current_rgb=torch.zeros(2, 3, 10, 10),
+        old_rgb=torch.zeros(2, 3, 10, 10),
+        old_depth=old_depth,
+        old_alpha=old_alpha,
+        hybrid_enabled=True,
+        dilation_radius=0,
+    )
+
+    assert torch.allclose(scales, torch.tensor([0.5, 2.0]))
+    assert coverage[0].any() and coverage[1].any()
+    assert not conflicts.any()
+
+
+def test_point_map_append_budget_is_per_batch() -> None:
+    state = _make_state()
+    state.point_map = torch.full_like(state.point_map, 1000.0)
+    depth = torch.ones(2, 1, 10, 10)
+    c2w = torch.eye(4).expand(2, -1, -1).clone()
+    intrinsics = torch.eye(3).expand(2, -1, -1).clone()
+    intrinsics[:, :2, 2] = 0.5
+
+    append_mask, coverage, _, _, _ = build_point_map_append_mask(
+        state=state,
+        current_depth=depth,
+        camera_to_world=c2w,
+        intrinsics=intrinsics,
+        depth_check_enabled=False,
+        dilation_radius=0,
+        max_append_ratio=0.20,
+    )
+
+    assert not coverage.any()
+    assert torch.equal(
+        append_mask.flatten(1).sum(dim=1),
+        torch.tensor([20, 20]),
+    )
 
 
 def test_masked_append_is_physical_and_batch_safe() -> None:

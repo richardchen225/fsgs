@@ -26,7 +26,8 @@ model:
     gir_projected_min_radius: 0.1
     gir_projected_covariance_sigma: 3.0
     gir_projected_opacity_logit_scale: 1.0
-    gir_projected_front_decay_strength: 0.02
+    # Hybrid append applies the deterministic decay instead.
+    gir_projected_front_decay_strength: 0.0
     gir_projected_warmup_steps: 1000
     gir_old_delete_enabled: false
     gir_old_decay_enabled: false
@@ -65,7 +66,7 @@ toy:
   projected_min_radius: 0.1
   projected_covariance_sigma: 3.0
   projected_opacity_logit_scale: 1.0
-  projected_front_decay_strength: 0.02
+  projected_front_decay_strength: 0.0
   projected_warmup_steps: 1000
   # Scatter each pixel residual to its strongest K historical contributors.
   # K=1 preserves the original dominant-GS update path.
@@ -104,13 +105,23 @@ toy:
   # none: preserve the complete cross-view graph. Current residual updates are
   # applied after this boundary and remain differentiable for the current step.
   historical_detach_mode: none  # all | means | none
-  # Append where no historical point projects, ignoring depth disagreement.
+  # Immediate layered fusion mirrors the main training path.
   append_new_gs_enabled: true
   append_mode: point_map  # point_map | all
   point_append_depth_check_enabled: false
-  # Used only when depth checking is enabled.
-  point_append_depth_relative_tolerance: 0.08
-  point_append_dilation_radius: 1
+  point_append_hybrid_enabled: true
+  # Ablation: do not treat a closer current surface as automatic new geometry.
+  point_append_current_in_front_enabled: true
+  # Ablation: do not append behind unmatched projected historical points.
+  point_append_history_in_front_enabled: true
+  point_append_depth_relative_tolerance: 0.15
+  point_append_rgb_bad_threshold: 0.08
+  point_append_old_alpha_threshold: 0.10
+  point_append_min_depth_confidence: 0.0
+  point_append_front_conflict_confirm_views: 1
+  point_append_front_conflict_opacity_decay: 0.70
+  point_append_max_ratio: 1.0
+  point_append_dilation_radius: 2
   point_append_chunk_size: 65536
 
   # Contributor-conditioned top-4 soft opacity decay. Hard pruning is only

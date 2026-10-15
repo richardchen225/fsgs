@@ -769,11 +769,54 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         point_append_depth_check = bool(
             getattr(cfg, "gir_point_append_depth_check_enabled", True)
         )
+        point_append_hybrid = bool(
+            getattr(cfg, "gir_point_append_hybrid_enabled", False)
+        )
+        point_append_current_in_front = bool(
+            getattr(
+                cfg,
+                "gir_point_append_current_in_front_enabled",
+                True,
+            )
+        )
+        point_append_history_in_front = bool(
+            getattr(
+                cfg,
+                "gir_point_append_history_in_front_enabled",
+                True,
+            )
+        )
         point_append_tolerance = float(
-            getattr(cfg, "gir_point_append_depth_relative_tolerance", 0.08)
+            getattr(cfg, "gir_point_append_depth_relative_tolerance", 0.15)
+        )
+        point_append_rgb_threshold = float(
+            getattr(cfg, "gir_point_append_rgb_bad_threshold", 0.08)
+        )
+        point_append_old_alpha_threshold = float(
+            getattr(cfg, "gir_point_append_old_alpha_threshold", 0.10)
+        )
+        point_append_min_depth_confidence = float(
+            getattr(cfg, "gir_point_append_min_depth_confidence", 0.0)
+        )
+        point_append_front_decay = float(
+            getattr(
+                cfg,
+                "gir_point_append_front_conflict_opacity_decay",
+                0.30,
+            )
+        )
+        point_append_front_confirm_views = int(
+            getattr(
+                cfg,
+                "gir_point_append_front_conflict_confirm_views",
+                1,
+            )
+        )
+        point_append_max_ratio = float(
+            getattr(cfg, "gir_point_append_max_ratio", 1.0)
         )
         point_append_dilation = int(
-            getattr(cfg, "gir_point_append_dilation_radius", 1)
+            getattr(cfg, "gir_point_append_dilation_radius", 2)
         )
         point_append_chunk_size = int(
             getattr(cfg, "gir_point_append_chunk_size", 65536)
@@ -858,6 +901,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         projected_front_decay_probabilities = []
         point_coverage_ratios = []
         point_append_ratios = []
+        point_front_conflict_ratios = []
+        point_depth_scales = []
+        point_front_decay_mass_ratios = []
         old_delete_graph_anchor = features.new_zeros(())
         add_gates = []
         learned_add_gates = []
@@ -1682,19 +1728,65 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             )
             visible_ratios.append(coverage.mean())
             point_append_mask = None
+            point_front_conflict_mask = None
             if state is not None and append_mode == "point_map":
-                point_append_mask, point_coverage = build_point_map_append_mask(
+                (
+                    point_append_mask,
+                    point_coverage,
+                    point_front_conflict_mask,
+                    next_front_conflict_count,
+                    point_depth_scale,
+                ) = build_point_map_append_mask(
                     state=state,
                     current_depth=current_depth,
                     camera_to_world=pred_all_extrinsic[:, view_idx],
                     intrinsics=intrinsics[:, view_idx],
+                    current_rgb=current_rgb,
+                    old_rgb=gir.rgb,
+                    old_depth=gir.raster_depth,
+                    old_alpha=gir.raster_alpha,
+                    current_depth_confidence=current_depth_confidence,
                     depth_relative_tolerance=point_append_tolerance,
+                    rgb_bad_threshold=point_append_rgb_threshold,
+                    old_alpha_threshold=point_append_old_alpha_threshold,
+                    min_depth_confidence=point_append_min_depth_confidence,
                     dilation_radius=point_append_dilation,
                     chunk_size=point_append_chunk_size,
                     depth_check_enabled=point_append_depth_check,
+                    hybrid_enabled=point_append_hybrid,
+                    append_current_in_front_enabled=(
+                        point_append_current_in_front
+                    ),
+                    append_history_in_front_enabled=(
+                        point_append_history_in_front
+                    ),
+                    front_conflict_confirm_views=(
+                        point_append_front_confirm_views
+                    ),
+                    max_append_ratio=point_append_max_ratio,
+                )
+                state = state.with_front_conflict_count(
+                    next_front_conflict_count
                 )
                 point_coverage_ratios.append(point_coverage.float().mean())
                 point_append_ratios.append(point_append_mask.float().mean())
+                point_depth_scales.append(point_depth_scale.mean())
+                valid_old = (state.stable_ids >= 0).float().sum().clamp_min(1.0)
+                point_front_conflict_ratios.append(
+                    point_front_conflict_mask.float().sum() / valid_old
+                )
+                opacity_before_decay = state.gaussians.opacities
+                state = state.decay_masked_opacity(
+                    point_front_conflict_mask,
+                    point_append_front_decay,
+                )
+                point_front_decay_mass_ratios.append(
+                    (
+                        opacity_before_decay.detach().float().sum()
+                        - state.gaussians.opacities.detach().float().sum()
+                    )
+                    / opacity_before_decay.detach().float().sum().clamp_min(1e-8)
+                )
 
             if state is None or append_mode == "all":
                 # The first frame initializes the point map; all mode is the
@@ -2075,11 +2167,29 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 encoder_output.infos["gir_point_append_depth_check_enabled"] = (
                     features.new_tensor(float(point_append_depth_check))
                 )
+                encoder_output.infos["gir_point_append_hybrid_enabled"] = (
+                    features.new_tensor(float(point_append_hybrid))
+                )
+                encoder_output.infos[
+                    "gir_point_append_current_in_front_enabled"
+                ] = features.new_tensor(float(point_append_current_in_front))
+                encoder_output.infos[
+                    "gir_point_append_history_in_front_enabled"
+                ] = features.new_tensor(float(point_append_history_in_front))
                 encoder_output.infos["gir_point_coverage_ratio"] = torch.stack(
                     point_coverage_ratios
                 ).mean()
                 encoder_output.infos["gir_point_append_ratio"] = torch.stack(
                     point_append_ratios
+                ).mean()
+                encoder_output.infos[
+                    "gir_point_front_conflict_ratio"
+                ] = torch.stack(point_front_conflict_ratios).mean()
+                encoder_output.infos[
+                    "gir_point_front_decay_mass_ratio"
+                ] = torch.stack(point_front_decay_mass_ratios).mean()
+                encoder_output.infos["gir_point_depth_scale"] = torch.stack(
+                    point_depth_scales
                 ).mean()
             encoder_output.infos["gir_add_gate_warmup_progress"] = torch.tensor(
                 add_gate_warmup_progress, device=features.device

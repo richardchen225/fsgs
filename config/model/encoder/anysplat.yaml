@@ -78,13 +78,25 @@ gir_raw_harmonics_residual: false
 gir_mean_relative_scale: 0.02
 gir_rotation_scale: 0.05
 gir_harmonics_scale: 0.10
-# New-GS append policy. point_map ignores Gaussian footprints and only appends
-# pixels without a depth-consistent historical point.
+# New-GS append policy. Hybrid point-map mode compares all projected point-map
+# depth layers and deterministically fades conflicting front GS.
 gir_append_mode: all  # all | point_map | learned
-# False uses projection coverage only; True also requires depth consistency.
+# Legacy fallback used only when hybrid mode is disabled.
 gir_point_append_depth_check_enabled: true
-gir_point_append_depth_relative_tolerance: 0.08
-gir_point_append_dilation_radius: 1
+gir_point_append_hybrid_enabled: false
+# Whether a current surface clearly in front of all projected history may append.
+gir_point_append_current_in_front_enabled: true
+# Whether a current surface behind unmatched projected history may append.
+gir_point_append_history_in_front_enabled: true
+gir_point_append_depth_relative_tolerance: 0.15
+gir_point_append_rgb_bad_threshold: 0.08
+gir_point_append_old_alpha_threshold: 0.10
+# Set above zero only after checking the backbone confidence distribution.
+gir_point_append_min_depth_confidence: 0.0
+gir_point_append_front_conflict_confirm_views: 1
+gir_point_append_front_conflict_opacity_decay: 0.30
+gir_point_append_max_ratio: 1.0
+gir_point_append_dilation_radius: 2
 gir_point_append_chunk_size: 65536
 gir_add_gate_enabled: false
 gir_add_gate_warmup_steps: 1000

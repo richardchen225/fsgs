@@ -103,6 +103,9 @@ TRAIN_CSV_FIELDS = [
     "opacity_decay_candidate_probability",
     "opacity_decay_candidate_count",
     "opacity_decay_mass_ratio",
+    "point_front_conflict_ratio",
+    "point_front_decay_mass_ratio",
+    "point_append_depth_scale",
     *[
         f"rank{rank_idx}_{key}"
         for rank_idx in range(1, MAX_LOGGED_RESIDUAL_RANKS + 1)
@@ -1156,31 +1159,85 @@ def _predict_projected_updated_state(
         )
         overlap = depth_consistent
         append_mode = str(cfg.get("append_mode", "point_map")).lower()
+        front_conflict_gaussians = torch.zeros_like(
+            state.gaussians.opacities, dtype=torch.bool
+        )
         if append_mode == "all":
             append_mask = valid_depth
         elif append_mode in {"logic", "point_map"}:
-            append_mask, _ = build_point_map_append_mask(
+            (
+                append_mask,
+                _,
+                front_conflict_gaussians,
+                next_front_conflict_count,
+                point_depth_scale,
+            ) = build_point_map_append_mask(
                 state=state,
                 current_depth=current_depth[:, None],
                 camera_to_world=current_c2w,
                 intrinsics=current_intrinsic,
+                current_rgb=current_rgb,
+                old_rgb=old_rgb,
+                old_depth=old_depth,
+                old_alpha=old_alpha,
+                current_depth_confidence=torch.ones_like(
+                    current_depth[:, None]
+                ),
                 depth_relative_tolerance=float(
                     cfg.get(
                         "point_append_depth_relative_tolerance",
                         cfg.depth_relative_tolerance,
                     )
                 ),
-                dilation_radius=int(cfg.get("point_append_dilation_radius", 1)),
+                rgb_bad_threshold=float(
+                    cfg.get(
+                        "point_append_rgb_bad_threshold",
+                        cfg.rgb_bad_threshold,
+                    )
+                ),
+                old_alpha_threshold=float(
+                    cfg.get("point_append_old_alpha_threshold", 0.10)
+                ),
+                min_depth_confidence=float(
+                    cfg.get("point_append_min_depth_confidence", 0.0)
+                ),
+                dilation_radius=int(cfg.get("point_append_dilation_radius", 2)),
                 chunk_size=int(cfg.get("point_append_chunk_size", 65536)),
                 depth_check_enabled=bool(
                     cfg.get("point_append_depth_check_enabled", True)
                 ),
+                hybrid_enabled=bool(
+                    cfg.get("point_append_hybrid_enabled", False)
+                ),
+                append_current_in_front_enabled=bool(
+                    cfg.get(
+                        "point_append_current_in_front_enabled",
+                        True,
+                    )
+                ),
+                append_history_in_front_enabled=bool(
+                    cfg.get(
+                        "point_append_history_in_front_enabled",
+                        True,
+                    )
+                ),
+                front_conflict_confirm_views=int(
+                    cfg.get("point_append_front_conflict_confirm_views", 1)
+                ),
+                max_append_ratio=float(
+                    cfg.get("point_append_max_ratio", 1.0)
+                ),
+            )
+            state = state.with_front_conflict_count(
+                next_front_conflict_count
             )
         else:
             raise ValueError(
                 "toy.append_mode must be point_map or all; "
                 f"got {append_mode!r}."
             )
+        if append_mode == "all":
+            point_depth_scale = current_depth.new_ones((batch,))
         rgb_error = (old_rgb - current_rgb.float()).abs().mean(
             dim=1, keepdim=True
         )
@@ -1259,6 +1316,15 @@ def _predict_projected_updated_state(
             "harmonics_shift_mean": current_feature.new_zeros(()),
             "front_decay_probability_mean": current_feature.new_zeros(()),
         }
+    opacity_before_fixed_decay = updated.gaussians.opacities
+    updated = updated.decay_masked_opacity(
+        front_conflict_gaussians,
+        float(cfg.get("point_append_front_conflict_opacity_decay", 0.30)),
+    )
+    fixed_decay_mass_ratio = (
+        opacity_before_fixed_decay.detach().float().sum()
+        - updated.gaussians.opacities.detach().float().sum()
+    ) / opacity_before_fixed_decay.detach().float().sum().clamp_min(1e-8)
 
     update_stats = _empty_residual_update_stats(
         current_feature, max(1, int(cfg.get("residual_topk", 1)))
@@ -1359,6 +1425,9 @@ def _predict_projected_updated_state(
         ],
         "opacity_decay_candidate_count": evidence.old_in_front.float().sum(),
         "opacity_decay_mass_ratio": projected_stats["opacity_shift_mean"],
+        "point_front_conflict_ratio": front_conflict_gaussians.float().mean(),
+        "point_front_decay_mass_ratio": fixed_decay_mass_ratio,
+        "point_append_depth_scale": point_depth_scale.mean(),
         **update_stats,
     }
     return updated, stats
@@ -1458,31 +1527,96 @@ def _predict_updated_state(
             & (relative_depth_delta < -float(cfg.depth_relative_tolerance))
         )
         overlap = depth_consistent
+        front_conflict_gaussians = torch.zeros_like(
+            state.gaussians.opacities, dtype=torch.bool
+        )
         if append_mode == "all":
             append_mask = valid_depth
         else:
-            append_mask, _ = build_point_map_append_mask(
+            (
+                append_mask,
+                _,
+                front_conflict_gaussians,
+                next_front_conflict_count,
+                point_depth_scale,
+            ) = build_point_map_append_mask(
                 state=state,
                 current_depth=current_depth[:, None],
                 camera_to_world=current_c2w,
                 intrinsics=current_intrinsic,
+                current_rgb=current_rgb,
+                old_rgb=gir.rgb,
+                old_depth=gir.raster_depth,
+                old_alpha=gir.raster_alpha,
+                current_depth_confidence=torch.ones_like(
+                    current_depth[:, None]
+                ),
                 depth_relative_tolerance=float(
                     cfg.get(
                         "point_append_depth_relative_tolerance",
                         cfg.depth_relative_tolerance,
                     )
                 ),
-                dilation_radius=int(cfg.get("point_append_dilation_radius", 1)),
+                rgb_bad_threshold=float(
+                    cfg.get(
+                        "point_append_rgb_bad_threshold",
+                        cfg.rgb_bad_threshold,
+                    )
+                ),
+                old_alpha_threshold=float(
+                    cfg.get("point_append_old_alpha_threshold", 0.10)
+                ),
+                min_depth_confidence=float(
+                    cfg.get("point_append_min_depth_confidence", 0.0)
+                ),
+                dilation_radius=int(cfg.get("point_append_dilation_radius", 2)),
                 chunk_size=int(cfg.get("point_append_chunk_size", 65536)),
                 depth_check_enabled=bool(
                     cfg.get("point_append_depth_check_enabled", True)
                 ),
+                hybrid_enabled=bool(
+                    cfg.get("point_append_hybrid_enabled", False)
+                ),
+                append_current_in_front_enabled=bool(
+                    cfg.get(
+                        "point_append_current_in_front_enabled",
+                        True,
+                    )
+                ),
+                append_history_in_front_enabled=bool(
+                    cfg.get(
+                        "point_append_history_in_front_enabled",
+                        True,
+                    )
+                ),
+                front_conflict_confirm_views=int(
+                    cfg.get("point_append_front_conflict_confirm_views", 1)
+                ),
+                max_append_ratio=float(
+                    cfg.get("point_append_max_ratio", 1.0)
+                ),
             )
+            state = state.with_front_conflict_count(
+                next_front_conflict_count
+            )
+        if append_mode == "all":
+            point_depth_scale = current_depth.new_ones((batch,))
         rgb_error = (gir.rgb.float() - current_rgb.float()).abs().mean(dim=1, keepdim=True)
         rgb_bad = rgb_error >= float(cfg.rgb_bad_threshold)
         bad_mask = (depth_consistent & rgb_bad) | old_in_front
 
     if not bool(cfg.residual_enabled) and not opacity_decay_enabled:
+        opacity_before_fixed_decay = state.gaussians.opacities
+        fixed_decay_state = state.decay_masked_opacity(
+            front_conflict_gaussians,
+            float(
+                cfg.get("point_append_front_conflict_opacity_decay", 0.30)
+            ),
+        )
+        fixed_decay_mass_ratio = (
+            opacity_before_fixed_decay.detach().float().sum()
+            - fixed_decay_state.gaussians.opacities.detach().float().sum()
+        ) / opacity_before_fixed_decay.detach().float().sum().clamp_min(1e-8)
         stats = {
             "overlap": overlap,
             "old_coverage": old_coverage,
@@ -1506,9 +1640,14 @@ def _predict_updated_state(
             "opacity_decay_candidate_probability": current_feature.new_zeros(()),
             "opacity_decay_candidate_count": current_feature.new_zeros(()),
             "opacity_decay_mass_ratio": current_feature.new_zeros(()),
+            "point_front_conflict_ratio": (
+                front_conflict_gaussians.float().mean()
+            ),
+            "point_front_decay_mass_ratio": fixed_decay_mass_ratio,
+            "point_append_depth_scale": point_depth_scale.mean(),
             **_empty_residual_update_stats(current_feature, residual_topk),
         }
-        return state, stats
+        return fixed_decay_state, stats
 
     masked_gir = _mask_gir(gir, bad_mask)
     confidence = torch.ones_like(current_depth[:, None])
@@ -1649,6 +1788,16 @@ def _predict_updated_state(
             ),
         )
 
+    opacity_before_fixed_decay = updated.gaussians.opacities
+    updated = updated.decay_masked_opacity(
+        front_conflict_gaussians,
+        float(cfg.get("point_append_front_conflict_opacity_decay", 0.30)),
+    )
+    fixed_decay_mass_ratio = (
+        opacity_before_fixed_decay.detach().float().sum()
+        - updated.gaussians.opacities.detach().float().sum()
+    ) / opacity_before_fixed_decay.detach().float().sum().clamp_min(1e-8)
+
     if bool(cfg.residual_enabled) and residual_topk > 1:
         if masked_gir.contributor_ids is None:
             raise RuntimeError(
@@ -1720,6 +1869,9 @@ def _predict_updated_state(
         "opacity_decay_mass_ratio": decay_stats[
             "decay_opacity_mass_ratio"
         ],
+        "point_front_conflict_ratio": front_conflict_gaussians.float().mean(),
+        "point_front_decay_mass_ratio": fixed_decay_mass_ratio,
+        "point_append_depth_scale": point_depth_scale.mean(),
         **update_stats,
     }
     return updated, stats
@@ -2338,6 +2490,12 @@ def _summarize_step_stats(steps: list[dict[str, Any]]) -> dict[str, Any]:
         "opacity_decay_mass_ratio": torch.stack(
             [item["opacity_decay_mass_ratio"] for item in stats]
         ).mean(),
+        "point_front_conflict_ratio": torch.stack(
+            [item["point_front_conflict_ratio"] for item in stats]
+        ).mean(),
+        "point_front_decay_mass_ratio": torch.stack(
+            [item["point_front_decay_mass_ratio"] for item in stats]
+        ).mean(),
     }
     for key in RANK_UPDATE_LOG_KEYS:
         tensor_key = f"rank_{key}"
@@ -2459,6 +2617,12 @@ def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_d
         ),
         "opacity_decay_mass_ratio": float(
             summary["opacity_decay_mass_ratio"].item()
+        ),
+        "point_front_conflict_ratio": float(
+            summary["point_front_conflict_ratio"].item()
+        ),
+        "point_front_decay_mass_ratio": float(
+            summary["point_front_decay_mass_ratio"].item()
         ),
         "append_ratio": float(summary["append_ratio"].item()),
         "appended_gs": int(summary["appended_gs"]),
@@ -3383,6 +3547,12 @@ def main(cfg_dict: DictConfig) -> None:
                 "opacity_decay_mass_ratio": float(
                     summary["opacity_decay_mass_ratio"].item()
                 ),
+                "point_front_conflict_ratio": float(
+                    summary["point_front_conflict_ratio"].item()
+                ),
+                "point_front_decay_mass_ratio": float(
+                    summary["point_front_decay_mass_ratio"].item()
+                ),
             }
             train_row.update(_flatten_residual_update_stats(summary))
             writer.writerow(train_row)
@@ -3409,6 +3579,8 @@ def main(cfg_dict: DictConfig) -> None:
                     f"heldout={loss_heldout.item():.6f} "
                     f"decay_p={summary['opacity_decay_candidate_probability'].item():.3f} "
                     f"decay_mass={summary['opacity_decay_mass_ratio'].item():.3%} "
+                    f"front_conflict={summary['point_front_conflict_ratio'].item():.3%} "
+                    f"fixed_decay={summary['point_front_decay_mass_ratio'].item():.3%} "
                     f"coverage={summary['old_coverage_ratio'].item():.2%} "
                     f"consistent={summary['depth_consistent_ratio'].item():.2%} "
                     f"new_front={summary['current_in_front_ratio'].item():.2%} "
