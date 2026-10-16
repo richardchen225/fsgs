@@ -534,6 +534,32 @@ def test_hybrid_append_aligns_depth_scale_per_batch() -> None:
     assert not conflicts.any()
 
 
+def test_point_map_append_is_safe_under_mixed_precision() -> None:
+    state = _make_state()
+    state.point_map[..., 2] = 2.0
+    depth = torch.full((2, 1, 5, 5), 2.0)
+    camera_to_world = torch.eye(4).expand(2, -1, -1).clone()
+    intrinsics = torch.tensor([
+        [0.5, 0.0, 0.5],
+        [0.0, 0.5, 0.5],
+        [0.0, 0.0, 1.0],
+    ]).expand(2, -1, -1).clone()
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        append_mask, coverage, conflicts, _, _ = build_point_map_append_mask(
+            state=state,
+            current_depth=depth,
+            camera_to_world=camera_to_world,
+            intrinsics=intrinsics,
+            hybrid_enabled=True,
+            dilation_radius=0,
+        )
+
+    assert coverage[0].any()
+    assert not conflicts.any()
+    assert append_mask.dtype == torch.bool
+
+
 def test_point_map_append_budget_is_per_batch() -> None:
     state = _make_state()
     state.point_map = torch.full_like(state.point_map, 1000.0)

@@ -308,7 +308,7 @@ def build_point_map_append_mask(
             "bij,bnj->bni",
             world_to_camera,
             torch.cat([points, ones], dim=-1),
-        )[..., :3]
+        )[..., :3].float()
         z = camera_points[..., 2]
         z_safe = z.clamp_min(1e-6)
         u = fx * camera_points[..., 0] / z_safe + cx
@@ -340,10 +340,13 @@ def build_point_map_append_mask(
         consistent_count.scatter_add_(
             1, linear_index, consistent.to(consistent_count.dtype)
         )
+        projected_depth = torch.where(
+            in_image, z, torch.full_like(z, float("inf"))
+        ).to(dtype=nearest_depth.dtype)
         nearest_depth.scatter_reduce_(
             1,
             linear_index,
-            torch.where(in_image, z, torch.full_like(z, float("inf"))),
+            projected_depth,
             reduce="amin",
             include_self=True,
         )
@@ -378,7 +381,7 @@ def build_point_map_append_mask(
                 "bij,bnj->bni",
                 world_to_camera,
                 torch.cat([points, ones], dim=-1),
-            )[..., :3]
+            )[..., :3].float()
             z = camera_points[..., 2]
             z_safe = z.clamp_min(1e-6)
             u = fx * camera_points[..., 0] / z_safe + cx
