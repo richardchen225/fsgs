@@ -84,15 +84,15 @@ model:
     gir_point_append_depth_check_enabled: false
     gir_point_append_hybrid_enabled: true
     # Ablation: do not treat a closer current surface as automatic new geometry.
-    gir_point_append_current_in_front_enabled: false
+    gir_point_append_current_in_front_enabled: true
     # Ablation: do not append behind unmatched projected historical points.
-    gir_point_append_history_in_front_enabled: false
+    gir_point_append_history_in_front_enabled: true
     gir_point_append_depth_relative_tolerance: 0.15
     gir_point_append_rgb_bad_threshold: 0.08
     gir_point_append_old_alpha_threshold: 0.10
     gir_point_append_min_depth_confidence: 0.0
     gir_point_append_front_conflict_confirm_views: 1
-    gir_point_append_front_conflict_opacity_decay: 0.30
+    gir_point_append_front_conflict_opacity_decay: 0.70
     gir_point_append_max_ratio: 1.0
     gir_point_append_dilation_radius: 2
     gir_point_append_chunk_size: 65536
