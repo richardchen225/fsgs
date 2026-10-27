@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Usage:
-#   bash test.sh [CKPT] [OUTPUT_PATH] [EXPERIMENT] [WANDB_NAME] \
+#   GIR_DEBUG_SAVE_INTERMEDIATES=true bash test.sh \
+#     [CKPT] [OUTPUT_PATH] [EXPERIMENT] [WANDB_NAME] \
 #     [DL3DV140_ROOT] [DL3DV140_INDEX]
 #
 # DL3DV140_ROOT may use the dl3dv_1 layout:
@@ -20,6 +21,9 @@ export NUM_NODES="${NUM_NODES:-1}"
 export MASTER_ADDR="${MASTER_ADDR:-localhost}"
 export MASTER_PORT="${MASTER_PORT:-12345}"
 EXPECTED_SCENES="${EXPECTED_SCENES:-140}"
+GIR_DEBUG_SAVE_INTERMEDIATES="${GIR_DEBUG_SAVE_INTERMEDIATES:-false}"
+GIR_DEBUG_MAX_SCENES="${GIR_DEBUG_MAX_SCENES:-10}"
+GIR_DEBUG_VIEW_STRIDE="${GIR_DEBUG_VIEW_STRIDE:-1}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -159,4 +163,7 @@ torchrun \
   test.compute_scores=true \
   test.save_metrics=true \
   test.output_path="$OUTPUT_PATH" \
+  test.gir_debug_save_intermediates="$GIR_DEBUG_SAVE_INTERMEDIATES" \
+  test.gir_debug_max_scenes="$GIR_DEBUG_MAX_SCENES" \
+  test.gir_debug_view_stride="$GIR_DEBUG_VIEW_STRIDE" \
   checkpointing.load="$CKPT"

@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange, repeat
 from jaxtyping import Float
 from torch import Tensor
@@ -10,7 +11,7 @@ import torchvision
 from ..types import Gaussians
 # from .cuda_splatting import DepthRenderingMode, render_cuda
 from .decoder import Decoder, DecoderOutput
-from math import prod, sqrt
+from math import isfinite, prod, sqrt
 from gsplat import rasterization
 
 try:
@@ -50,6 +51,48 @@ class ProjectedGSRasterizationOutput:
     color: Tensor
     expected_depth: Tensor
     alpha: Tensor
+
+
+@dataclass
+class GSParameterGradientOutput:
+    opacity_logit: Tensor
+    mean_camera: Tensor | None
+    losses: Tensor
+
+
+def _invert_rigid_camera_poses(camera_to_world: Tensor) -> Tensor:
+    """Invert rigid C2W poses without a generic matrix inverse."""
+    if camera_to_world.shape[-2:] != (4, 4):
+        raise ValueError(
+            "Camera poses must end in [4,4], got "
+            f"{tuple(camera_to_world.shape)}."
+        )
+    rotation_c2w = camera_to_world[..., :3, :3]
+    translation_c2w = camera_to_world[..., :3, 3:4]
+    rotation_w2c = rotation_c2w.transpose(-1, -2)
+    translation_w2c = -(rotation_w2c @ translation_c2w)
+    top = torch.cat([rotation_w2c, translation_w2c], dim=-1)
+    bottom = camera_to_world.new_tensor([0.0, 0.0, 0.0, 1.0])
+    bottom = bottom.expand(*camera_to_world.shape[:-2], 1, 4)
+    return torch.cat([top, bottom], dim=-2)
+
+
+def _raster_clip_planes(
+    near_plane: float,
+    far_plane: float,
+) -> tuple[float, float]:
+    near_plane = float(near_plane)
+    far_plane = float(far_plane)
+    if not isfinite(near_plane) or near_plane <= 0.0:
+        raise ValueError(
+            f"Raster near plane must be finite and positive: {near_plane}."
+        )
+    if not isfinite(far_plane) or far_plane <= near_plane:
+        raise ValueError(
+            "Raster far plane must be finite and greater than near plane: "
+            f"near={near_plane}, far={far_plane}."
+        )
+    return near_plane, far_plane
 
 
 @torch.no_grad()
@@ -287,6 +330,149 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             alpha=torch.stack(alphas),
         )
 
+    def render_parameter_gradients(
+        self,
+        gaussians: Gaussians,
+        extrinsics: Tensor,
+        intrinsics: Tensor,
+        target_rgb: Tensor,
+        image_shape: tuple[int, int],
+        active_mask: Tensor | None = None,
+        mean_camera_enabled: bool = False,
+    ) -> GSParameterGradientOutput:
+        """Probe detached GS parameters with per-view RGB reconstruction loss."""
+        if extrinsics.ndim == 3:
+            extrinsics = extrinsics[:, None]
+        if intrinsics.ndim == 3:
+            intrinsics = intrinsics[:, None]
+        if target_rgb.ndim == 4:
+            target_rgb = target_rgb[:, None]
+        batch, views = extrinsics.shape[:2]
+        if intrinsics.shape[:2] != (batch, views):
+            raise ValueError(
+                "Opacity-gradient intrinsics must match camera views; got "
+                f"{tuple(intrinsics.shape)} and {tuple(extrinsics.shape)}."
+            )
+        if target_rgb.shape[:2] != (batch, views):
+            raise ValueError(
+                "Opacity-gradient RGB targets must match camera views; got "
+                f"{tuple(target_rgb.shape)} and {tuple(extrinsics.shape)}."
+            )
+        if active_mask is None:
+            active_mask = gaussians.opacities.detach() > 0
+        if active_mask.shape != gaussians.opacities.shape:
+            raise ValueError(
+                "Opacity-gradient active mask must match opacities; got "
+                f"{tuple(active_mask.shape)} and {tuple(gaussians.opacities.shape)}."
+            )
+
+        height, width = image_shape
+        opacity_gradients = []
+        mean_gradients = []
+        losses = []
+        with torch.inference_mode(False), torch.enable_grad(), torch.autocast(
+            device_type=gaussians.opacities.device.type, enabled=False
+        ):
+            target = target_rgb.detach().clone().float().reshape(
+                batch * views, *target_rgb.shape[2:]
+            )
+            if target.shape[-2:] != (height, width):
+                target = F.interpolate(
+                    target,
+                    size=(height, width),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            target = target.reshape(batch, views, 3, height, width)
+            base_opacity = (
+                gaussians.opacities.detach()
+                .clone()
+                .float()
+                .clamp(1e-4, 1.0 - 1e-4)
+            )
+            active = active_mask.detach().clone().to(base_opacity.dtype)
+            near = torch.full((batch, 1), 1e-4, device=base_opacity.device)
+            far = torch.full((batch, 1), 100.0, device=base_opacity.device)
+            fixed_means = gaussians.means.detach().clone().float()
+            fixed_harmonics = gaussians.harmonics.detach().clone().float()
+            fixed_scales = gaussians.scales.detach().clone().float()
+            fixed_rotations = gaussians.rotations.detach().clone().float()
+            fixed_extrinsics = extrinsics.detach().clone().float()
+            fixed_intrinsics = intrinsics.detach().clone().float()
+            reference_rotation = fixed_extrinsics[:, 0, :3, :3]
+            for view_idx in range(views):
+                opacity_logits = torch.logit(base_opacity).requires_grad_(True)
+                probe_inputs = [opacity_logits]
+                probe_means = fixed_means
+                if mean_camera_enabled:
+                    mean_delta_camera = torch.zeros_like(fixed_means).requires_grad_(
+                        True
+                    )
+                    mean_delta_world = torch.einsum(
+                        "bij,bnj->bni", reference_rotation, mean_delta_camera
+                    )
+                    probe_means = fixed_means + mean_delta_world
+                    probe_inputs.append(mean_delta_camera)
+                detached_gaussians = Gaussians(
+                    means=probe_means,
+                    harmonics=fixed_harmonics,
+                    opacities=torch.sigmoid(opacity_logits) * active,
+                    scales=fixed_scales,
+                    rotations=fixed_rotations,
+                )
+                rendering = self.forward(
+                    detached_gaussians,
+                    fixed_extrinsics[:, view_idx : view_idx + 1],
+                    fixed_intrinsics[:, view_idx : view_idx + 1],
+                    near,
+                    far,
+                    image_shape,
+                )
+                loss = (
+                    rendering.color.float() - target[:, view_idx : view_idx + 1]
+                ).square().sum()
+                gradient_values = torch.autograd.grad(
+                    loss,
+                    probe_inputs,
+                    create_graph=False,
+                    retain_graph=False,
+                )
+                opacity_gradients.append(gradient_values[0].detach() * active)
+                if mean_camera_enabled:
+                    mean_gradients.append(
+                        gradient_values[1].detach() * active.unsqueeze(-1)
+                    )
+                losses.append(loss.detach())
+        return GSParameterGradientOutput(
+            opacity_logit=torch.stack(opacity_gradients, dim=1),
+            mean_camera=(
+                torch.stack(mean_gradients, dim=1)
+                if mean_camera_enabled
+                else None
+            ),
+            losses=torch.stack(losses),
+        )
+
+    def render_opacity_logit_gradients(
+        self,
+        gaussians: Gaussians,
+        extrinsics: Tensor,
+        intrinsics: Tensor,
+        target_rgb: Tensor,
+        image_shape: tuple[int, int],
+        active_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        output = self.render_parameter_gradients(
+            gaussians,
+            extrinsics,
+            intrinsics,
+            target_rgb,
+            image_shape,
+            active_mask=active_mask,
+            mean_camera_enabled=False,
+        )
+        return output.opacity_logit, output.losses
+
     @torch.no_grad()
     def render_gir_evidence(
         self,
@@ -484,7 +670,17 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         cam_rot_delta: Float[Tensor, "batch view 3"] | None = None,
         cam_trans_delta: Float[Tensor, "batch view 3"] | None = None,
     ) -> DecoderOutput:
-        B, V, _, _  = intrinsics.shape
+        B, V, _, _ = intrinsics.shape
+        if near.shape != (B, V) or far.shape != (B, V):
+            raise ValueError(
+                "Near/far planes must match decoder cameras: "
+                f"near={tuple(near.shape)}, far={tuple(far.shape)}, "
+                f"cameras={(B, V)}."
+            )
+        # Clip planes are control values, not differentiable camera parameters.
+        # Transfer them once instead of synchronizing the GPU inside every view.
+        near_values = near.detach().float().cpu().tolist()
+        far_values = far.detach().float().cpu().tolist()
         H, W = image_shape
         rendered_imgs, rendered_depths, rendered_alphas = [], [], []
         # xyzs, opacitys, rotations, scales, features = gaussians.means, gaussians.opacities, gaussians.rotations, gaussians.scales, gaussians.harmonics.permute(0, 1, 3, 2).contiguous()
@@ -497,7 +693,7 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             scale_i = scales[i].float()
             rotation_i = rotations[i].float()
             opacity_i = opacitys[i].float()
-            test_w2c_i = extrinsics[i].float().inverse() # (V, 4, 4)
+            test_w2c_i = _invert_rigid_camera_poses(extrinsics[i].float())
             test_intr_i_normalized = intrinsics[i].float()
             # Denormalize the intrinsics into standred format
             test_intr_i = test_intr_i_normalized.clone()
@@ -509,17 +705,28 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             rendering_depth_list = []
             rendering_alpha_list = []
             for j in range(V):
-                rendering, alpha, *ignored = rasterization(xyz_i, rotation_i, scale_i, opacity_i, feature_i,
-                                                test_w2c_i[j:j+1], test_intr_i[j:j+1], W, H, 
-                                                sh_degree=sh_degree, 
-                                                # near_plane=near[i].mean(), far_plane=far[i].mean(),
-                                                render_mode="RGB+D", packed=False,
-                                                near_plane=1e-10,
-                                                backgrounds=self.background_color.unsqueeze(0).repeat(1, 1),
-                                                radius_clip=0.1,
-                                                # covars=covar_i,
-                                                rasterize_mode='classic'
-                                                        ) # (V, H, W, 3) 
+                near_plane, far_plane = _raster_clip_planes(
+                    near_values[i][j], far_values[i][j]
+                )
+                rendering, alpha, *ignored = rasterization(
+                    xyz_i,
+                    rotation_i,
+                    scale_i,
+                    opacity_i,
+                    feature_i,
+                    test_w2c_i[j : j + 1],
+                    test_intr_i[j : j + 1],
+                    W,
+                    H,
+                    sh_degree=sh_degree,
+                    render_mode="RGB+D",
+                    packed=False,
+                    near_plane=near_plane,
+                    far_plane=far_plane,
+                    backgrounds=self.background_color.unsqueeze(0),
+                    radius_clip=0.1,
+                    rasterize_mode="classic",
+                )
                 rendering_img, rendering_depth = torch.split(rendering, [3, 1], dim=-1)
                 rendering_img = rendering_img.clamp(0.0, 1.0)
                 rendering_list.append(rendering_img.permute(0, 3, 1, 2))

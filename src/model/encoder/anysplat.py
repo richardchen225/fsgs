@@ -104,6 +104,9 @@ class EncoderAnySplatCfg:
     depth_refine_geometry_neighbors: int = 2
     depth_refine_geometry_weight: float = 0.1
     num_test_context_views: Optional[int] = None
+    # Camera parameters are supervised directly. Detaching their derived
+    # matrices keeps rasterizer and geometry gradients out of the camera MLP.
+    detach_predicted_camera_for_geometry: bool = False
     gir_enabled: bool = False
     gir_render_scale: float = 0.25
     gir_raster_evidence_enabled: bool = False
@@ -120,6 +123,27 @@ class EncoderAnySplatCfg:
     gir_projected_opacity_logit_scale: float = 1.0
     gir_projected_front_decay_strength: float = 0.02
     gir_projected_warmup_steps: int = 1000
+    gir_old_opacity_gradient_enabled: bool = False
+    gir_new_opacity_gradient_enabled: bool = False
+    gir_opacity_gradient_replay_views: int = 6
+    gir_opacity_gradient_scale: float = 1000.0
+    gir_opacity_gradient_clip: float = 20.0
+    gir_opacity_gradient_threshold: float = 1e-3
+    gir_opacity_gradient_current_weight: float = 1.0
+    gir_opacity_gradient_replay_weight: float = 0.5
+    gir_opacity_gradient_front_decay_gate_enabled: bool = False
+    gir_opacity_gradient_front_decay_threshold: float = 0.0
+    gir_mean_gradient_enabled: bool = False
+    gir_mean_gradient_scale: float = 1.0
+    gir_mean_gradient_clip: float = 20.0
+    gir_mean_gradient_threshold: float = 1e-6
+    gir_mean_gradient_replay_views: int = 6
+    gir_old_mean_gradient_current_weight: float = 1.0
+    gir_old_mean_gradient_replay_weight: float = 0.5
+    gir_new_mean_gradient_enabled: bool = False
+    gir_new_mean_gradient_replay_views: int = 0
+    gir_new_mean_gradient_current_weight: float = 1.0
+    gir_new_mean_gradient_replay_weight: float = 0.0
     gir_old_delete_enabled: bool = False
     gir_old_delete_warmup_steps: int = 1000
     gir_old_delete_target_ratio: float = 0.01
@@ -179,9 +203,8 @@ class EncoderAnySplatCfg:
     # each new view.  "means" matches the selected overfit setup: historical
     # positions are detached while appearance parameters keep their graph.
     gir_historical_detach_mode: Literal["all", "means", "none"] = "means"
-    # The current-frame residual is an independent operation from appending
-    # new GS.  Keep it switchable so a full append can be tested by itself.
-    gir_new_residual_enabled: bool = True
+    # Refine only append-selected DPT anchors with the shared projected-GS MLP.
+    gir_new_residual_enabled: bool = False
     gir_residual_alpha_threshold: float = 0.02
     gir_residual_depth_relative_tolerance: float = 0.08
     gir_residual_rgb_bad_threshold: float = 0.08
@@ -919,39 +942,49 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 ],
                 dim=-1,
             )
-            pred_all_extrinsic, pred_all_intrinsic_px = (
+            pred_all_w2c, pred_all_intrinsic_px = (
                 pose_encoding_to_extri_intri(
                     safe_pose_enc, image.shape[-2:]
                 )
             )
-            
+
+            detach_camera_geometry = bool(
+                self.cfg.detach_predicted_camera_for_geometry
+            )
+            geometry_w2c = (
+                pred_all_w2c.detach()
+                if detach_camera_geometry
+                else pred_all_w2c
+            )
+            geometry_intrinsic_px = (
+                pred_all_intrinsic_px.detach()
+                if detach_camera_geometry
+                else pred_all_intrinsic_px
+            )
             gt_ex = closed_form_inverse_se3(
-                pred_all_extrinsic[:, :ctx_img_num, ...].flatten(0, 1)
+                geometry_w2c[:, :ctx_img_num].flatten(0, 1)
             )
 
             distill_infos["pred_pose_enc_list"] = last_pred_pose_enc
 
             # 复制成 [b, ctx_img_num, 3, 3]
-            intrinsic = pred_all_intrinsic_px[:, :ctx_img_num]
+            intrinsic = geometry_intrinsic_px[:, :ctx_img_num]
             gt_ix = intrinsic
 
-            extrinsic_padding = (
-                torch.tensor(
-                    [0, 0, 0, 1],
-                    device=pred_all_extrinsic.device,
-                    dtype=pred_all_extrinsic.dtype,
-                )
-                .view(1, 1, 1, 4)
-                .repeat(b, image.shape[1], 1, 1)
+            # pose_encoding_to_extri_intri returns rigid W2C matrices. The
+            # closed-form inverse avoids differentiating through a generic 4x4
+            # matrix inverse and preserves the exact homogeneous bottom row.
+            pred_all_extrinsic = closed_form_inverse_se3(
+                geometry_w2c.flatten(0, 1)
+            ).reshape(
+                b,
+                image.shape[1],
+                4,
+                4,
             )
-            pred_all_extrinsic = torch.cat(
-                [pred_all_extrinsic, extrinsic_padding], dim=2
-            ).inverse()
-            # Keep predicted poses attached so camera supervision and RGB
-            # rendering losses can both train the camera head.
             infos["pred_context_c2w"] = pred_all_extrinsic
-            # Supervise the same finite pose encoding used to build the
-            # differentiable camera matrices and intrinsics above.
+            # This remains attached even when derived geometry is detached, so
+            # the explicit pose/FOV objective still trains the camera head.
             infos["pred_context_pose_encoding"] = safe_pose_enc
 
             ctx_agg_token_list = [
@@ -1077,7 +1110,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             depth_dict["depth_uncertainty"] = depth_uncertainty
 
         # print("B:", b, "V:", v, "H:", h, "W:", w)
-        render_intrinsic = pred_all_intrinsic_px.clone()
+        render_intrinsic = geometry_intrinsic_px.clone()
         render_intrinsic = torch.stack(
             [
                 render_intrinsic[:, :, 0] / w,

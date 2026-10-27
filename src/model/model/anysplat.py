@@ -13,13 +13,23 @@ from dataclasses import dataclass, replace
 
 from src.model.types import Gaussians
 from src.model.streaming_gir import (
-    apply_current_gaussian_residual,
+    apply_projected_new_gaussian_residual,
+    build_mean_gradient_evidence,
+    build_opacity_gradient_evidence,
     build_point_map_append_mask,
+    build_provisional_gaussians,
     build_projected_gaussian_evidence,
+    build_projected_new_gaussian_evidence,
+    compute_old_opacity_gradient_effective_stats,
     DominantGIR,
     DominantGIRRenderer,
+    gate_front_conflict_decay,
     GIRUpdateHead,
+    MEAN_GRADIENT_STAT_KEYS,
+    OLD_OPACITY_GRADIENT_EFFECTIVE_STAT_KEYS,
+    OPACITY_GRADIENT_STAT_KEYS,
     ProjectedGSResidualHead,
+    select_current_and_recent_replay_gradients,
     StreamingGaussianState,
 )
 from src.model.encoder import act_gs, sh_utils
@@ -34,6 +44,25 @@ from src.model.encoder.anysplat import (
     OpacityMappingCfg,
 )
 from src.misc.cuda_memory import log_cuda_memory
+
+
+NEW_RESIDUAL_STAT_KEYS = (
+    "candidate_ratio",
+    "gate_mean",
+    "raw_mean",
+    "mean_shift_mean",
+    "raw_rotation",
+    "rotation_shift_mean",
+    "raw_log_scale",
+    "scale_relative_shift_mean",
+    "raw_opacity_logit",
+    "opacity_shift_mean",
+    "raw_harmonics",
+    "harmonics_shift_mean",
+    "regularization",
+    *OPACITY_GRADIENT_STAT_KEYS,
+    *MEAN_GRADIENT_STAT_KEYS,
+)
 
 
 def _group_count(channels: int, max_groups: int = 8) -> int:
@@ -298,12 +327,32 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 "gir_old_update_mode must be pixel_topk or projected_shared; "
                 f"got {old_update_mode!r}."
             )
-        if old_update_mode == "projected_shared":
+        new_residual_enabled = bool(
+            getattr(cfg, "gir_new_residual_enabled", False)
+        )
+        new_opacity_gradient_enabled = bool(
+            getattr(cfg, "gir_new_opacity_gradient_enabled", False)
+        )
+        if new_opacity_gradient_enabled and not new_residual_enabled:
+            raise ValueError(
+                "New-GS opacity-gradient conditioning requires "
+                "gir_new_residual_enabled=true."
+            )
+        new_mean_gradient_enabled = bool(
+            getattr(cfg, "gir_new_mean_gradient_enabled", False)
+        )
+        if new_mean_gradient_enabled and not new_residual_enabled:
+            raise ValueError(
+                "New-GS mean-gradient conditioning requires "
+                "gir_new_residual_enabled=true."
+            )
+        if old_update_mode == "projected_shared" or new_residual_enabled:
             if bool(getattr(cfg, "gir_old_decay_enabled", False)):
-                raise ValueError(
-                    "projected_shared includes front-surface opacity decay; "
-                    "set gir_old_decay_enabled=false to avoid duplicate updates."
-                )
+                if old_update_mode == "projected_shared":
+                    raise ValueError(
+                        "projected_shared includes front-surface opacity decay; "
+                        "set gir_old_decay_enabled=false to avoid duplicate updates."
+                    )
             self.gir_projected_update_head = ProjectedGSResidualHead(
                 feature_dim=self.encoder.feature_dim // 2,
                 harmonic_dim=self.encoder.nums_sh * 3,
@@ -555,6 +604,76 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             rotations=gaussians.rotations[:, start:end],
         )
 
+    @staticmethod
+    def _project_selected_points_for_debug(
+        point_map: torch.Tensor,
+        selected_mask: torch.Tensor,
+        camera_to_world: torch.Tensor,
+        intrinsics: torch.Tensor,
+        image_shape: tuple[int, int],
+    ) -> torch.Tensor:
+        """Project a GS-space boolean mask into the current image for debugging."""
+        height, width = image_shape
+        batch_size, point_count, _ = point_map.shape
+        if selected_mask.shape != (batch_size, point_count):
+            raise ValueError(
+                "Debug point mask must match the point map; got "
+                f"{tuple(selected_mask.shape)} and {(batch_size, point_count)}."
+            )
+
+        projected = torch.zeros(
+            (batch_size, 1, height, width),
+            device=point_map.device,
+            dtype=torch.float32,
+        )
+        world_to_camera = torch.linalg.inv(camera_to_world.detach().float())
+        for batch_idx in range(batch_size):
+            points = point_map[batch_idx, selected_mask[batch_idx]].detach().float()
+            if points.numel() == 0:
+                continue
+            ones = torch.ones(
+                (points.shape[0], 1), device=points.device, dtype=points.dtype
+            )
+            camera_points = (
+                world_to_camera[batch_idx]
+                @ torch.cat([points, ones], dim=-1).transpose(0, 1)
+            ).transpose(0, 1)[..., :3]
+            z = camera_points[:, 2]
+            z_safe = z.clamp_min(1e-6)
+            pixel_x = (
+                intrinsics[batch_idx, 0, 0].detach().float()
+                * width
+                * camera_points[:, 0]
+                / z_safe
+                + intrinsics[batch_idx, 0, 2].detach().float() * width
+            ).round().long()
+            pixel_y = (
+                intrinsics[batch_idx, 1, 1].detach().float()
+                * height
+                * camera_points[:, 1]
+                / z_safe
+                + intrinsics[batch_idx, 1, 2].detach().float() * height
+            ).round().long()
+            valid = (
+                torch.isfinite(camera_points).all(dim=-1)
+                & (z > 1e-5)
+                & (pixel_x >= 0)
+                & (pixel_x < width)
+                & (pixel_y >= 0)
+                & (pixel_y < height)
+            )
+            linear_index = pixel_y[valid] * width + pixel_x[valid]
+            projected[batch_idx, 0].view(-1).scatter_add_(
+                0,
+                linear_index,
+                torch.ones_like(linear_index, dtype=projected.dtype),
+            )
+
+        # A one-pixel projected center is hard to inspect in a large panel.
+        return F.max_pool2d(
+            (projected > 0).float(), kernel_size=3, stride=1, padding=1
+        )
+
     def _update_streaming_gaussians(
         self,
         encoder_output,
@@ -568,10 +687,19 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         test_add_gate_prune_threshold: float = 0.0,
         test_top1_confidence_mode: str = "inherit",
         test_top1_confidence_floor: float = 0.25,
+        return_debug_intermediates: bool = False,
+        debug_view_stride: int = 1,
     ) -> Gaussians:
         refine_info = None if encoder_output.infos is None else encoder_output.infos.get("gir")
         if refine_info is None:
             raise RuntimeError("GIR is enabled, but the encoder did not return per-view GS data.")
+
+        debug_view_stride = int(debug_view_stride)
+        if debug_view_stride < 1:
+            raise ValueError(
+                "GIR debug view stride must be at least 1, "
+                f"got {debug_view_stride}."
+            )
 
         cfg = self.encoder.cfg
         prune_threshold = float(test_add_gate_prune_threshold)
@@ -632,6 +760,108 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             raise RuntimeError(
                 "projected_shared is enabled, but the projected GS head is missing."
             )
+        old_opacity_gradient_enabled = bool(
+            getattr(cfg, "gir_old_opacity_gradient_enabled", False)
+        )
+        new_opacity_gradient_enabled = bool(
+            getattr(cfg, "gir_new_opacity_gradient_enabled", False)
+        )
+        if (
+            old_opacity_gradient_enabled
+            and old_residual_enabled
+            and old_update_mode != "projected_shared"
+        ):
+            raise ValueError(
+                "Old-GS opacity-gradient conditioning requires "
+                "gir_old_update_mode=projected_shared."
+            )
+        opacity_gradient_replay_views = int(
+            getattr(cfg, "gir_opacity_gradient_replay_views", 6)
+        )
+        if opacity_gradient_replay_views < -1:
+            raise ValueError(
+                "gir_opacity_gradient_replay_views must be -1, 0, or positive; "
+                f"got {opacity_gradient_replay_views}."
+            )
+        opacity_gradient_scale = float(
+            getattr(cfg, "gir_opacity_gradient_scale", 1000.0)
+        )
+        opacity_gradient_clip = float(
+            getattr(cfg, "gir_opacity_gradient_clip", 20.0)
+        )
+        opacity_gradient_threshold = float(
+            getattr(cfg, "gir_opacity_gradient_threshold", 1e-3)
+        )
+        opacity_gradient_current_weight = float(
+            getattr(cfg, "gir_opacity_gradient_current_weight", 1.0)
+        )
+        opacity_gradient_replay_weight = float(
+            getattr(cfg, "gir_opacity_gradient_replay_weight", 0.5)
+        )
+        opacity_gradient_front_decay_gate_enabled = bool(
+            getattr(
+                cfg,
+                "gir_opacity_gradient_front_decay_gate_enabled",
+                False,
+            )
+        )
+        opacity_gradient_front_decay_threshold = float(
+            getattr(
+                cfg,
+                "gir_opacity_gradient_front_decay_threshold",
+                0.0,
+            )
+        )
+        mean_gradient_enabled = bool(
+            getattr(cfg, "gir_mean_gradient_enabled", False)
+        )
+        if mean_gradient_enabled and not projected_update_enabled:
+            raise ValueError(
+                "Old-GS mean-gradient conditioning requires "
+                "gir_old_residual_enabled=true and "
+                "gir_old_update_mode=projected_shared."
+            )
+        mean_gradient_scale = float(
+            getattr(cfg, "gir_mean_gradient_scale", 1.0)
+        )
+        mean_gradient_clip = float(
+            getattr(cfg, "gir_mean_gradient_clip", 20.0)
+        )
+        mean_gradient_threshold = float(
+            getattr(cfg, "gir_mean_gradient_threshold", 1e-6)
+        )
+        mean_gradient_replay_views = int(
+            getattr(
+                cfg,
+                "gir_mean_gradient_replay_views",
+                opacity_gradient_replay_views,
+            )
+        )
+        if mean_gradient_replay_views < -1:
+            raise ValueError(
+                "gir_mean_gradient_replay_views must be -1, 0, or positive; "
+                f"got {mean_gradient_replay_views}."
+            )
+        old_mean_gradient_current_weight = float(
+            getattr(cfg, "gir_old_mean_gradient_current_weight", 1.0)
+        )
+        old_mean_gradient_replay_weight = float(
+            getattr(cfg, "gir_old_mean_gradient_replay_weight", 0.5)
+        )
+        new_mean_gradient_replay_views = int(
+            getattr(cfg, "gir_new_mean_gradient_replay_views", 0)
+        )
+        if new_mean_gradient_replay_views < -1:
+            raise ValueError(
+                "gir_new_mean_gradient_replay_views must be -1, 0, or "
+                f"positive; got {new_mean_gradient_replay_views}."
+            )
+        new_mean_gradient_current_weight = float(
+            getattr(cfg, "gir_new_mean_gradient_current_weight", 1.0)
+        )
+        new_mean_gradient_replay_weight = float(
+            getattr(cfg, "gir_new_mean_gradient_replay_weight", 0.0)
+        )
         old_decay_enabled = bool(
             getattr(cfg, "gir_old_decay_enabled", False)
         )
@@ -822,8 +1052,16 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             getattr(cfg, "gir_point_append_chunk_size", 65536)
         )
         new_residual_enabled = bool(
-            getattr(cfg, "gir_new_residual_enabled", True)
+            getattr(cfg, "gir_new_residual_enabled", False)
         )
+        new_mean_gradient_enabled = bool(
+            getattr(cfg, "gir_new_mean_gradient_enabled", False)
+        )
+        if new_mean_gradient_enabled and not new_residual_enabled:
+            raise ValueError(
+                "New-GS mean-gradient conditioning requires "
+                "gir_new_residual_enabled=true."
+            )
         historical_detach_mode = str(
             getattr(cfg, "gir_historical_detach_mode", "means")
         ).lower()
@@ -861,7 +1099,6 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             intrinsics = intrinsics.expand(-1, source_views, -1, -1)
 
         depth = refine_info["depth"]
-        depth_confidence = refine_info["depth_conf"]
         state: Optional[StreamingGaussianState] = None
         # Keep the streaming RGB terms separate so append holes can receive
         # focused supervision without changing current/replay normalization.
@@ -899,9 +1136,18 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         projected_gate_means = []
         projected_opacity_shifts = []
         projected_front_decay_probabilities = []
+        projected_gradient_stats = {
+            key: []
+            for key in (
+                *OPACITY_GRADIENT_STAT_KEYS,
+                *OLD_OPACITY_GRADIENT_EFFECTIVE_STAT_KEYS,
+                *MEAN_GRADIENT_STAT_KEYS,
+            )
+        }
         point_coverage_ratios = []
         point_append_ratios = []
         point_front_conflict_ratios = []
+        point_front_gradient_decay_gate_ratios = []
         point_depth_scales = []
         point_front_decay_mass_ratios = []
         old_delete_graph_anchor = features.new_zeros(())
@@ -927,8 +1173,8 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         residual_magnitudes = []
         raster_alpha_means = []
         dominant_weight_means = []
-        new_residual_magnitudes = []
-        new_residual_gates = []
+        new_residual_stats = {key: [] for key in NEW_RESIDUAL_STAT_KEYS}
+        debug_intermediates = []
         auxiliary_enabled = bool(
             self.training
             and float(getattr(cfg, "gir_aux_loss_weight", 0.0)) > 0.0
@@ -951,13 +1197,16 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             current_feature = features[:, view_idx]
             current_rgb = context_image[:, view_idx]
             current_depth = depth[:, view_idx].permute(0, 3, 1, 2)
-            current_depth_confidence = depth_confidence[:, view_idx].permute(0, 3, 1, 2)
+            # Match the overfit rollout, which does not condition streaming
+            # evidence or point-map fusion on predicted depth confidence.
+            current_depth_confidence = torch.ones_like(current_depth)
             current_gaussians = self._slice_gaussian_view(
                 encoder_output.gaussians,
                 view_idx,
                 gaussians_per_view,
             )
             has_history = state is not None
+            projected_alignment_context = None
 
             if auxiliary_enabled and view_idx == 0:
                 # Render the first-view GS before any historical update or
@@ -982,6 +1231,11 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 )
 
             projected_raster = None
+            old_coverage = None
+            depth_consistent = None
+            old_in_front = None
+            rgb_error = None
+            residual_mask = None
             if state is None:
                 gir = DominantGIR.empty(
                     b,
@@ -1128,11 +1382,141 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
 
             projected_evidence = None
             projected_prediction = None
+            old_gradient_evidence = None
+            old_mean_gradient_evidence = None
+            point_append_mask = None
+            point_coverage = None
+            point_front_conflict_mask = None
+            point_front_decay_mask = None
+            point_depth_scale = None
+
+            # Match overfit: decide append/front-conflict ownership from the
+            # incoming historical map before applying its learned residual.
+            if has_history and append_mode == "point_map":
+                (
+                    point_append_mask,
+                    point_coverage,
+                    point_front_conflict_mask,
+                    next_front_conflict_count,
+                    point_depth_scale,
+                ) = build_point_map_append_mask(
+                    state=state,
+                    current_depth=current_depth,
+                    camera_to_world=pred_all_extrinsic[:, view_idx],
+                    intrinsics=intrinsics[:, view_idx],
+                    current_rgb=current_rgb,
+                    old_rgb=gir.rgb,
+                    old_depth=gir.raster_depth,
+                    old_alpha=gir.raster_alpha,
+                    current_depth_confidence=current_depth_confidence,
+                    depth_relative_tolerance=point_append_tolerance,
+                    rgb_bad_threshold=point_append_rgb_threshold,
+                    old_alpha_threshold=point_append_old_alpha_threshold,
+                    min_depth_confidence=point_append_min_depth_confidence,
+                    dilation_radius=point_append_dilation,
+                    chunk_size=point_append_chunk_size,
+                    depth_check_enabled=point_append_depth_check,
+                    hybrid_enabled=point_append_hybrid,
+                    append_current_in_front_enabled=(
+                        point_append_current_in_front
+                    ),
+                    append_history_in_front_enabled=(
+                        point_append_history_in_front
+                    ),
+                    front_conflict_confirm_views=(
+                        point_append_front_confirm_views
+                    ),
+                    max_append_ratio=point_append_max_ratio,
+                )
+                state = state.with_front_conflict_count(
+                    next_front_conflict_count
+                )
+                point_coverage_ratios.append(point_coverage.float().mean())
+                point_append_ratios.append(point_append_mask.float().mean())
+                point_depth_scales.append(point_depth_scale.mean())
+                valid_old = (
+                    (state.stable_ids >= 0).float().sum().clamp_min(1.0)
+                )
+                point_front_conflict_ratios.append(
+                    point_front_conflict_mask.float().sum() / valid_old
+                )
+
             if projected_update_enabled and has_history:
                 if projected_raster is None:
                     raise RuntimeError(
                         "Projected old-GS update requires old-map raster evidence."
                     )
+                if old_opacity_gradient_enabled or mean_gradient_enabled:
+                    opacity_uses_all_replay = (
+                        old_opacity_gradient_enabled
+                        and opacity_gradient_replay_views == -1
+                    )
+                    mean_uses_all_replay = (
+                        mean_gradient_enabled
+                        and mean_gradient_replay_views == -1
+                    )
+                    gradient_replay_limit = (
+                        -1
+                        if opacity_uses_all_replay or mean_uses_all_replay
+                        else max(
+                            opacity_gradient_replay_views
+                            if old_opacity_gradient_enabled
+                            else 0,
+                            mean_gradient_replay_views
+                            if mean_gradient_enabled
+                            else 0,
+                        )
+                    )
+                    gradient_replay_indices = _causal_replay_indices(
+                        view_idx,
+                        gradient_replay_limit,
+                        "combined GIR gradient replay views",
+                    )
+                    gradient_view_indices = [view_idx, *gradient_replay_indices]
+                    old_gradient_active_mask = (
+                        (state.stable_ids >= 0)
+                        & (state.gaussians.opacities.detach() > 0)
+                    )
+                    old_gradients = self.decoder.render_parameter_gradients(
+                        state.gaussians,
+                        pred_all_extrinsic[:, gradient_view_indices],
+                        intrinsics[:, gradient_view_indices],
+                        context_image[:, gradient_view_indices],
+                        (low_h, low_w),
+                        active_mask=old_gradient_active_mask,
+                        mean_camera_enabled=mean_gradient_enabled,
+                    )
+                    if old_opacity_gradient_enabled:
+                        old_gradient_evidence = build_opacity_gradient_evidence(
+                            select_current_and_recent_replay_gradients(
+                                old_gradients.opacity_logit,
+                                opacity_gradient_replay_views,
+                            ),
+                            gradient_scale=opacity_gradient_scale,
+                            gradient_clip=opacity_gradient_clip,
+                            gradient_threshold=opacity_gradient_threshold,
+                            current_weight=opacity_gradient_current_weight,
+                            replay_weight=opacity_gradient_replay_weight,
+                            active_mask=old_gradient_active_mask,
+                        )
+                    if mean_gradient_enabled:
+                        if old_gradients.mean_camera is None:
+                            raise RuntimeError(
+                                "Mean-gradient rendering did not return mean "
+                                "gradients."
+                            )
+                        old_mean_gradient_evidence = build_mean_gradient_evidence(
+                            select_current_and_recent_replay_gradients(
+                                old_gradients.mean_camera,
+                                mean_gradient_replay_views,
+                            ),
+                            gradient_scale=mean_gradient_scale,
+                            gradient_clip=mean_gradient_clip,
+                            gradient_threshold=mean_gradient_threshold,
+                            current_weight=old_mean_gradient_current_weight,
+                            replay_weight=old_mean_gradient_replay_weight,
+                            active_mask=old_gradient_active_mask,
+                        )
                 projected_evidence = build_projected_gaussian_evidence(
                     state=state,
                     current_feature=current_feature,
@@ -1166,6 +1550,8 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     chunk_size=int(
                         getattr(cfg, "gir_projected_chunk_size", 65536)
                     ),
+                    opacity_gradient_evidence=old_gradient_evidence,
+                    mean_gradient_evidence=old_mean_gradient_evidence,
                 )
                 log_cuda_memory(
                     "gir_projected_evidence",
@@ -1375,6 +1761,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                             raise RuntimeError(
                                 "Projected old-GS evidence/prediction is missing."
                             )
+                        projected_original_opacities = state.gaussians.opacities
                         state, projected_update_stats = (
                             state.update_projected_historical(
                                 projected_evidence,
@@ -1405,6 +1792,10 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                                 harmonics_scale=harmonics_scale,
                             )
                         )
+                        projected_alignment_context = (
+                            projected_evidence,
+                            projected_original_opacities,
+                        )
                         projected_candidate_ratios.append(
                             projected_update_stats["candidate_ratio"]
                         )
@@ -1425,6 +1816,14 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                                 "front_decay_probability_mean"
                             ]
                         )
+                        for key in (
+                            *OPACITY_GRADIENT_STAT_KEYS,
+                            *OLD_OPACITY_GRADIENT_EFFECTIVE_STAT_KEYS,
+                            *MEAN_GRADIENT_STAT_KEYS,
+                        ):
+                            projected_gradient_stats[key].append(
+                                projected_update_stats[key]
+                            )
                     else:
                         state = state.update_historical(
                             residual_gir,
@@ -1682,102 +2081,33 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                             / replay_normalizer
                         )
 
-                if new_residual_enabled:
-                    current_gaussians = apply_current_gaussian_residual(
-                        current_gaussians,
-                        prediction,
-                        pred_all_extrinsic[:, view_idx],
-                        current_depth,
-                    )
-                    new_residual_energy = (
-                        prediction.current_delta_mean_camera.square().sum(
-                            dim=1, keepdim=True
-                        )
-                        + prediction.current_delta_rotation.square().sum(
-                            dim=1, keepdim=True
-                        )
-                        + prediction.current_delta_log_scale.square().sum(
-                            dim=1, keepdim=True
-                        )
-                        + prediction.current_delta_opacity_logit.square()
-                        + prediction.current_delta_harmonics.square().mean(
-                            dim=1, keepdim=True
-                        )
-                    )
-                else:
-                    # Keep the disabled current branch connected to the graph
-                    # with zero weight, avoiding an unused DDP head while
-                    # guaranteeing that no new-GS residual is written back.
-                    new_residual_energy = (
-                        prediction.current_delta_mean_camera.square().sum()
-                        + prediction.current_delta_rotation.square().sum()
-                        + prediction.current_delta_log_scale.square().sum()
-                        + prediction.current_delta_opacity_logit.square().sum()
-                        + prediction.current_delta_harmonics.square().sum()
-                    ) * 0.0
-                new_residual_magnitudes.append(new_residual_energy.mean().sqrt())
-                new_residual_gates.append(
-                    prediction.current_residual_gate.sigmoid().mean()
-                )
-            else:
-                new_residual_energy = prediction.add_logit.new_zeros(())
+            new_residual_energy = prediction.add_logit.new_zeros(())
 
             coverage = gir.valid.to(prediction.add_logit.dtype)
             residual_coverage = residual_gir.valid.to(
                 prediction.add_logit.dtype
             )
             visible_ratios.append(coverage.mean())
-            point_append_mask = None
-            point_front_conflict_mask = None
-            if state is not None and append_mode == "point_map":
+            if has_history and append_mode == "point_map":
+                if point_front_conflict_mask is None:
+                    raise RuntimeError(
+                        "Point-map front-conflict mask is missing."
+                    )
                 (
-                    point_append_mask,
-                    point_coverage,
+                    point_front_decay_mask,
+                    point_front_gradient_decay_gate_ratio,
+                ) = gate_front_conflict_decay(
                     point_front_conflict_mask,
-                    next_front_conflict_count,
-                    point_depth_scale,
-                ) = build_point_map_append_mask(
-                    state=state,
-                    current_depth=current_depth,
-                    camera_to_world=pred_all_extrinsic[:, view_idx],
-                    intrinsics=intrinsics[:, view_idx],
-                    current_rgb=current_rgb,
-                    old_rgb=gir.rgb,
-                    old_depth=gir.raster_depth,
-                    old_alpha=gir.raster_alpha,
-                    current_depth_confidence=current_depth_confidence,
-                    depth_relative_tolerance=point_append_tolerance,
-                    rgb_bad_threshold=point_append_rgb_threshold,
-                    old_alpha_threshold=point_append_old_alpha_threshold,
-                    min_depth_confidence=point_append_min_depth_confidence,
-                    dilation_radius=point_append_dilation,
-                    chunk_size=point_append_chunk_size,
-                    depth_check_enabled=point_append_depth_check,
-                    hybrid_enabled=point_append_hybrid,
-                    append_current_in_front_enabled=(
-                        point_append_current_in_front
-                    ),
-                    append_history_in_front_enabled=(
-                        point_append_history_in_front
-                    ),
-                    front_conflict_confirm_views=(
-                        point_append_front_confirm_views
-                    ),
-                    max_append_ratio=point_append_max_ratio,
+                    old_gradient_evidence,
+                    enabled=opacity_gradient_front_decay_gate_enabled,
+                    threshold=opacity_gradient_front_decay_threshold,
                 )
-                state = state.with_front_conflict_count(
-                    next_front_conflict_count
-                )
-                point_coverage_ratios.append(point_coverage.float().mean())
-                point_append_ratios.append(point_append_mask.float().mean())
-                point_depth_scales.append(point_depth_scale.mean())
-                valid_old = (state.stable_ids >= 0).float().sum().clamp_min(1.0)
-                point_front_conflict_ratios.append(
-                    point_front_conflict_mask.float().sum() / valid_old
+                point_front_gradient_decay_gate_ratios.append(
+                    point_front_gradient_decay_gate_ratio
                 )
                 opacity_before_decay = state.gaussians.opacities
                 state = state.decay_masked_opacity(
-                    point_front_conflict_mask,
+                    point_front_decay_mask,
                     point_append_front_decay,
                 )
                 point_front_decay_mass_ratios.append(
@@ -1787,6 +2117,23 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     )
                     / opacity_before_decay.detach().float().sum().clamp_min(1e-8)
                 )
+
+            if projected_alignment_context is not None and state is not None:
+                alignment_evidence, original_opacities = (
+                    projected_alignment_context
+                )
+                if original_opacities.shape == state.gaussians.opacities.shape:
+                    final_alignment_stats = (
+                        compute_old_opacity_gradient_effective_stats(
+                            alignment_evidence,
+                            original_opacities,
+                            state.gaussians.opacities,
+                        )
+                    )
+                    for key in OLD_OPACITY_GRADIENT_EFFECTIVE_STAT_KEYS:
+                        projected_gradient_stats[key][-1] = final_alignment_stats[
+                            key
+                        ]
 
             if state is None or append_mode == "all":
                 # The first frame initializes the point map; all mode is the
@@ -1827,6 +2174,292 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     align_corners=False,
                 )
             add_gates.append(add_gate_low.mean())
+
+            if (
+                return_debug_intermediates
+                and has_history
+                and (view_idx - 1) % debug_view_stride == 0
+            ):
+                point_map = (
+                    state.point_map
+                    if state.point_map is not None
+                    else state.gaussians.means
+                )
+                front_conflict_projection = (
+                    self._project_selected_points_for_debug(
+                        point_map,
+                        point_front_conflict_mask,
+                        pred_all_extrinsic[:, view_idx],
+                        intrinsics[:, view_idx],
+                        (h, w),
+                    )
+                    if point_front_conflict_mask is not None
+                    else None
+                )
+                front_decay_projection = (
+                    self._project_selected_points_for_debug(
+                        point_map,
+                        point_front_decay_mask,
+                        pred_all_extrinsic[:, view_idx],
+                        intrinsics[:, view_idx],
+                        (h, w),
+                    )
+                    if point_front_decay_mask is not None
+                    else None
+                )
+                active_old = (state.stable_ids >= 0)
+                active_old_count = active_old.float().sum().clamp_min(1.0)
+
+                def snapshot(value: torch.Tensor | None):
+                    return (
+                        None
+                        if value is None
+                        else value.detach().float().cpu()
+                    )
+
+                debug_intermediates.append(
+                    {
+                        "view_index": view_idx,
+                        "current_rgb": snapshot(current_rgb),
+                        "old_rgb": snapshot(gir.rgb),
+                        "rgb_error": snapshot(rgb_error),
+                        "current_depth": snapshot(current_depth),
+                        "old_depth": snapshot(gir.raster_depth),
+                        "old_alpha": snapshot(gir.raster_alpha),
+                        "old_coverage": snapshot(old_coverage),
+                        "depth_consistent": snapshot(depth_consistent),
+                        "old_in_front": snapshot(old_in_front),
+                        "residual_mask": snapshot(residual_mask),
+                        "point_coverage": snapshot(point_coverage),
+                        "append_mask": snapshot(point_append_mask),
+                        "add_gate": snapshot(add_gate),
+                        "front_conflict_projection": snapshot(
+                            front_conflict_projection
+                        ),
+                        "front_decay_projection": snapshot(
+                            front_decay_projection
+                        ),
+                        "summary": {
+                            "old_gaussians": int(state.num_gaussians),
+                            "old_active_gaussians": int(active_old.sum().item()),
+                            "coverage_ratio": float(
+                                point_coverage.float().mean().item()
+                            )
+                            if point_coverage is not None
+                            else None,
+                            "append_ratio": float(
+                                point_append_mask.float().mean().item()
+                            )
+                            if point_append_mask is not None
+                            else None,
+                            "appended_gaussians": int(
+                                point_append_mask.sum().item()
+                            )
+                            if point_append_mask is not None
+                            else None,
+                            "old_coverage_ratio": float(
+                                old_coverage.float().mean().item()
+                            )
+                            if old_coverage is not None
+                            else None,
+                            "depth_consistent_ratio": float(
+                                depth_consistent.float().mean().item()
+                            )
+                            if depth_consistent is not None
+                            else None,
+                            "old_in_front_ratio": float(
+                                old_in_front.float().mean().item()
+                            )
+                            if old_in_front is not None
+                            else None,
+                            "residual_candidate_ratio": float(
+                                residual_mask.float().mean().item()
+                            )
+                            if residual_mask is not None
+                            else None,
+                            "rgb_error_mean": float(rgb_error.mean().item())
+                            if rgb_error is not None
+                            else None,
+                            "old_alpha_mean": float(
+                                gir.raster_alpha.float().mean().item()
+                            ),
+                            "add_gate_mean": float(add_gate.mean().item()),
+                            "front_conflict_count": int(
+                                point_front_conflict_mask.sum().item()
+                            )
+                            if point_front_conflict_mask is not None
+                            else None,
+                            "front_conflict_ratio": float(
+                                point_front_conflict_mask.float().sum().item()
+                                / active_old_count.item()
+                            )
+                            if point_front_conflict_mask is not None
+                            else None,
+                            "front_decay_count": int(
+                                point_front_decay_mask.sum().item()
+                            )
+                            if point_front_decay_mask is not None
+                            else None,
+                            "front_decay_ratio": float(
+                                point_front_decay_mask.float().sum().item()
+                                / active_old_count.item()
+                            )
+                            if point_front_decay_mask is not None
+                            else None,
+                            "point_depth_scale": float(
+                                point_depth_scale.mean().item()
+                            )
+                            if point_depth_scale is not None
+                            else None,
+                        },
+                    }
+                )
+            if has_history and new_residual_enabled:
+                if self.gir_projected_update_head is None:
+                    raise RuntimeError(
+                        "New-GS residuals require gir_projected_update_head."
+                    )
+                new_candidate_mask = (
+                    point_append_mask
+                    if append_mode == "point_map"
+                    else torch.ones(
+                        (b, 1, h, w),
+                        device=current_depth.device,
+                        dtype=torch.bool,
+                    )
+                )
+                new_gradient_evidence = None
+                new_mean_gradient_evidence = None
+                if new_opacity_gradient_enabled or new_mean_gradient_enabled:
+                    provisional, provisional_active = build_provisional_gaussians(
+                        state.gaussians,
+                        current_gaussians,
+                        torch.ones_like(current_gaussians.opacities),
+                        new_candidate_mask,
+                    )
+                    opacity_uses_all_replay = (
+                        new_opacity_gradient_enabled
+                        and opacity_gradient_replay_views == -1
+                    )
+                    mean_uses_all_replay = (
+                        new_mean_gradient_enabled
+                        and new_mean_gradient_replay_views == -1
+                    )
+                    gradient_replay_limit = (
+                        -1
+                        if opacity_uses_all_replay or mean_uses_all_replay
+                        else max(
+                            opacity_gradient_replay_views
+                            if new_opacity_gradient_enabled
+                            else 0,
+                            new_mean_gradient_replay_views
+                            if new_mean_gradient_enabled
+                            else 0,
+                        )
+                    )
+                    gradient_replay_indices = _causal_replay_indices(
+                        view_idx,
+                        gradient_replay_limit,
+                        "combined GIR gradient replay views",
+                    )
+                    gradient_view_indices = [view_idx, *gradient_replay_indices]
+                    provisional_gradients = self.decoder.render_parameter_gradients(
+                        provisional,
+                        pred_all_extrinsic[:, gradient_view_indices],
+                        intrinsics[:, gradient_view_indices],
+                        context_image[:, gradient_view_indices],
+                        (low_h, low_w),
+                        active_mask=provisional_active,
+                        mean_camera_enabled=new_mean_gradient_enabled,
+                    )
+                    new_count = current_gaussians.opacities.shape[1]
+                    new_active_mask = new_candidate_mask.reshape(b, new_count)
+                    if new_opacity_gradient_enabled:
+                        new_gradient_evidence = build_opacity_gradient_evidence(
+                            select_current_and_recent_replay_gradients(
+                                provisional_gradients.opacity_logit[
+                                    :, :, -new_count:
+                                ],
+                                opacity_gradient_replay_views,
+                            ),
+                            gradient_scale=opacity_gradient_scale,
+                            gradient_clip=opacity_gradient_clip,
+                            gradient_threshold=opacity_gradient_threshold,
+                            current_weight=opacity_gradient_current_weight,
+                            replay_weight=opacity_gradient_replay_weight,
+                            active_mask=new_active_mask,
+                        )
+                    if new_mean_gradient_enabled:
+                        if provisional_gradients.mean_camera is None:
+                            raise RuntimeError(
+                                "New-GS mean-gradient rendering returned no "
+                                "mean gradients."
+                            )
+                        new_mean_gradient_evidence = build_mean_gradient_evidence(
+                            select_current_and_recent_replay_gradients(
+                                provisional_gradients.mean_camera[
+                                    :, :, -new_count:
+                                ],
+                                new_mean_gradient_replay_views,
+                            ),
+                            gradient_scale=mean_gradient_scale,
+                            gradient_clip=mean_gradient_clip,
+                            gradient_threshold=mean_gradient_threshold,
+                            current_weight=new_mean_gradient_current_weight,
+                            replay_weight=new_mean_gradient_replay_weight,
+                            active_mask=new_active_mask,
+                        )
+                new_evidence = build_projected_new_gaussian_evidence(
+                    current=current_gaussians,
+                    append_mask=new_candidate_mask,
+                    current_feature=current_feature,
+                    current_rgb=current_rgb,
+                    current_depth=current_depth,
+                    current_depth_confidence=current_depth_confidence,
+                    old_rgb=gir.rgb,
+                    old_depth=gir.raster_depth,
+                    old_alpha=gir.raster_alpha,
+                    camera_to_world=pred_all_extrinsic[:, view_idx],
+                    intrinsics=intrinsics[:, view_idx],
+                    alpha_threshold=float(
+                        getattr(cfg, "gir_point_append_old_alpha_threshold", 0.10)
+                    ),
+                    depth_relative_tolerance=point_append_tolerance,
+                    covariance_extent_sigma=float(
+                        getattr(cfg, "gir_projected_covariance_sigma", 3.0)
+                    ),
+                    opacity_gradient_evidence=new_gradient_evidence,
+                    mean_gradient_evidence=new_mean_gradient_evidence,
+                )
+                new_prediction = self.gir_projected_update_head.forward_new(
+                    new_evidence
+                )
+                current_gaussians, new_update_stats = (
+                    apply_projected_new_gaussian_residual(
+                        current_gaussians,
+                        new_evidence,
+                        new_prediction,
+                        pred_all_extrinsic[:, view_idx],
+                        opacity_logit_scale=float(
+                            getattr(
+                                cfg,
+                                "gir_projected_opacity_logit_scale",
+                                1.0,
+                            )
+                        ),
+                        mean_update_mode=mean_update_mode,
+                        raw_scale_residual=raw_scale_residual,
+                        raw_opacity_residual=raw_opacity_residual,
+                        raw_rotation_residual=raw_rotation_residual,
+                        raw_harmonics_residual=raw_harmonics_residual,
+                        mean_relative_scale=mean_relative_scale,
+                        rotation_scale=rotation_scale,
+                        harmonics_scale=harmonics_scale,
+                    )
+                )
+                new_residual_energy = new_update_stats["regularization"]
+                for key in NEW_RESIDUAL_STAT_KEYS:
+                    new_residual_stats[key].append(new_update_stats[key])
             if has_history:
                 learned_add_gate = F.interpolate(
                     learned_add_gate_low,
@@ -1915,7 +2548,7 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     else residual_energy.sum() * 0.0
                 )
             regularization_losses.append(
-                old_residual_regularization + new_residual_energy.mean()
+                old_residual_regularization + new_residual_energy
             )
 
             if debug_view:
@@ -2085,6 +2718,10 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
 
         if encoder_output.infos is not None:
             encoder_output.infos.pop("gir", None)
+            if return_debug_intermediates:
+                encoder_output.infos[
+                    "gir_debug_intermediates"
+                ] = debug_intermediates
             encoder_output.infos["gir_history_views"] = torch.tensor(
                 max(source_views - 1, 0), device=features.device
             )
@@ -2106,6 +2743,37 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             )
             encoder_output.infos["gir_new_residual_enabled"] = torch.tensor(
                 float(new_residual_enabled), device=features.device
+            )
+            encoder_output.infos["gir_new_mean_gradient_enabled"] = torch.tensor(
+                float(new_mean_gradient_enabled), device=features.device
+            )
+            encoder_output.infos["gir_mean_gradient_replay_views"] = torch.tensor(
+                float(mean_gradient_replay_views), device=features.device
+            )
+            encoder_output.infos[
+                "gir_new_mean_gradient_replay_views"
+            ] = torch.tensor(
+                float(new_mean_gradient_replay_views), device=features.device
+            )
+            encoder_output.infos[
+                "gir_old_mean_gradient_current_weight"
+            ] = torch.tensor(
+                old_mean_gradient_current_weight, device=features.device
+            )
+            encoder_output.infos[
+                "gir_old_mean_gradient_replay_weight"
+            ] = torch.tensor(
+                old_mean_gradient_replay_weight, device=features.device
+            )
+            encoder_output.infos[
+                "gir_new_mean_gradient_current_weight"
+            ] = torch.tensor(
+                new_mean_gradient_current_weight, device=features.device
+            )
+            encoder_output.infos[
+                "gir_new_mean_gradient_replay_weight"
+            ] = torch.tensor(
+                new_mean_gradient_replay_weight, device=features.device
             )
             encoder_output.infos["gir_historical_detach_mode_code"] = torch.tensor(
                 {"all": 0.0, "means": 1.0, "none": 2.0}[historical_detach_mode],
@@ -2186,6 +2854,11 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                     "gir_point_front_conflict_ratio"
                 ] = torch.stack(point_front_conflict_ratios).mean()
                 encoder_output.infos[
+                    "gir_point_front_gradient_decay_gate_ratio"
+                ] = torch.stack(
+                    point_front_gradient_decay_gate_ratios
+                ).mean()
+                encoder_output.infos[
                     "gir_point_front_decay_mass_ratio"
                 ] = torch.stack(point_front_decay_mass_ratios).mean()
                 encoder_output.infos["gir_point_depth_scale"] = torch.stack(
@@ -2249,6 +2922,10 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 encoder_output.infos[
                     "gir_projected_front_decay_probability"
                 ] = torch.stack(projected_front_decay_probabilities).mean()
+                for key, values in projected_gradient_stats.items():
+                    encoder_output.infos[
+                        f"gir_projected_{key}"
+                    ] = torch.stack(values).mean()
             if raster_alpha_means:
                 encoder_output.infos["gir_raster_alpha"] = torch.stack(
                     raster_alpha_means
@@ -2257,13 +2934,19 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 encoder_output.infos["gir_dominant_weight"] = torch.stack(
                     dominant_weight_means
                 ).mean()
-            if new_residual_magnitudes:
-                encoder_output.infos["gir_new_residual_magnitude"] = torch.stack(
-                    new_residual_magnitudes
-                ).mean()
-                encoder_output.infos["gir_new_residual_gate"] = torch.stack(
-                    new_residual_gates
-                ).mean()
+            if new_residual_stats["candidate_ratio"]:
+                for key, values in new_residual_stats.items():
+                    encoder_output.infos[
+                        f"gir_new_residual_{key}"
+                    ] = torch.stack(values).mean()
+                # Preserve the original dashboard names while exposing the
+                # unambiguous per-channel diagnostics above.
+                encoder_output.infos["gir_new_residual_magnitude"] = (
+                    encoder_output.infos["gir_new_residual_mean_shift_mean"]
+                )
+                encoder_output.infos["gir_new_residual_gate"] = (
+                    encoder_output.infos["gir_new_residual_gate_mean"]
+                )
             if history_adapt_losses:
                 encoder_output.infos["gir_history_adapt_loss"] = torch.stack(
                     history_adapt_losses
@@ -2431,6 +3114,8 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         test_add_gate_prune_threshold: float = 0.0,
         test_top1_confidence_mode: str = "inherit",
         test_top1_confidence_floor: float = 0.25,
+        return_debug_intermediates: bool = False,
+        debug_view_stride: int = 1,
     ) -> Gaussians:
         if self.gir_update_head is not None:
             return self._update_streaming_gaussians(
@@ -2445,6 +3130,8 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 test_add_gate_prune_threshold,
                 test_top1_confidence_mode,
                 test_top1_confidence_floor,
+                return_debug_intermediates,
+                debug_view_stride,
             )
         return encoder_output.gaussians
 

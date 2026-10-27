@@ -29,9 +29,22 @@ from src.model.encoder.vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from src.model.model import get_model
 from src.model.ply_export import export_ply
 from src.model.streaming_gir import (
+    apply_projected_new_gaussian_residual,
+    build_mean_gradient_evidence,
+    build_opacity_gradient_evidence,
     build_point_map_append_mask,
     build_projected_gaussian_evidence,
+    build_projected_new_gaussian_evidence,
+    build_provisional_gaussians,
+    compute_old_opacity_gradient_effective_stats,
     DominantGIR,
+    gate_front_conflict_decay,
+    MEAN_GRADIENT_STAT_KEYS,
+    MeanGradientEvidence,
+    OLD_OPACITY_GRADIENT_EFFECTIVE_STAT_KEYS,
+    OPACITY_GRADIENT_STAT_KEYS,
+    OpacityGradientEvidence,
+    select_current_and_recent_replay_gradients,
     StreamingGaussianState,
 )
 from src.model.types import Gaussians
@@ -71,6 +84,33 @@ MAP_UPDATE_LOG_KEYS = (
     "map_harmonics_mean",
     "map_harmonics_max",
 )
+NEW_RESIDUAL_LOG_KEYS = (
+    "candidate_ratio",
+    "gate_mean",
+    "raw_mean",
+    "mean_shift_mean",
+    "raw_rotation",
+    "rotation_shift_mean",
+    "raw_log_scale",
+    "scale_relative_shift_mean",
+    "raw_opacity_logit",
+    "opacity_shift_mean",
+    "raw_harmonics",
+    "harmonics_shift_mean",
+    "regularization",
+    *OPACITY_GRADIENT_STAT_KEYS,
+    *MEAN_GRADIENT_STAT_KEYS,
+)
+OLD_OPACITY_GRADIENT_LOG_KEYS = tuple(
+    f"old_{key}"
+    for key in (
+        *OPACITY_GRADIENT_STAT_KEYS,
+        *OLD_OPACITY_GRADIENT_EFFECTIVE_STAT_KEYS,
+    )
+)
+OLD_MEAN_GRADIENT_LOG_KEYS = tuple(
+    f"old_{key}" for key in MEAN_GRADIENT_STAT_KEYS
+)
 
 
 TRAIN_CSV_FIELDS = [
@@ -104,6 +144,7 @@ TRAIN_CSV_FIELDS = [
     "opacity_decay_candidate_count",
     "opacity_decay_mass_ratio",
     "point_front_conflict_ratio",
+    "point_front_gradient_decay_gate_ratio",
     "point_front_decay_mass_ratio",
     "point_append_depth_scale",
     *[
@@ -112,6 +153,9 @@ TRAIN_CSV_FIELDS = [
         for key in RANK_UPDATE_LOG_KEYS
     ],
     *MAP_UPDATE_LOG_KEYS,
+    *OLD_OPACITY_GRADIENT_LOG_KEYS,
+    *OLD_MEAN_GRADIENT_LOG_KEYS,
+    *[f"new_residual_{key}" for key in NEW_RESIDUAL_LOG_KEYS],
 ]
 
 # Evaluation-only diagnostics for the frozen DAV3 teacher against Replica GT.
@@ -657,6 +701,7 @@ def _load_checkpoint(model: torch.nn.Module, checkpoint: str | None) -> dict[str
 
     model_state = model.state_dict()
     compatible = {}
+    optimizer_compatible = True
     for original_key, value in model_payload.items():
         if not torch.is_tensor(value):
             continue
@@ -666,9 +711,15 @@ def _load_checkpoint(model: torch.nn.Module, checkpoint: str | None) -> dict[str
                 stripped = stripped[len(prefix) :]
         candidates = (stripped, _rename_wm_key(stripped))
         for candidate in candidates:
-            if candidate in model_state and model_state[candidate].shape == value.shape:
+            if candidate not in model_state:
+                continue
+            if model_state[candidate].shape == value.shape:
                 compatible[candidate] = value
                 break
+            elif candidate.startswith(
+                "gir_projected_update_head.new_output."
+            ):
+                optimizer_compatible = False
     model.load_state_dict(compatible, strict=False)
     copied_rank_heads = 0
     additional_heads = getattr(
@@ -702,6 +753,12 @@ def _load_checkpoint(model: torch.nn.Module, checkpoint: str | None) -> dict[str
         )
     if resume_state is not None:
         resume_state["_checkpoint_path"] = str(path)
+        resume_state["_optimizer_compatible"] = optimizer_compatible
+        if not optimizer_compatible:
+            print(
+                "Checkpoint uses the previous new-GS output shape; compatible "
+                "weights were loaded, but optimizer state will be restarted."
+            )
     return resume_state
 
 
@@ -714,6 +771,11 @@ def _configure_trainable_modules(
     train_depth_head: bool,
     train_camera_head: bool,
     opacity_decay_enabled: bool,
+    new_residual_enabled: bool,
+    old_opacity_gradient_enabled: bool,
+    new_opacity_gradient_enabled: bool,
+    mean_gradient_enabled: bool,
+    new_mean_gradient_enabled: bool,
 ) -> list[dict[str, Any]]:
     model.requires_grad_(False)
     model.encoder.gaussian_param_head.requires_grad_(train_gaussian_param_head)
@@ -728,7 +790,10 @@ def _configure_trainable_modules(
             "residual_mode must be pixel_topk or projected_shared; "
             f"got {residual_mode!r}."
         )
-    projected_trainable = residual_enabled and residual_mode == "projected_shared"
+    projected_old_trainable = (
+        residual_enabled and residual_mode == "projected_shared"
+    )
+    projected_trainable = projected_old_trainable or new_residual_enabled
     pixel_residual_trainable = residual_enabled and residual_mode == "pixel_topk"
     gir_trainable = pixel_residual_trainable or opacity_decay_enabled
     model.gir_update_head.encoder.requires_grad_(gir_trainable)
@@ -744,10 +809,23 @@ def _configure_trainable_modules(
     projected_head = getattr(model, "gir_projected_update_head", None)
     if projected_trainable and projected_head is None:
         raise RuntimeError(
-            "projected_shared residual mode requires gir_projected_update_head."
+            "Projected old/new residuals require gir_projected_update_head."
         )
     if projected_head is not None:
-        projected_head.requires_grad_(projected_trainable)
+        projected_head.requires_grad_(False)
+        projected_head.decoder.requires_grad_(projected_trainable)
+        projected_head.opacity_gradient_adapter.requires_grad_(
+            (projected_old_trainable and old_opacity_gradient_enabled)
+            or (new_residual_enabled and new_opacity_gradient_enabled)
+        )
+        projected_head.mean_gradient_adapter.requires_grad_(
+            projected_old_trainable and mean_gradient_enabled
+        )
+        projected_head.new_mean_gradient_adapter.requires_grad_(
+            new_residual_enabled and new_mean_gradient_enabled
+        )
+        projected_head.output.requires_grad_(projected_old_trainable)
+        projected_head.new_output.requires_grad_(new_residual_enabled)
 
     groups = []
     if train_gaussian_param_head:
@@ -786,8 +864,12 @@ def _configure_trainable_modules(
     if projected_trainable:
         groups.append(
             {
-                "name": "projected_old_residual_head",
-                "params": list(projected_head.parameters()),
+                "name": "projected_residual_head",
+                "params": [
+                    parameter
+                    for parameter in projected_head.parameters()
+                    if parameter.requires_grad
+                ],
             }
         )
     if train_camera_head:
@@ -904,6 +986,116 @@ def _render(model, gaussians, c2w, intrinsic, image_shape):
     near = torch.full((batch, views), 1e-4, device=c2w.device)
     far = torch.full((batch, views), 100.0, device=c2w.device)
     return model.decoder(gaussians, c2w, intrinsic, near, far, image_shape)
+
+
+def _build_render_gradient_evidence(
+    model,
+    cfg: DictConfig,
+    gaussians: Gaussians,
+    images: torch.Tensor,
+    c2w: torch.Tensor,
+    intrinsic: torch.Tensor,
+    image_shape: tuple[int, int],
+    view_idx: int,
+    active_mask: torch.Tensor,
+    *,
+    opacity_enabled: bool | None = None,
+    mean_enabled: bool | None = None,
+    mean_replay_views: int | None = None,
+    mean_current_weight: float | None = None,
+    mean_replay_weight: float | None = None,
+) -> tuple[OpacityGradientEvidence | None, MeanGradientEvidence | None]:
+    if opacity_enabled is None:
+        opacity_enabled = bool(cfg.get("old_opacity_gradient_enabled", False))
+    if mean_enabled is None:
+        mean_enabled = bool(cfg.get("mean_gradient_enabled", False))
+    opacity_replay_views = int(cfg.get("opacity_gradient_replay_views", 6))
+    mean_replay_views = int(
+        cfg.get("mean_gradient_replay_views", opacity_replay_views)
+        if mean_replay_views is None
+        else mean_replay_views
+    )
+    for name, value in (
+        ("toy.opacity_gradient_replay_views", opacity_replay_views),
+        ("toy.mean_gradient_replay_views", mean_replay_views),
+    ):
+        if value < -1:
+            raise ValueError(
+                f"{name} must be -1, 0, or positive; got {value}."
+            )
+    requested_replay_views = []
+    if opacity_enabled:
+        requested_replay_views.append(opacity_replay_views)
+    if mean_enabled:
+        requested_replay_views.append(mean_replay_views)
+    max_replay_views = (
+        -1
+        if -1 in requested_replay_views
+        else max(requested_replay_views, default=0)
+    )
+    replay_start = (
+        0
+        if max_replay_views == -1
+        else max(0, view_idx - max(0, max_replay_views))
+    )
+    replay_indices = (
+        [] if max_replay_views == 0 else list(range(replay_start, view_idx))
+    )
+    view_indices = [view_idx, *replay_indices]
+    gradients = model.decoder.render_parameter_gradients(
+        gaussians,
+        c2w[:, view_indices],
+        intrinsic[:, view_indices],
+        images[:, view_indices],
+        image_shape,
+        active_mask=active_mask,
+        mean_camera_enabled=mean_enabled,
+    )
+    opacity_evidence = (
+        build_opacity_gradient_evidence(
+            select_current_and_recent_replay_gradients(
+                gradients.opacity_logit, opacity_replay_views
+            ),
+            gradient_scale=float(cfg.get("opacity_gradient_scale", 1000.0)),
+            gradient_clip=float(cfg.get("opacity_gradient_clip", 20.0)),
+            gradient_threshold=float(
+                cfg.get("opacity_gradient_threshold", 1e-3)
+            ),
+            current_weight=float(
+                cfg.get("opacity_gradient_current_weight", 1.0)
+            ),
+            replay_weight=float(
+                cfg.get("opacity_gradient_replay_weight", 0.5)
+            ),
+            active_mask=active_mask,
+        )
+        if opacity_enabled
+        else None
+    )
+    mean_evidence = None
+    if mean_enabled:
+        if gradients.mean_camera is None:
+            raise RuntimeError("Mean-gradient rendering did not return mean gradients.")
+        mean_evidence = build_mean_gradient_evidence(
+            select_current_and_recent_replay_gradients(
+                gradients.mean_camera, mean_replay_views
+            ),
+            gradient_scale=float(cfg.get("mean_gradient_scale", 1.0)),
+            gradient_clip=float(cfg.get("mean_gradient_clip", 20.0)),
+            gradient_threshold=float(cfg.get("mean_gradient_threshold", 1e-6)),
+            current_weight=(
+                float(cfg.get("old_mean_gradient_current_weight", 1.0))
+                if mean_current_weight is None
+                else float(mean_current_weight)
+            ),
+            replay_weight=(
+                float(cfg.get("old_mean_gradient_replay_weight", 0.5))
+                if mean_replay_weight is None
+                else float(mean_replay_weight)
+            ),
+            active_mask=active_mask,
+        )
+    return opacity_evidence, mean_evidence
 
 
 def _bound_tanh_input(value: torch.Tensor, scale: float) -> torch.Tensor:
@@ -1111,6 +1303,8 @@ def _predict_projected_updated_state(
     current_intrinsic: torch.Tensor,
     image_shape: tuple[int, int],
     global_step: int,
+    opacity_gradient_evidence: OpacityGradientEvidence | None = None,
+    mean_gradient_evidence: MeanGradientEvidence | None = None,
 ):
     batch, height, width = current_rgb.shape[0], *image_shape
     raster = model.decoder.render_projected_gs_evidence(
@@ -1264,6 +1458,8 @@ def _predict_projected_updated_state(
             cfg.get("projected_covariance_sigma", 3.0)
         ),
         chunk_size=int(cfg.get("projected_chunk_size", 65536)),
+        opacity_gradient_evidence=opacity_gradient_evidence,
+        mean_gradient_evidence=mean_gradient_evidence,
     )
     with torch.autocast("cuda", enabled=False):
         prediction = model.gir_projected_update_head(evidence)
@@ -1315,16 +1511,41 @@ def _predict_projected_updated_state(
             "opacity_shift_mean": current_feature.new_zeros(()),
             "harmonics_shift_mean": current_feature.new_zeros(()),
             "front_decay_probability_mean": current_feature.new_zeros(()),
+            **{
+                key: current_feature.new_zeros(())
+                for key in (
+                    *OPACITY_GRADIENT_STAT_KEYS,
+                    *OLD_OPACITY_GRADIENT_EFFECTIVE_STAT_KEYS,
+                    *MEAN_GRADIENT_STAT_KEYS,
+                )
+            },
         }
+    fixed_decay_mask, fixed_decay_gate_ratio = gate_front_conflict_decay(
+        front_conflict_gaussians,
+        opacity_gradient_evidence,
+        enabled=bool(
+            cfg.get("opacity_gradient_front_decay_gate_enabled", False)
+        ),
+        threshold=float(
+            cfg.get("opacity_gradient_front_decay_threshold", 0.0)
+        ),
+    )
     opacity_before_fixed_decay = updated.gaussians.opacities
     updated = updated.decay_masked_opacity(
-        front_conflict_gaussians,
+        fixed_decay_mask,
         float(cfg.get("point_append_front_conflict_opacity_decay", 0.30)),
     )
     fixed_decay_mass_ratio = (
         opacity_before_fixed_decay.detach().float().sum()
         - updated.gaussians.opacities.detach().float().sum()
     ) / opacity_before_fixed_decay.detach().float().sum().clamp_min(1e-8)
+    projected_stats.update(
+        compute_old_opacity_gradient_effective_stats(
+            evidence,
+            before.gaussians.opacities,
+            updated.gaussians.opacities,
+        )
+    )
 
     update_stats = _empty_residual_update_stats(
         current_feature, max(1, int(cfg.get("residual_topk", 1)))
@@ -1426,10 +1647,28 @@ def _predict_projected_updated_state(
         "opacity_decay_candidate_count": evidence.old_in_front.float().sum(),
         "opacity_decay_mass_ratio": projected_stats["opacity_shift_mean"],
         "point_front_conflict_ratio": front_conflict_gaussians.float().mean(),
+        "point_front_gradient_decay_gate_ratio": fixed_decay_gate_ratio,
         "point_front_decay_mass_ratio": fixed_decay_mass_ratio,
         "point_append_depth_scale": point_depth_scale.mean(),
+        **{
+            f"old_{key}": projected_stats[key]
+            for key in (
+                *OPACITY_GRADIENT_STAT_KEYS,
+                *OLD_OPACITY_GRADIENT_EFFECTIVE_STAT_KEYS,
+            )
+        },
+        **{
+            f"old_{key}": projected_stats[key]
+            for key in MEAN_GRADIENT_STAT_KEYS
+        },
+        **{
+            f"new_residual_{key}": current_feature.new_zeros(())
+            for key in NEW_RESIDUAL_LOG_KEYS
+        },
         **update_stats,
     }
+    if bool(cfg.get("new_residual_enabled", False)):
+        stats["_new_history_evidence"] = (old_rgb, old_depth, old_alpha)
     return updated, stats
 
 
@@ -1444,6 +1683,8 @@ def _predict_updated_state(
     current_intrinsic: torch.Tensor,
     image_shape: tuple[int, int],
     global_step: int,
+    opacity_gradient_evidence: OpacityGradientEvidence | None = None,
+    mean_gradient_evidence: MeanGradientEvidence | None = None,
 ):
     residual_mode = str(cfg.get("residual_mode", "pixel_topk")).lower()
     if residual_mode == "projected_shared":
@@ -1458,6 +1699,8 @@ def _predict_updated_state(
             current_intrinsic,
             image_shape,
             global_step,
+            opacity_gradient_evidence,
+            mean_gradient_evidence,
         )
     if residual_mode != "pixel_topk":
         raise ValueError(
@@ -1606,9 +1849,19 @@ def _predict_updated_state(
         bad_mask = (depth_consistent & rgb_bad) | old_in_front
 
     if not bool(cfg.residual_enabled) and not opacity_decay_enabled:
+        fixed_decay_mask, fixed_decay_gate_ratio = gate_front_conflict_decay(
+            front_conflict_gaussians,
+            opacity_gradient_evidence,
+            enabled=bool(
+                cfg.get("opacity_gradient_front_decay_gate_enabled", False)
+            ),
+            threshold=float(
+                cfg.get("opacity_gradient_front_decay_threshold", 0.0)
+            ),
+        )
         opacity_before_fixed_decay = state.gaussians.opacities
         fixed_decay_state = state.decay_masked_opacity(
-            front_conflict_gaussians,
+            fixed_decay_mask,
             float(
                 cfg.get("point_append_front_conflict_opacity_decay", 0.30)
             ),
@@ -1643,6 +1896,7 @@ def _predict_updated_state(
             "point_front_conflict_ratio": (
                 front_conflict_gaussians.float().mean()
             ),
+            "point_front_gradient_decay_gate_ratio": fixed_decay_gate_ratio,
             "point_front_decay_mass_ratio": fixed_decay_mass_ratio,
             "point_append_depth_scale": point_depth_scale.mean(),
             **_empty_residual_update_stats(current_feature, residual_topk),
@@ -1788,9 +2042,19 @@ def _predict_updated_state(
             ),
         )
 
+    fixed_decay_mask, fixed_decay_gate_ratio = gate_front_conflict_decay(
+        front_conflict_gaussians,
+        opacity_gradient_evidence,
+        enabled=bool(
+            cfg.get("opacity_gradient_front_decay_gate_enabled", False)
+        ),
+        threshold=float(
+            cfg.get("opacity_gradient_front_decay_threshold", 0.0)
+        ),
+    )
     opacity_before_fixed_decay = updated.gaussians.opacities
     updated = updated.decay_masked_opacity(
-        front_conflict_gaussians,
+        fixed_decay_mask,
         float(cfg.get("point_append_front_conflict_opacity_decay", 0.30)),
     )
     fixed_decay_mass_ratio = (
@@ -1870,6 +2134,7 @@ def _predict_updated_state(
             "decay_opacity_mass_ratio"
         ],
         "point_front_conflict_ratio": front_conflict_gaussians.float().mean(),
+        "point_front_gradient_decay_gate_ratio": fixed_decay_gate_ratio,
         "point_front_decay_mass_ratio": fixed_decay_mass_ratio,
         "point_append_depth_scale": point_depth_scale.mean(),
         **update_stats,
@@ -2358,6 +2623,45 @@ def _forward_experiment(
             # Fix historical positions while preserving cross-view gradients
             # for SH, opacity, scale, and rotation.
             state = state.detach_means()
+        append_enabled = bool(cfg.append_new_gs_enabled)
+        current_gaussians = None
+        anchor_point_map = None
+        new_history_evidence = None
+        if append_enabled:
+            current_gaussians = _build_base_gaussians(
+                model,
+                features[:, view_idx],
+                images[:, view_idx],
+                depth[:, view_idx],
+                c2w[:, view_idx],
+                intrinsic_px[:, view_idx],
+            )
+            anchor_point_map = current_gaussians.means
+        old_gradient_evidence = None
+        old_mean_gradient_evidence = None
+        if (
+            (
+                bool(cfg.get("old_opacity_gradient_enabled", False))
+                or bool(cfg.get("mean_gradient_enabled", False))
+            )
+            and str(cfg.get("residual_mode", "pixel_topk")).lower()
+            == "projected_shared"
+        ):
+            (
+                old_gradient_evidence,
+                old_mean_gradient_evidence,
+            ) = _build_render_gradient_evidence(
+                model,
+                cfg,
+                state.gaussians,
+                images,
+                c2w,
+                intrinsic,
+                image_shape,
+                view_idx,
+                active_mask=(state.stable_ids >= 0)
+                & (state.gaussians.opacities.detach() > 0),
+            )
         state, stats = _predict_updated_state(
             model,
             cfg,
@@ -2369,23 +2673,211 @@ def _forward_experiment(
             intrinsic[:, view_idx],
             image_shape,
             global_step,
+            old_gradient_evidence,
+            old_mean_gradient_evidence,
         )
-        append_enabled = bool(cfg.append_new_gs_enabled)
+        for key in OLD_OPACITY_GRADIENT_LOG_KEYS:
+            stats.setdefault(key, features.new_zeros(()))
+        for key in OLD_MEAN_GRADIENT_LOG_KEYS:
+            stats.setdefault(key, features.new_zeros(()))
         if append_enabled:
             previous_gs_count = state.num_gaussians
-            current_gaussians = _build_base_gaussians(
-                model,
-                features[:, view_idx],
-                images[:, view_idx],
-                depth[:, view_idx],
-                c2w[:, view_idx],
-                intrinsic_px[:, view_idx],
-            )
+            if current_gaussians is None or anchor_point_map is None:
+                raise RuntimeError("Current DPT anchors were not constructed.")
+            if bool(cfg.get("new_residual_enabled", False)):
+                new_history_evidence = stats.pop(
+                    "_new_history_evidence", new_history_evidence
+                )
+                if new_history_evidence is None:
+                    raster = model.decoder.render_projected_gs_evidence(
+                        state.gaussians,
+                        c2w[:, view_idx],
+                        intrinsic[:, view_idx],
+                        image_shape,
+                    )
+                    old_rgb = torch.nan_to_num(
+                        raster.color.float(), nan=0.0, posinf=0.0, neginf=0.0
+                    ).clamp(0.0, 1.0)
+                    old_alpha = torch.nan_to_num(
+                        raster.alpha.float(), nan=0.0, posinf=0.0, neginf=0.0
+                    ).clamp(0.0, 1.0)
+                    old_depth = torch.nan_to_num(
+                        raster.expected_depth.float(),
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                    )
+                    old_depth = torch.where(
+                        old_alpha > 1e-4,
+                        old_depth.clamp_min(1e-6),
+                        torch.zeros_like(old_depth),
+                    )
+                    new_history_evidence = (old_rgb, old_depth, old_alpha)
+                old_rgb, old_depth, old_alpha = new_history_evidence
+                new_gradient_evidence = None
+                new_mean_gradient_evidence = None
+                new_opacity_gradient_enabled = bool(
+                    cfg.get("new_opacity_gradient_enabled", False)
+                )
+                new_mean_gradient_enabled = bool(
+                    cfg.get("new_mean_gradient_enabled", False)
+                )
+                if new_opacity_gradient_enabled or new_mean_gradient_enabled:
+                    provisional, provisional_active = build_provisional_gaussians(
+                        state.gaussians,
+                        current_gaussians,
+                        torch.ones_like(current_gaussians.opacities),
+                        stats["append_mask"],
+                    )
+                    (
+                        full_gradient_evidence,
+                        full_mean_gradient_evidence,
+                    ) = _build_render_gradient_evidence(
+                        model,
+                        cfg,
+                        provisional,
+                        images,
+                        c2w,
+                        intrinsic,
+                        image_shape,
+                        view_idx,
+                        provisional_active,
+                        opacity_enabled=new_opacity_gradient_enabled,
+                        mean_enabled=new_mean_gradient_enabled,
+                        mean_replay_views=int(
+                            cfg.get("new_mean_gradient_replay_views", 0)
+                        ),
+                        mean_current_weight=float(
+                            cfg.get("new_mean_gradient_current_weight", 1.0)
+                        ),
+                        mean_replay_weight=float(
+                            cfg.get("new_mean_gradient_replay_weight", 0.0)
+                        ),
+                    )
+                    new_count = current_gaussians.opacities.shape[1]
+                    if new_opacity_gradient_enabled:
+                        if full_gradient_evidence is None:
+                            raise RuntimeError(
+                                "New-GS opacity-gradient rendering returned no "
+                                "evidence."
+                            )
+                        new_gradient_evidence = OpacityGradientEvidence(
+                            features=full_gradient_evidence.features[
+                                :, -new_count:
+                            ],
+                            signal=full_gradient_evidence.signal[:, -new_count:],
+                            current_signal=(
+                                full_gradient_evidence.current_signal[
+                                    :, -new_count:
+                                ]
+                            ),
+                            replay_signal=(
+                                full_gradient_evidence.replay_signal[
+                                    :, -new_count:
+                                ]
+                            ),
+                        )
+                    if new_mean_gradient_enabled:
+                        if full_mean_gradient_evidence is None:
+                            raise RuntimeError(
+                                "New-GS mean-gradient rendering returned no "
+                                "evidence."
+                            )
+                        new_mean_gradient_evidence = MeanGradientEvidence(
+                            features=full_mean_gradient_evidence.features[
+                                :, -new_count:
+                            ],
+                            signal=full_mean_gradient_evidence.signal[
+                                :, -new_count:
+                            ],
+                            current_signal=(
+                                full_mean_gradient_evidence.current_signal[
+                                    :, -new_count:
+                                ]
+                            ),
+                            replay_signal=(
+                                full_mean_gradient_evidence.replay_signal[
+                                    :, -new_count:
+                                ]
+                            ),
+                        )
+                new_evidence = build_projected_new_gaussian_evidence(
+                    current=current_gaussians,
+                    append_mask=stats["append_mask"],
+                    current_feature=features[:, view_idx],
+                    current_rgb=images[:, view_idx],
+                    current_depth=depth[:, view_idx, None],
+                    current_depth_confidence=torch.ones_like(
+                        depth[:, view_idx, None]
+                    ),
+                    old_rgb=old_rgb,
+                    old_depth=old_depth,
+                    old_alpha=old_alpha,
+                    camera_to_world=c2w[:, view_idx],
+                    intrinsics=intrinsic[:, view_idx],
+                    alpha_threshold=float(
+                        cfg.get("point_append_old_alpha_threshold", 0.10)
+                    ),
+                    depth_relative_tolerance=float(
+                        cfg.get(
+                            "point_append_depth_relative_tolerance",
+                            cfg.depth_relative_tolerance,
+                        )
+                    ),
+                    covariance_extent_sigma=float(
+                        cfg.get("projected_covariance_sigma", 3.0)
+                    ),
+                    opacity_gradient_evidence=new_gradient_evidence,
+                    mean_gradient_evidence=new_mean_gradient_evidence,
+                )
+                with torch.autocast("cuda", enabled=False):
+                    new_prediction = (
+                        model.gir_projected_update_head.forward_new(new_evidence)
+                    )
+                    current_gaussians, new_stats = (
+                        apply_projected_new_gaussian_residual(
+                            current_gaussians,
+                            new_evidence,
+                            new_prediction,
+                            c2w[:, view_idx],
+                            opacity_logit_scale=float(
+                                cfg.get("projected_opacity_logit_scale", 1.0)
+                            ),
+                            mean_update_mode=str(
+                                cfg.get("mean_update_mode", "relative_depth")
+                            ),
+                            raw_scale_residual=bool(
+                                cfg.get("raw_scale_residual", False)
+                            ),
+                            raw_opacity_residual=bool(
+                                cfg.get("raw_opacity_residual", False)
+                            ),
+                            raw_rotation_residual=bool(
+                                cfg.get("raw_rotation_residual", False)
+                            ),
+                            raw_harmonics_residual=bool(
+                                cfg.get("raw_harmonics_residual", False)
+                            ),
+                            mean_relative_scale=float(
+                                cfg.get("mean_relative_scale", 0.02)
+                            ),
+                            rotation_scale=float(cfg.get("rotation_scale", 0.05)),
+                            harmonics_scale=float(
+                                cfg.get("harmonics_scale", 0.10)
+                            ),
+                        )
+                    )
+                stats["residual_regularization"] = (
+                    stats["residual_regularization"]
+                    + new_stats["regularization"]
+                )
+                for key in NEW_RESIDUAL_LOG_KEYS:
+                    stats[f"new_residual_{key}"] = new_stats[key]
             state = state.append(
                 current_gaussians,
                 torch.ones_like(current_gaussians.opacities),
                 append_mask=stats["append_mask"],
-                point_map=current_gaussians.means,
+                point_map=anchor_point_map,
             )
             appended_gs = state.num_gaussians - previous_gs_count
         else:
@@ -2493,6 +2985,9 @@ def _summarize_step_stats(steps: list[dict[str, Any]]) -> dict[str, Any]:
         "point_front_conflict_ratio": torch.stack(
             [item["point_front_conflict_ratio"] for item in stats]
         ).mean(),
+        "point_front_gradient_decay_gate_ratio": torch.stack(
+            [item["point_front_gradient_decay_gate_ratio"] for item in stats]
+        ).mean(),
         "point_front_decay_mass_ratio": torch.stack(
             [item["point_front_decay_mass_ratio"] for item in stats]
         ).mean(),
@@ -2504,6 +2999,15 @@ def _summarize_step_stats(steps: list[dict[str, Any]]) -> dict[str, Any]:
         ).mean(dim=0)
     for key in MAP_UPDATE_LOG_KEYS:
         summary[key] = torch.stack([item[key] for item in stats]).mean()
+    for key in OLD_OPACITY_GRADIENT_LOG_KEYS:
+        summary[key] = torch.stack([item[key] for item in stats]).mean()
+    for key in OLD_MEAN_GRADIENT_LOG_KEYS:
+        summary[key] = torch.stack([item[key] for item in stats]).mean()
+    for key in NEW_RESIDUAL_LOG_KEYS:
+        tensor_key = f"new_residual_{key}"
+        summary[tensor_key] = torch.stack(
+            [item[tensor_key] for item in stats]
+        ).mean()
     return summary
 
 
@@ -2520,6 +3024,13 @@ def _flatten_residual_update_stats(summary: dict[str, Any]) -> dict[str, float]:
             )
     for key in MAP_UPDATE_LOG_KEYS:
         values[key] = float(summary[key].item())
+    for key in OLD_OPACITY_GRADIENT_LOG_KEYS:
+        values[key] = float(summary[key].item())
+    for key in OLD_MEAN_GRADIENT_LOG_KEYS:
+        values[key] = float(summary[key].item())
+    for key in NEW_RESIDUAL_LOG_KEYS:
+        tensor_key = f"new_residual_{key}"
+        values[tensor_key] = float(summary[tensor_key].item())
     return values
 
 
@@ -2582,6 +3093,52 @@ def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_d
         "residual_contributor_conditioned": bool(
             cfg.get("residual_contributor_conditioned", False)
         ),
+        "new_residual_enabled": bool(
+            cfg.get("new_residual_enabled", False)
+        ),
+        "opacity_gradient_enabled": bool(
+            cfg.get("old_opacity_gradient_enabled", False)
+        ),
+        "old_opacity_gradient_enabled": bool(
+            cfg.get("old_opacity_gradient_enabled", False)
+        ),
+        "new_opacity_gradient_enabled": bool(
+            cfg.get("new_opacity_gradient_enabled", False)
+        ),
+        "opacity_gradient_replay_views": int(
+            cfg.get("opacity_gradient_replay_views", 6)
+        ),
+        "opacity_gradient_current_weight": float(
+            cfg.get("opacity_gradient_current_weight", 1.0)
+        ),
+        "opacity_gradient_replay_weight": float(
+            cfg.get("opacity_gradient_replay_weight", 0.5)
+        ),
+        "mean_gradient_enabled": bool(cfg.get("mean_gradient_enabled", False)),
+        "mean_gradient_replay_views": int(
+            cfg.get(
+                "mean_gradient_replay_views",
+                cfg.get("opacity_gradient_replay_views", 6),
+            )
+        ),
+        "old_mean_gradient_current_weight": float(
+            cfg.get("old_mean_gradient_current_weight", 1.0)
+        ),
+        "old_mean_gradient_replay_weight": float(
+            cfg.get("old_mean_gradient_replay_weight", 0.5)
+        ),
+        "new_mean_gradient_enabled": bool(
+            cfg.get("new_mean_gradient_enabled", False)
+        ),
+        "new_mean_gradient_replay_views": int(
+            cfg.get("new_mean_gradient_replay_views", 0)
+        ),
+        "new_mean_gradient_current_weight": float(
+            cfg.get("new_mean_gradient_current_weight", 1.0)
+        ),
+        "new_mean_gradient_replay_weight": float(
+            cfg.get("new_mean_gradient_replay_weight", 0.0)
+        ),
         "append_mode": str(cfg.get("append_mode", "point_map")).lower(),
         "point_append_depth_check_enabled": bool(
             cfg.get("point_append_depth_check_enabled", True)
@@ -2620,6 +3177,9 @@ def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_d
         ),
         "point_front_conflict_ratio": float(
             summary["point_front_conflict_ratio"].item()
+        ),
+        "point_front_gradient_decay_gate_ratio": float(
+            summary["point_front_gradient_decay_gate_ratio"].item()
         ),
         "point_front_decay_mass_ratio": float(
             summary["point_front_decay_mass_ratio"].item()
@@ -2825,9 +3385,12 @@ def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_d
     )
     if model.gir_projected_update_head is not None:
         model.gir_projected_update_head.train(
-            bool(cfg.residual_enabled)
-            and str(cfg.get("residual_mode", "pixel_topk")).lower()
-            == "projected_shared"
+            (
+                bool(cfg.residual_enabled)
+                and str(cfg.get("residual_mode", "pixel_topk")).lower()
+                == "projected_shared"
+            )
+            or bool(cfg.get("new_residual_enabled", False))
         )
     return metrics
 
@@ -2999,6 +3562,29 @@ def main(cfg_dict: DictConfig) -> None:
             "toy.residual_mode must be pixel_topk or projected_shared; "
             f"got {residual_mode!r}."
         )
+    old_opacity_gradient_enabled = bool(
+        toy_cfg.get("old_opacity_gradient_enabled", False)
+    )
+    new_opacity_gradient_enabled = bool(
+        toy_cfg.get("new_opacity_gradient_enabled", False)
+    )
+    mean_gradient_enabled = bool(toy_cfg.get("mean_gradient_enabled", False))
+    if (
+        old_opacity_gradient_enabled
+        and residual_enabled
+        and residual_mode != "projected_shared"
+    ):
+        raise ValueError(
+            "Old-GS opacity-gradient conditioning requires "
+            "toy.residual_mode=projected_shared."
+        )
+    if mean_gradient_enabled and (
+        not residual_enabled or residual_mode != "projected_shared"
+    ):
+        raise ValueError(
+            "Old-GS mean-gradient conditioning requires residuals and "
+            "toy.residual_mode=projected_shared."
+        )
     residual_topk = max(1, int(toy_cfg.get("residual_topk", 1)))
     residual_independent_heads = bool(
         toy_cfg.get("residual_independent_heads", False)
@@ -3014,6 +3600,22 @@ def main(cfg_dict: DictConfig) -> None:
     opacity_decay_enabled = bool(
         toy_cfg.get("opacity_decay_enabled", False)
     )
+    new_residual_enabled = bool(
+        toy_cfg.get("new_residual_enabled", False)
+    )
+    if new_opacity_gradient_enabled and not new_residual_enabled:
+        raise ValueError(
+            "New-GS opacity-gradient conditioning requires "
+            "toy.new_residual_enabled=true."
+        )
+    new_mean_gradient_enabled = bool(
+        toy_cfg.get("new_mean_gradient_enabled", False)
+    )
+    if new_mean_gradient_enabled and not new_residual_enabled:
+        raise ValueError(
+            "New-GS mean-gradient conditioning requires "
+            "toy.new_residual_enabled=true."
+        )
     if residual_mode == "projected_shared" and opacity_decay_enabled:
         raise ValueError(
             "projected_shared includes front-surface opacity decay; set "
@@ -3141,6 +3743,51 @@ def main(cfg_dict: DictConfig) -> None:
             f"opacity={bool(toy_cfg.get('residual_opacity_enabled', True))}, "
             f"harmonics={bool(toy_cfg.get('residual_harmonics_enabled', True))}"
         )
+    print(
+        "Append-selected new-GS residual: "
+        f"enabled={new_residual_enabled}, "
+        "parameterization=shared_with_old_gs"
+    )
+    print(
+        "Opacity-gradient evidence: "
+        f"old_enabled={old_opacity_gradient_enabled}, "
+        f"new_enabled={new_opacity_gradient_enabled}, "
+        f"replay_views={int(toy_cfg.get('opacity_gradient_replay_views', 6))}, "
+        f"scale={float(toy_cfg.get('opacity_gradient_scale', 1000.0)):g}, "
+        f"clip={float(toy_cfg.get('opacity_gradient_clip', 20.0)):g}, "
+        f"threshold={float(toy_cfg.get('opacity_gradient_threshold', 1e-3)):g}, "
+        f"current_weight={float(toy_cfg.get('opacity_gradient_current_weight', 1.0)):g}, "
+        f"replay_weight={float(toy_cfg.get('opacity_gradient_replay_weight', 0.5)):g}, "
+        "front_decay_gate="
+        f"{bool(toy_cfg.get('opacity_gradient_front_decay_gate_enabled', False))}, "
+        "front_decay_threshold="
+        f"{float(toy_cfg.get('opacity_gradient_front_decay_threshold', 0.0)):g}"
+    )
+    print(
+        "Old-GS camera-space mean-gradient evidence: "
+        f"enabled={mean_gradient_enabled}, "
+        f"scale={float(toy_cfg.get('mean_gradient_scale', 1.0)):g}, "
+        f"clip={float(toy_cfg.get('mean_gradient_clip', 20.0)):g}, "
+        f"threshold={float(toy_cfg.get('mean_gradient_threshold', 1e-6)):g}, "
+        f"replay_views={int(toy_cfg.get('mean_gradient_replay_views', 6))}, "
+        "current_weight="
+        f"{float(toy_cfg.get('old_mean_gradient_current_weight', 1.0)):g}, "
+        "replay_weight="
+        f"{float(toy_cfg.get('old_mean_gradient_replay_weight', 0.5)):g}"
+    )
+    print(
+        "New-GS camera-space mean-gradient evidence: "
+        f"enabled={new_mean_gradient_enabled}, adapter=independent, "
+        f"scale={float(toy_cfg.get('mean_gradient_scale', 1.0)):g}, "
+        f"clip={float(toy_cfg.get('mean_gradient_clip', 20.0)):g}, "
+        f"threshold={float(toy_cfg.get('mean_gradient_threshold', 1e-6)):g}, "
+        "replay_views="
+        f"{int(toy_cfg.get('new_mean_gradient_replay_views', 0))}, "
+        "current_weight="
+        f"{float(toy_cfg.get('new_mean_gradient_current_weight', 1.0)):g}, "
+        "replay_weight="
+        f"{float(toy_cfg.get('new_mean_gradient_replay_weight', 0.0)):g}"
+    )
     print(f"Train Gaussian feature/depth head: {train_gaussian_param_head}")
     print(f"Train base GS parameter head: {train_gs_head}")
     print(f"Train depth output head: {train_depth_head}")
@@ -3198,6 +3845,11 @@ def main(cfg_dict: DictConfig) -> None:
         train_depth_head,
         train_camera_head,
         opacity_decay_enabled,
+        new_residual_enabled,
+        old_opacity_gradient_enabled,
+        new_opacity_gradient_enabled,
+        mean_gradient_enabled,
+        new_mean_gradient_enabled,
     )
     data = _load_toy_data(toy_cfg, device)
     if not bool(data.get("has_gt_depth", True)):
@@ -3255,7 +3907,7 @@ def main(cfg_dict: DictConfig) -> None:
         "gaussian_param_head": float(toy_cfg.gaussian_head_lr),
         "gs_head": float(toy_cfg.gs_head_lr),
         "old_residual_head": float(toy_cfg.residual_head_lr),
-        "projected_old_residual_head": float(toy_cfg.residual_head_lr),
+        "projected_residual_head": float(toy_cfg.residual_head_lr),
         "camera_head": float(toy_cfg.camera_head_lr),
     }
     optimizer_groups = [
@@ -3273,21 +3925,28 @@ def main(cfg_dict: DictConfig) -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     start_step = 0
     if resume_state is not None:
-        try:
-            optimizer.load_state_dict(resume_state["optimizer"])
-            if "scheduler" in resume_state:
-                scheduler.load_state_dict(resume_state["scheduler"])
-            if "scaler" in resume_state:
-                scaler.load_state_dict(resume_state["scaler"])
-            start_step = int(resume_state.get("step", 0))
-            print(f"Resuming toy optimizer state from step {start_step}.")
-        except (KeyError, ValueError) as exc:
-            print(
-                "Checkpoint optimizer groups are incompatible with the current "
-                "camera/depth configuration; loaded model weights only and "
-                f"started a fresh optimizer. Details: {exc}"
-            )
+        if not bool(resume_state.get("_optimizer_compatible", True)):
             resume_state = None
+            print(
+                "Loaded checkpoint as a warm start with a fresh optimizer "
+                "because the new-GS residual head architecture changed."
+            )
+        else:
+            try:
+                optimizer.load_state_dict(resume_state["optimizer"])
+                if "scheduler" in resume_state:
+                    scheduler.load_state_dict(resume_state["scheduler"])
+                if "scaler" in resume_state:
+                    scaler.load_state_dict(resume_state["scaler"])
+                start_step = int(resume_state.get("step", 0))
+                print(f"Resuming toy optimizer state from step {start_step}.")
+            except (KeyError, ValueError) as exc:
+                print(
+                    "Checkpoint optimizer groups are incompatible with the current "
+                    "camera/depth configuration; loaded model weights only and "
+                    f"started a fresh optimizer. Details: {exc}"
+                )
+                resume_state = None
     model.encoder.gaussian_param_head.train(train_gaussian_param_head)
     model.encoder.camera_head.train(train_camera_head)
     model.encoder.gs_head.train(train_gs_head)
@@ -3296,7 +3955,8 @@ def main(cfg_dict: DictConfig) -> None:
     )
     if model.gir_projected_update_head is not None:
         model.gir_projected_update_head.train(
-            residual_enabled and residual_mode == "projected_shared"
+            (residual_enabled and residual_mode == "projected_shared")
+            or new_residual_enabled
         )
 
     _inherit_resume_logs(resume_state, output_dir)
@@ -3550,6 +4210,9 @@ def main(cfg_dict: DictConfig) -> None:
                 "point_front_conflict_ratio": float(
                     summary["point_front_conflict_ratio"].item()
                 ),
+                "point_front_gradient_decay_gate_ratio": float(
+                    summary["point_front_gradient_decay_gate_ratio"].item()
+                ),
                 "point_front_decay_mass_ratio": float(
                     summary["point_front_decay_mass_ratio"].item()
                 ),
@@ -3580,6 +4243,7 @@ def main(cfg_dict: DictConfig) -> None:
                     f"decay_p={summary['opacity_decay_candidate_probability'].item():.3f} "
                     f"decay_mass={summary['opacity_decay_mass_ratio'].item():.3%} "
                     f"front_conflict={summary['point_front_conflict_ratio'].item():.3%} "
+                    f"front_grad_gate={summary['point_front_gradient_decay_gate_ratio'].item():.3%} "
                     f"fixed_decay={summary['point_front_decay_mass_ratio'].item():.3%} "
                     f"coverage={summary['old_coverage_ratio'].item():.2%} "
                     f"consistent={summary['depth_consistent_ratio'].item():.2%} "
@@ -3590,7 +4254,25 @@ def main(cfg_dict: DictConfig) -> None:
                     f"appended_gs={int(summary['appended_gs'])} "
                     f"rank_mean_eff=[{rank_effective_mean}] "
                     f"rank_mult=[{rank_multiplier}] "
-                    f"map_mean={summary['map_mean_shift_mean'].item():.2e}"
+                    f"map_mean={summary['map_mean_shift_mean'].item():.2e} "
+                    f"new_gate={summary['new_residual_gate_mean'].item():.3f} "
+                    f"new_mean={summary['new_residual_mean_shift_mean'].item():.2e} "
+                    f"new_rot={summary['new_residual_rotation_shift_mean'].item():.2e} "
+                    f"new_scale={summary['new_residual_scale_relative_shift_mean'].item():.2e} "
+                    f"new_opacity={summary['new_residual_opacity_shift_mean'].item():.2e} "
+                    f"new_sh={summary['new_residual_harmonics_shift_mean'].item():.2e} "
+                    f"old_grad={summary['old_gradient_signal_abs_mean'].item():.2e} "
+                    f"old_grad_raw_align={summary['old_gradient_update_alignment'].item():.2%} "
+                    f"old_grad_eff_align={summary['old_gradient_effective_alignment'].item():.2%} "
+                    f"old_grad_conflict={summary['old_gradient_current_replay_conflict_ratio'].item():.2%} "
+                    f"old_mean_grad={summary['old_mean_gradient_signal_norm_mean'].item():.2e} "
+                    f"old_mean_align={summary['old_mean_gradient_effective_update_alignment'].item():.2%} "
+                    f"old_mean_conflict={summary['old_mean_gradient_current_replay_conflict_ratio'].item():.2%} "
+                    f"new_grad={summary['new_residual_gradient_signal_abs_mean'].item():.2e} "
+                    f"new_grad_align={summary['new_residual_gradient_update_alignment'].item():.2%} "
+                    f"new_mean_grad={summary['new_residual_mean_gradient_signal_norm_mean'].item():.2e} "
+                    f"new_mean_align={summary['new_residual_mean_gradient_effective_update_alignment'].item():.2%} "
+                    f"new_mean_conflict={summary['new_residual_mean_gradient_current_replay_conflict_ratio'].item():.2%}"
                 )
             if step % int(toy_cfg.eval_every) == 0 or step == int(toy_cfg.max_steps):
                 metrics = _evaluate(

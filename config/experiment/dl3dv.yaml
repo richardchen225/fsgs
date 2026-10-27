@@ -15,6 +15,9 @@ model:
     mode: ${mode}
     reconstruction_backbone: zipmap
     zipmap_weights_path: weights/pre_zipmap.pt
+    # Keep photometric gradients to the camera head. The decoder uses rigid
+    # pose inversion and the configured 0.01 near plane for stable backprop.
+    detach_predicted_camera_for_geometry: false
     depth_refine_downsample_factor: 4
     depth_refine_enabled: false
     gir_enabled: true
@@ -35,9 +38,17 @@ model:
     gir_projected_min_radius: 0.1
     gir_projected_covariance_sigma: 3.0
     gir_projected_opacity_logit_scale: 1.0
-    # First-observation front conflicts receive deterministic 30% opacity decay.
+    # Disable the learned projected-front decay; point-map decay is configured below.
     gir_projected_front_decay_strength: 0.0
     gir_projected_warmup_steps: 1000
+    # Condition both old/new residual branches on rendered opacity gradients.
+    # The old-GS evidence also gates deterministic front-conflict decay.
+    gir_old_opacity_gradient_enabled: true
+    gir_new_opacity_gradient_enabled: true
+    gir_opacity_gradient_front_decay_gate_enabled: true
+    # Keep mean-gradient conditioning disabled in this experiment.
+    gir_mean_gradient_enabled: false
+    gir_new_mean_gradient_enabled: false
     gir_old_delete_enabled: false
     gir_old_delete_warmup_steps: 1000
     gir_old_delete_target_ratio: 0.01
@@ -92,12 +103,13 @@ model:
     gir_point_append_old_alpha_threshold: 0.10
     gir_point_append_min_depth_confidence: 0.0
     gir_point_append_front_conflict_confirm_views: 1
+    # Decay fraction 0.70 retains 30% opacity for a selected old GS.
     gir_point_append_front_conflict_opacity_decay: 0.70
     gir_point_append_max_ratio: 1.0
     gir_point_append_dilation_radius: 2
     gir_point_append_chunk_size: 65536
     gir_add_gate_enabled: false
-    gir_new_residual_enabled: false
+    gir_new_residual_enabled: true
     # Preserve cross-view gradients inside each TBPTT chunk so sparse point-map
     # appends can jointly optimize the shared historical geometry.
     gir_historical_detach_mode: none
@@ -120,7 +132,7 @@ dataset:
     view_sampler:
       num_target_views: 9
       min_distance_between_context_views: 32
-      max_distance_between_context_views: 256
+      max_distance_between_context_views: 48
       min_gap_multiplier: 3
       max_gap_multiplier: 5
     avg_pose: false

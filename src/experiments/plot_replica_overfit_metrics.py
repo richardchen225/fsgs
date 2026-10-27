@@ -254,7 +254,7 @@ def plot_residual_update_metrics(
     if not rows or not any(rank_probe in row for row in rows):
         return None
 
-    figure, axes = plt.subplots(3, 3, figsize=(17, 13), constrained_layout=True)
+    figure, axes = plt.subplots(5, 3, figsize=(17, 21), constrained_layout=True)
     axes = axes.ravel()
     rank_indices = [
         rank_idx
@@ -366,6 +366,160 @@ def plot_residual_update_metrics(
         axis.set_ylabel("Change magnitude")
         axis.grid(alpha=0.25)
         axis.legend(fontsize=8)
+
+    for key, label in (
+        ("new_residual_mean_shift_mean", "Mean shift"),
+        ("new_residual_rotation_shift_mean", "Rotation"),
+        ("new_residual_scale_relative_shift_mean", "Relative scale"),
+        ("new_residual_opacity_shift_mean", "Opacity"),
+        ("new_residual_harmonics_shift_mean", "SH"),
+    ):
+        x, y = points(key)
+        if x:
+            axes[9].plot(x, y, linewidth=1.2, label=label)
+    axes[9].set_yscale("symlog", linthresh=1e-8)
+    axes[9].set_title("Actual new-GS change")
+    axes[9].set_xlabel("Step")
+    axes[9].set_ylabel("Change magnitude")
+    axes[9].grid(alpha=0.25)
+    if axes[9].lines:
+        axes[9].legend(fontsize=8)
+
+    for key, label in (
+        ("new_residual_raw_mean", "Mean"),
+        ("new_residual_raw_rotation", "Rotation"),
+        ("new_residual_raw_log_scale", "Log-scale"),
+        ("new_residual_raw_opacity_logit", "Opacity logit"),
+        ("new_residual_raw_harmonics", "SH"),
+        ("new_residual_regularization", "Regularization"),
+    ):
+        x, y = points(key)
+        if x:
+            axes[10].plot(x, y, linewidth=1.2, label=label)
+    axes[10].set_yscale("symlog", linthresh=1e-8)
+    axes[10].set_title("Raw new-GS residual")
+    axes[10].set_xlabel("Step")
+    axes[10].set_ylabel("Raw magnitude")
+    axes[10].grid(alpha=0.25)
+    if axes[10].lines:
+        axes[10].legend(fontsize=8)
+
+    for key, label in (
+        ("new_residual_candidate_ratio", "Candidates"),
+        ("new_residual_gate_mean", "Mean gate"),
+    ):
+        x, y = points(key, scale=100.0)
+        if x:
+            axes[11].plot(x, y, linewidth=1.2, label=label)
+    axes[11].set_title("New-GS update support")
+    axes[11].set_xlabel("Step")
+    axes[11].set_ylabel("Ratio (%)")
+    axes[11].grid(alpha=0.25)
+    if axes[11].lines:
+        axes[11].legend(fontsize=8)
+
+    for axis, prefix, title in (
+        (axes[12], "old_gradient_", "Old-GS opacity-gradient evidence"),
+        (
+            axes[13],
+            "new_residual_gradient_",
+            "New-GS gradient evidence",
+        ),
+    ):
+        for suffix, label in (
+            ("current_positive_mean", "Current positive"),
+            ("current_negative_mean", "Current negative"),
+            ("replay_positive_mean", "Replay positive"),
+            ("replay_negative_mean", "Replay negative"),
+            ("signal_abs_mean", "Combined |signal|"),
+        ):
+            x, y = points(f"{prefix}{suffix}")
+            if x:
+                axis.plot(x, y, linewidth=1.2, label=label)
+        axis.set_yscale("symlog", linthresh=1e-8)
+        axis.set_title(title)
+        axis.set_xlabel("Step")
+        axis.set_ylabel("Normalized mass / clipped signal")
+        axis.grid(alpha=0.25)
+        if axis.lines:
+            axis.legend(fontsize=8)
+
+    for key, label in (
+        (
+            "new_residual_mean_gradient_current_norm_mean",
+            "New mean current norm",
+        ),
+        (
+            "new_residual_mean_gradient_replay_norm_mean",
+            "New mean replay norm",
+        ),
+        (
+            "new_residual_mean_gradient_signal_norm_mean",
+            "New mean combined norm",
+        ),
+    ):
+        x, y = points(key)
+        if x:
+            axes[13].plot(x, y, linewidth=1.2, label=label)
+    if axes[13].lines:
+        axes[13].legend(fontsize=8)
+
+    for key, label in (
+        ("old_gradient_current_nonzero_ratio", "Old current nonzero"),
+        ("old_gradient_update_alignment", "Old residual aligned"),
+        ("old_gradient_consistent_alignment", "Old consistent aligned"),
+        ("old_gradient_front_alignment", "Old front aligned"),
+        ("old_gradient_effective_alignment", "Old final aligned"),
+        (
+            "point_front_gradient_decay_gate_ratio",
+            "Front conflicts allowed to decay",
+        ),
+        (
+            "old_gradient_current_replay_conflict_ratio",
+            "Old current/replay conflict",
+        ),
+        (
+            "new_residual_gradient_current_nonzero_ratio",
+            "New current nonzero",
+        ),
+        (
+            "new_residual_gradient_update_alignment",
+            "New update aligned",
+        ),
+        (
+            "old_mean_gradient_raw_update_alignment",
+            "Old mean raw aligned",
+        ),
+        (
+            "old_mean_gradient_effective_update_alignment",
+            "Old mean effective aligned",
+        ),
+        (
+            "old_mean_gradient_current_replay_conflict_ratio",
+            "Old mean current/replay conflict",
+        ),
+        (
+            "new_residual_mean_gradient_raw_update_alignment",
+            "New mean raw aligned",
+        ),
+        (
+            "new_residual_mean_gradient_effective_update_alignment",
+            "New mean effective aligned",
+        ),
+        (
+            "new_residual_mean_gradient_current_replay_conflict_ratio",
+            "New mean current/replay conflict",
+        ),
+    ):
+        x, y = points(key, scale=100.0)
+        if x:
+            axes[14].plot(x, y, linewidth=1.2, label=label)
+    axes[14].set_title("Gradient utilization")
+    axes[14].set_xlabel("Step")
+    axes[14].set_ylabel("Ratio (%)")
+    axes[14].grid(alpha=0.25)
+    if axes[14].lines:
+        axes[14].legend(fontsize=8)
 
     destination = (
         Path(output_path)

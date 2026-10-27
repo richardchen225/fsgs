@@ -29,12 +29,40 @@ model:
     # Hybrid append applies the deterministic decay instead.
     gir_projected_front_decay_strength: 0.0
     gir_projected_warmup_steps: 1000
+    # Keep opacity-gradient conditioning and decay gating for historical GS,
+    # while ablating the same input for newly appended GS.
+    gir_old_opacity_gradient_enabled: true
+    gir_new_opacity_gradient_enabled: false
+    gir_opacity_gradient_replay_views: 6
+    gir_opacity_gradient_scale: 1000.0
+    gir_opacity_gradient_clip: 20.0
+    gir_opacity_gradient_threshold: 1.0e-3
+    # Match loss_updated_current=1.0 and loss_replay_history=0.5 below.
+    gir_opacity_gradient_current_weight: 1.0
+    gir_opacity_gradient_replay_weight: 0.5
+    gir_opacity_gradient_front_decay_gate_enabled: true
+    gir_opacity_gradient_front_decay_threshold: 0.0
+    gir_mean_gradient_enabled: true
+    gir_mean_gradient_scale: 1.0
+    gir_mean_gradient_clip: 20.0
+    gir_mean_gradient_threshold: 1.0e-6
+    # Old GS adapts to the current observation while retaining replay context.
+    gir_mean_gradient_replay_views: -1
+    gir_old_mean_gradient_current_weight: 1.0
+    gir_old_mean_gradient_replay_weight: 0.5
+    gir_new_mean_gradient_enabled: true
+    # New anchors are introduced by the current observation. Condition only
+    # their mean residual on the current-view RGB gradient.
+    gir_new_mean_gradient_replay_views: 0
+    gir_new_mean_gradient_current_weight: 1.0
+    gir_new_mean_gradient_replay_weight: 0.0
     gir_old_delete_enabled: false
     gir_old_decay_enabled: false
     gir_old_decay_topk: 4
     gir_old_decay_strength: 0.02
     gir_old_decay_prune_threshold: 0.005
     gir_add_gate_enabled: false
+    gir_new_residual_enabled: true
 
 toy:
   # replica: RGB+EXR depth toy scene; dl3dv: RGB-only transforms.json scene.
@@ -59,6 +87,8 @@ toy:
   save_checkpoints: false
   mixed_precision: true
   residual_enabled: true
+  # Refine append-selected anchors with the same parameterization as old GS.
+  new_residual_enabled: ${model.encoder.gir_new_residual_enabled}
   # Keep head construction and the overfit rollout on the same implementation.
   residual_mode: ${model.encoder.gir_old_update_mode}  # pixel_topk | projected_shared
   projected_hidden_dim: 128
@@ -68,6 +98,27 @@ toy:
   projected_opacity_logit_scale: 1.0
   projected_front_decay_strength: 0.0
   projected_warmup_steps: 1000
+  old_opacity_gradient_enabled: ${model.encoder.gir_old_opacity_gradient_enabled}
+  new_opacity_gradient_enabled: ${model.encoder.gir_new_opacity_gradient_enabled}
+  opacity_gradient_replay_views: ${model.encoder.gir_opacity_gradient_replay_views}
+  opacity_gradient_scale: ${model.encoder.gir_opacity_gradient_scale}
+  opacity_gradient_clip: ${model.encoder.gir_opacity_gradient_clip}
+  opacity_gradient_threshold: ${model.encoder.gir_opacity_gradient_threshold}
+  opacity_gradient_current_weight: ${model.encoder.gir_opacity_gradient_current_weight}
+  opacity_gradient_replay_weight: ${model.encoder.gir_opacity_gradient_replay_weight}
+  opacity_gradient_front_decay_gate_enabled: ${model.encoder.gir_opacity_gradient_front_decay_gate_enabled}
+  opacity_gradient_front_decay_threshold: ${model.encoder.gir_opacity_gradient_front_decay_threshold}
+  mean_gradient_enabled: ${model.encoder.gir_mean_gradient_enabled}
+  mean_gradient_scale: ${model.encoder.gir_mean_gradient_scale}
+  mean_gradient_clip: ${model.encoder.gir_mean_gradient_clip}
+  mean_gradient_threshold: ${model.encoder.gir_mean_gradient_threshold}
+  mean_gradient_replay_views: ${model.encoder.gir_mean_gradient_replay_views}
+  old_mean_gradient_current_weight: ${model.encoder.gir_old_mean_gradient_current_weight}
+  old_mean_gradient_replay_weight: ${model.encoder.gir_old_mean_gradient_replay_weight}
+  new_mean_gradient_enabled: ${model.encoder.gir_new_mean_gradient_enabled}
+  new_mean_gradient_replay_views: ${model.encoder.gir_new_mean_gradient_replay_views}
+  new_mean_gradient_current_weight: ${model.encoder.gir_new_mean_gradient_current_weight}
+  new_mean_gradient_replay_weight: ${model.encoder.gir_new_mean_gradient_replay_weight}
   # Scatter each pixel residual to its strongest K historical contributors.
   # K=1 preserves the original dominant-GS update path.
   residual_topk: 4

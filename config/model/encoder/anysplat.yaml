@@ -7,6 +7,9 @@ mode: ${mode}
 # The encoder uses ZipMap features/cameras with the shared DPT and GS heads.
 reconstruction_backbone: zipmap
 depth_teacher: ${oc.select:loss.depth.teacher,dav3}
+# Experiments with direct pose/FOV supervision can detach rasterizer geometry
+# from the camera head when camera gradients are unstable.
+detach_predicted_camera_for_geometry: false
 
 opacity_mapping:
   initial: 0.0
@@ -54,6 +57,33 @@ gir_projected_covariance_sigma: 3.0
 gir_projected_opacity_logit_scale: 1.0
 gir_projected_front_decay_strength: 0.02
 gir_projected_warmup_steps: 1000
+# RetroSplat-style d(RGB error)/d(opacity logit) evidence. Old and new GS use
+# separate switches while sharing the evidence scaling and adapter weights.
+gir_old_opacity_gradient_enabled: false
+gir_new_opacity_gradient_enabled: false
+gir_opacity_gradient_replay_views: 6
+gir_opacity_gradient_scale: 1000.0
+gir_opacity_gradient_clip: 20.0
+gir_opacity_gradient_threshold: 1.0e-3
+gir_opacity_gradient_current_weight: 1.0
+gir_opacity_gradient_replay_weight: 0.5
+# When enabled, deterministic front-conflict decay is allowed only where the
+# combined current/replay RGB gradient asks opacity to decrease.
+gir_opacity_gradient_front_decay_gate_enabled: false
+gir_opacity_gradient_front_decay_threshold: 0.0
+# Camera-space d(RGB loss)/d(mean residual) evidence for projected old GS.
+gir_mean_gradient_enabled: false
+gir_mean_gradient_scale: 1.0
+gir_mean_gradient_clip: 20.0
+gir_mean_gradient_threshold: 1.0e-6
+gir_mean_gradient_replay_views: 6
+gir_old_mean_gradient_current_weight: 1.0
+gir_old_mean_gradient_replay_weight: 0.5
+# Use the same camera-space evidence with an independent new-GS adapter.
+gir_new_mean_gradient_enabled: false
+gir_new_mean_gradient_replay_views: 0
+gir_new_mean_gradient_current_weight: 1.0
+gir_new_mean_gradient_replay_weight: 0.0
 gir_old_delete_enabled: false
 gir_old_delete_warmup_steps: 1000
 gir_old_delete_target_ratio: 0.01

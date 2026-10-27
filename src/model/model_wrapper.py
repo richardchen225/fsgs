@@ -95,6 +95,9 @@ class TestCfg:
         "inherit", "none", "floor_sqrt", "sqrt"
     ] = "inherit"
     gir_test_top1_confidence_floor: float = 0.25
+    gir_debug_save_intermediates: bool = False
+    gir_debug_max_scenes: int = 10
+    gir_debug_view_stride: int = 1
 
 
 @dataclass
@@ -270,6 +273,7 @@ class ModelWrapper(LightningModule):
         self.benchmarker = Benchmarker()
         self._skip_optimizer_step = False
         self._bad_grad_name = None
+        self._bad_grad_summaries = []
         self._val_comparison_images: list[np.ndarray] = []
         self._val_comparison_captions: list[str] = []
 
@@ -348,18 +352,72 @@ class ModelWrapper(LightningModule):
         projected_update_enabled = bool(
             getattr(self.model.encoder.cfg, "gir_old_residual_enabled", True)
         ) and old_update_mode == "projected_shared"
-        if projected_gir_head is not None:
-            projected_gir_head.requires_grad_(
-                train_gir and projected_update_enabled
+        new_residual_enabled = bool(
+            getattr(
+                self.model.encoder.cfg,
+                "gir_new_residual_enabled",
+                False,
             )
-        if gir_head is not None:
-            new_residual_enabled = bool(
-                getattr(
-                    self.model.encoder.cfg,
-                    "gir_new_residual_enabled",
-                    True,
+        )
+        old_opacity_gradient_enabled = bool(
+            getattr(
+                self.model.encoder.cfg,
+                "gir_old_opacity_gradient_enabled",
+                False,
+            )
+        )
+        new_opacity_gradient_enabled = bool(
+            getattr(
+                self.model.encoder.cfg,
+                "gir_new_opacity_gradient_enabled",
+                False,
+            )
+        )
+        mean_gradient_enabled = bool(
+            getattr(
+                self.model.encoder.cfg,
+                "gir_mean_gradient_enabled",
+                False,
+            )
+        )
+        new_mean_gradient_enabled = bool(
+            getattr(
+                self.model.encoder.cfg,
+                "gir_new_mean_gradient_enabled",
+                False,
+            )
+        )
+        projected_head_needed = projected_update_enabled or new_residual_enabled
+        if train_gir and projected_head_needed and projected_gir_head is None:
+            raise RuntimeError(
+                "Projected old/new GS residuals require "
+                "model.gir_projected_update_head."
+            )
+        if projected_gir_head is not None:
+            projected_gir_head.requires_grad_(False)
+            projected_gir_head.decoder.requires_grad_(
+                train_gir and projected_head_needed
+            )
+            projected_gir_head.opacity_gradient_adapter.requires_grad_(
+                train_gir
+                and (
+                    (projected_update_enabled and old_opacity_gradient_enabled)
+                    or (new_residual_enabled and new_opacity_gradient_enabled)
                 )
             )
+            projected_gir_head.mean_gradient_adapter.requires_grad_(
+                train_gir and projected_update_enabled and mean_gradient_enabled
+            )
+            projected_gir_head.new_mean_gradient_adapter.requires_grad_(
+                train_gir and new_residual_enabled and new_mean_gradient_enabled
+            )
+            projected_gir_head.output.requires_grad_(
+                train_gir and projected_update_enabled
+            )
+            projected_gir_head.new_output.requires_grad_(
+                train_gir and new_residual_enabled
+            )
+        if gir_head is not None:
             old_delete_enabled = bool(
                 getattr(
                     self.model.encoder.cfg,
@@ -382,7 +440,6 @@ class ModelWrapper(LightningModule):
             ) and old_update_mode == "pixel_topk"
             pixel_head_needed = (
                 pixel_residual_enabled
-                or new_residual_enabled
                 or old_delete_enabled
                 or old_decay_enabled
                 or add_gate_enabled
@@ -397,11 +454,9 @@ class ModelWrapper(LightningModule):
                 current_prediction = getattr(
                     gir_head, "current_prediction", None
                 )
-                if current_prediction is not None and not new_residual_enabled:
-                    # current_prediction is only consumed by
-                    # apply_current_gaussian_residual(). When new-GS
-                    # residuals are disabled, its zero-valued regularizer is
-                    # not a meaningful training signal.
+                if current_prediction is not None:
+                    # New anchors now use the projected shared decoder. Keep
+                    # the legacy dense current-pixel head out of the optimizer.
                     current_prediction.requires_grad_(False)
 
                 delete_prediction = getattr(gir_head, "delete_prediction", None)
@@ -435,6 +490,11 @@ class ModelWrapper(LightningModule):
                 "GIR old-map update: projected_shared residuals for "
                 "mean/rotation/scale/opacity/SH; front errors decay opacity "
                 "only; pixel rank heads and top-k decay are disabled"
+            )
+        if train_gir and new_residual_enabled:
+            print(
+                "GIR new-map update: append-selected DPT anchors use the "
+                "shared projected decoder with an independent new-GS head"
             )
         append_mode = str(
             getattr(self.model.encoder.cfg, "gir_append_mode", "all")
@@ -589,6 +649,7 @@ class ModelWrapper(LightningModule):
                 "gir_point_coverage_ratio",
                 "gir_point_append_ratio",
                 "gir_point_front_conflict_ratio",
+                "gir_point_front_gradient_decay_gate_ratio",
                 "gir_point_front_decay_mass_ratio",
                 "gir_point_depth_scale",
                 "gir_add_gate_learned",
@@ -641,14 +702,34 @@ class ModelWrapper(LightningModule):
                         encoder_output.infos[metric_name].float(),
                     )
             if "gir_new_residual_magnitude" in encoder_output.infos:
-                self.log(
-                    "train/gir_new_residual_magnitude",
-                    encoder_output.infos["gir_new_residual_magnitude"].float(),
-                )
-                self.log(
-                    "train/gir_new_residual_gate",
-                    encoder_output.infos["gir_new_residual_gate"].float(),
-                )
+                for metric_name in (
+                    "gir_new_residual_candidate_ratio",
+                    "gir_new_residual_gate_mean",
+                    "gir_new_residual_raw_mean",
+                    "gir_new_residual_mean_shift_mean",
+                    "gir_new_residual_raw_rotation",
+                    "gir_new_residual_rotation_shift_mean",
+                    "gir_new_residual_raw_log_scale",
+                    "gir_new_residual_scale_relative_shift_mean",
+                    "gir_new_residual_raw_opacity_logit",
+                    "gir_new_residual_opacity_shift_mean",
+                    "gir_new_residual_raw_harmonics",
+                    "gir_new_residual_harmonics_shift_mean",
+                    "gir_new_residual_regularization",
+                    "gir_new_residual_mean_gradient_current_norm_mean",
+                    "gir_new_residual_mean_gradient_replay_norm_mean",
+                    "gir_new_residual_mean_gradient_signal_norm_mean",
+                    "gir_new_residual_mean_gradient_current_replay_cosine",
+                    "gir_new_residual_mean_gradient_current_replay_conflict_ratio",
+                    "gir_new_residual_mean_gradient_raw_update_alignment",
+                    "gir_new_residual_mean_gradient_effective_update_alignment",
+                    "gir_new_residual_magnitude",
+                    "gir_new_residual_gate",
+                ):
+                    self.log(
+                        f"train/{metric_name}",
+                        encoder_output.infos[metric_name].float(),
+                    )
             if "gir_history_before_error" in encoder_output.infos:
                 history_before = encoder_output.infos[
                     "gir_history_before_error"
@@ -686,6 +767,13 @@ class ModelWrapper(LightningModule):
                 "gir_projected_gate_mean",
                 "gir_projected_opacity_shift",
                 "gir_projected_front_decay_probability",
+                "gir_projected_mean_gradient_current_norm_mean",
+                "gir_projected_mean_gradient_replay_norm_mean",
+                "gir_projected_mean_gradient_signal_norm_mean",
+                "gir_projected_mean_gradient_current_replay_cosine",
+                "gir_projected_mean_gradient_current_replay_conflict_ratio",
+                "gir_projected_mean_gradient_raw_update_alignment",
+                "gir_projected_mean_gradient_effective_update_alignment",
                 "gir_old_delete_target_ratio",
                 "gir_old_delete_candidate_probability",
                 "gir_old_delete_candidate_count",
@@ -1052,21 +1140,33 @@ class ModelWrapper(LightningModule):
         # 这个 hook 里检查的是“真正要 step 的梯度”
         self._skip_optimizer_step = False
         self._bad_grad_name = None
+        self._bad_grad_summaries = []
 
         for name, p in self.named_parameters():
             if p.grad is None:
                 continue
-            if not torch.isfinite(p.grad).all():
+            finite = torch.isfinite(p.grad)
+            if not bool(finite.all()):
                 self._skip_optimizer_step = True
-                self._bad_grad_name = name
-                break
+                if self._bad_grad_name is None:
+                    self._bad_grad_name = name
+                self._bad_grad_summaries.append(
+                    (name, int((~finite).sum().item()), p.grad.numel())
+                )
 
         if self._skip_optimizer_step:
             if self.global_rank == 0:
                 print(
                     f"[skip step] global_step={self.global_step}, "
-                    f"bad_param={self._bad_grad_name}"
+                    f"bad_param={self._bad_grad_name}, "
+                    f"bad_param_count={len(self._bad_grad_summaries)}"
                 )
+                for name, bad_count, element_count in self._bad_grad_summaries[:8]:
+                    print(
+                        f"[bad grad] {name}: "
+                        f"nonfinite={bad_count}/{element_count}",
+                        flush=True,
+                    )
                 encoder_cfg = getattr(
                     getattr(get_cfg(), "model", None), "encoder", None
                 )
@@ -1121,6 +1221,7 @@ class ModelWrapper(LightningModule):
             optimizer.zero_grad(set_to_none=True)
             self._skip_optimizer_step = False
             self._bad_grad_name = None
+            self._bad_grad_summaries = []
             return
 
         # 正常情况才 step
@@ -1128,6 +1229,7 @@ class ModelWrapper(LightningModule):
         log_cuda_memory("after_optimizer_step", step=int(self.global_step))
         self._skip_optimizer_step = False
         self._bad_grad_name = None
+        self._bad_grad_summaries = []
     def optimizer_zero_grad(self, epoch, batch_idx, optimizer):
         optimizer.zero_grad(set_to_none=True)
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
@@ -1207,10 +1309,213 @@ class ModelWrapper(LightningModule):
             if hasattr(self, name):
                 delattr(self, name)
 
+    def _save_test_gir_debug_intermediates(
+        self,
+        scene: str,
+        context_indices: torch.Tensor,
+        records: list[dict[str, Any]],
+    ) -> None:
+        if not records:
+            print(f"[GIR DEBUG] scene={scene}: no update-view intermediates.")
+            return
+
+        safe_scene = "".join(
+            character if character.isalnum() or character in "-_." else "_"
+            for character in scene
+        )
+        run_name = str(get_cfg()["wandb"]["name"])
+        output_dir = (
+            self.test_cfg.output_path
+            / run_name
+            / "gir_debug"
+            / f"rank_{int(self.global_rank):02d}"
+            / safe_scene
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        summaries = []
+        for record in records:
+            view_idx = int(record["view_index"])
+            frame_idx = int(context_indices[0, view_idx].item())
+            current_rgb = record["current_rgb"][0].float().clamp(0.0, 1.0)
+            image_shape = tuple(current_rgb.shape[-2:])
+
+            def resize(value: torch.Tensor | None, mode: str) -> torch.Tensor:
+                if value is None:
+                    return torch.zeros((1, *image_shape), dtype=torch.float32)
+                value = value[0].float()
+                if value.ndim == 2:
+                    value = value.unsqueeze(0)
+                if tuple(value.shape[-2:]) != image_shape:
+                    interpolation_args = {}
+                    if mode in {"bilinear", "bicubic"}:
+                        interpolation_args["align_corners"] = False
+                    value = F.interpolate(
+                        value.unsqueeze(0),
+                        size=image_shape,
+                        mode=mode,
+                        **interpolation_args,
+                    ).squeeze(0)
+                return value
+
+            def rgb(key: str) -> torch.Tensor:
+                value = resize(record.get(key), "bilinear")
+                if value.shape[0] == 1:
+                    value = value.repeat(3, 1, 1)
+                return value[:3].clamp(0.0, 1.0)
+
+            def mask(key: str) -> torch.Tensor:
+                value = resize(record.get(key), "nearest")[:1].clamp(0.0, 1.0)
+                return value.repeat(3, 1, 1)
+
+            def heat(key: str, color_map: str = "magma") -> torch.Tensor:
+                value = resize(record.get(key), "bilinear")[:1].clamp(0.0, 1.0)
+                return apply_color_map_to_image(value[0], color_map)
+
+            current_depth = resize(record.get("current_depth"), "bilinear")[:1]
+            old_depth = resize(record.get("old_depth"), "bilinear")[:1]
+            valid_depth_values = []
+            for depth_value in (current_depth, old_depth):
+                valid = torch.isfinite(depth_value) & (depth_value > 1e-6)
+                if bool(valid.any()):
+                    valid_depth_values.append(depth_value[valid].log())
+            if valid_depth_values:
+                log_depth_values = torch.cat(valid_depth_values)
+                depth_near = log_depth_values.quantile(0.01)
+                depth_far = log_depth_values.quantile(0.99)
+                depth_far = torch.maximum(
+                    depth_far, depth_near + depth_near.new_tensor(1e-6)
+                )
+            else:
+                depth_near = torch.tensor(0.0)
+                depth_far = torch.tensor(1.0)
+
+            def depth_image(depth_value: torch.Tensor) -> torch.Tensor:
+                valid = torch.isfinite(depth_value) & (depth_value > 1e-6)
+                safe_depth = torch.where(
+                    valid, depth_value, depth_near.exp().expand_as(depth_value)
+                )
+                normalized = 1.0 - (
+                    safe_depth.log() - depth_near
+                ) / (depth_far - depth_near)
+                colored = apply_color_map_to_image(
+                    normalized[0].clamp(0.0, 1.0), "turbo"
+                )
+                return colored * valid[0].float().unsqueeze(0)
+
+            append_mask = mask("append_mask")
+            append_overlay = current_rgb * (1.0 - 0.45 * append_mask[:1])
+            append_overlay = append_overlay + torch.tensor(
+                [1.0, 0.0, 0.0], dtype=current_rgb.dtype
+            )[:, None, None] * (0.45 * append_mask[:1])
+
+            def tile(image: torch.Tensor, label: str) -> torch.Tensor:
+                return add_label(image, label, font_size=18)
+
+            panel = vcat(
+                hcat(
+                    tile(current_rgb, "Current RGB"),
+                    tile(rgb("old_rgb"), "Old-map render"),
+                    tile(heat("rgb_error", "turbo"), "Absolute RGB error"),
+                    gap=4,
+                ),
+                hcat(
+                    tile(depth_image(current_depth), "Current predicted depth"),
+                    tile(depth_image(old_depth), "Old-map rendered depth"),
+                    tile(heat("old_alpha"), "Old-map alpha"),
+                    gap=4,
+                ),
+                hcat(
+                    tile(mask("point_coverage"), "Point-map coverage"),
+                    tile(append_mask, "Append mask"),
+                    tile(append_overlay.clamp(0.0, 1.0), "Append overlay"),
+                    gap=4,
+                ),
+                hcat(
+                    tile(mask("old_coverage"), "Old raster coverage"),
+                    tile(mask("depth_consistent"), "Depth consistent"),
+                    tile(mask("old_in_front"), "Old in front"),
+                    gap=4,
+                ),
+                hcat(
+                    tile(mask("residual_mask"), "Old residual candidates"),
+                    tile(
+                        mask("front_conflict_projection"),
+                        "Front-conflict GS projection",
+                    ),
+                    tile(
+                        mask("front_decay_projection"),
+                        "Applied opacity-decay projection",
+                    ),
+                    gap=4,
+                ),
+                gap=4,
+            )
+            stem = f"update_{view_idx:02d}_frame_{frame_idx:06d}"
+            save_image(panel, output_dir / f"{stem}_panel.png")
+            for key in (
+                "append_mask",
+                "point_coverage",
+                "residual_mask",
+                "front_conflict_projection",
+                "front_decay_projection",
+                "add_gate",
+            ):
+                if record.get(key) is not None:
+                    save_image(mask(key), output_dir / f"{stem}_{key}.png")
+
+            summaries.append(
+                {
+                    "view_index": view_idx,
+                    "frame_index": frame_idx,
+                    **record["summary"],
+                }
+            )
+
+        summary_path = output_dir / "summary.json"
+        summary_path.write_text(
+            json.dumps(
+                {
+                    "scene": scene,
+                    "rank": int(self.global_rank),
+                    "updates": summaries,
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        print(
+            f"[GIR DEBUG] saved {len(records)} update views for scene={scene} "
+            f"to {output_dir}"
+        )
+
     def test_step(self, batch, batch_idx):
         batch: BatchedExample = self.data_shim(batch)
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
+        scene_name = str(batch["scene"][0])
+        debug_max_scenes = int(self.test_cfg.gir_debug_max_scenes)
+        if debug_max_scenes < -1:
+            raise ValueError(
+                "test.gir_debug_max_scenes must be -1 or non-negative, "
+                f"got {debug_max_scenes}."
+            )
+        debug_view_stride = int(self.test_cfg.gir_debug_view_stride)
+        if debug_view_stride < 1:
+            raise ValueError(
+                "test.gir_debug_view_stride must be at least 1, "
+                f"got {debug_view_stride}."
+            )
+        world_size = max(1, int(getattr(self.trainer, "world_size", 1)))
+        debug_scene_ordinal = batch_idx * world_size + int(self.global_rank)
+        save_gir_debug = bool(
+            self.test_cfg.gir_debug_save_intermediates
+            and (
+                debug_max_scenes == -1
+                or debug_scene_ordinal < debug_max_scenes
+            )
+        )
         if batch_idx % 100 == 0:
             print(f"Test step {batch_idx:0>6}.")
         
@@ -1270,6 +1575,8 @@ class ModelWrapper(LightningModule):
                     test_top1_confidence_floor=(
                         self.test_cfg.gir_test_top1_confidence_floor
                     ),
+                    return_debug_intermediates=save_gir_debug,
+                    debug_view_stride=debug_view_stride,
                 )
                 if (
                     encoder_output.infos is not None
@@ -1310,6 +1617,7 @@ class ModelWrapper(LightningModule):
                 "gir_point_append_ratio",
                 "gir_point_append_hybrid_enabled",
                 "gir_point_front_conflict_ratio",
+                "gir_point_front_gradient_decay_gate_ratio",
                 "gir_point_front_decay_mass_ratio",
                 "gir_point_depth_scale",
                 "gir_add_gate_learned",
@@ -1369,7 +1677,6 @@ class ModelWrapper(LightningModule):
                 )
             self._record_test_gir_diagnostics(gir_diagnostics)
 
-            scene_name = str(batch["scene"][0])
             print(
                 "[GIR TEST] "
                 f"scene={scene_name} "
@@ -1401,6 +1708,16 @@ class ModelWrapper(LightningModule):
                 f"map>0.001={gir_diagnostics['map_above_0_001_ratio']:.4f} "
                 f"map>0.005={gir_diagnostics['map_above_0_005_ratio']:.4f} "
                 f"map>0.01={gir_diagnostics['map_above_0_01_ratio']:.4f}"
+            )
+
+        if save_gir_debug:
+            debug_records = (encoder_output.infos or {}).pop(
+                "gir_debug_intermediates", []
+            )
+            self._save_test_gir_debug_intermediates(
+                scene_name,
+                context_indices,
+                debug_records,
             )
         # if self.global_rank == 0:
         # export_ply(gaussians.means[0], gaussians.scales[0], gaussians.rotations[0], gaussians.harmonics[0].permute(0,2,1), single_opacities, Path(f"gaussians_{[x[:20] for x in batch['scene']]}.ply"))

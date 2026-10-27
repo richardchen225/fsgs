@@ -21,6 +21,53 @@ import torch.nn.functional as F
 warnings.filterwarnings("ignore")
 
 
+def _required_test_checkpoint_prefixes(encoder_cfg) -> list[str]:
+    """Return checkpoint prefixes required by the enabled inference paths."""
+    prefixes = [
+        "encoder.gaussian_param_head.",
+        "encoder.gs_head.",
+        "encoder.camera_head.",
+    ]
+    if not bool(getattr(encoder_cfg, "gir_enabled", False)):
+        return prefixes
+
+    prefixes.append("gir_update_head.")
+    old_projected_enabled = bool(
+        getattr(encoder_cfg, "gir_old_residual_enabled", True)
+    ) and (
+        str(getattr(encoder_cfg, "gir_old_update_mode", "pixel_topk")).lower()
+        == "projected_shared"
+    )
+    new_residual_enabled = bool(
+        getattr(encoder_cfg, "gir_new_residual_enabled", False)
+    )
+    if old_projected_enabled or new_residual_enabled:
+        prefixes.append("gir_projected_update_head.decoder.")
+    if old_projected_enabled:
+        prefixes.append("gir_projected_update_head.output.")
+    if new_residual_enabled:
+        prefixes.append("gir_projected_update_head.new_output.")
+
+    opacity_gradient_enabled = (
+        old_projected_enabled
+        and bool(getattr(encoder_cfg, "gir_old_opacity_gradient_enabled", False))
+    ) or (
+        new_residual_enabled
+        and bool(getattr(encoder_cfg, "gir_new_opacity_gradient_enabled", False))
+    )
+    if opacity_gradient_enabled:
+        prefixes.append("gir_projected_update_head.opacity_gradient_adapter.")
+    if old_projected_enabled and bool(
+        getattr(encoder_cfg, "gir_mean_gradient_enabled", False)
+    ):
+        prefixes.append("gir_projected_update_head.mean_gradient_adapter.")
+    if new_residual_enabled and bool(
+        getattr(encoder_cfg, "gir_new_mean_gradient_enabled", False)
+    ):
+        prefixes.append("gir_projected_update_head.new_mean_gradient_adapter.")
+    return prefixes
+
+
 def _print_gir_parameter_stats(model, enabled: bool) -> None:
     """Print GIR head ranges after optional pretrained weights are loaded."""
     if not enabled or not hasattr(model, "gir_update_head"):
@@ -310,24 +357,9 @@ def train(cfg_dict: DictConfig):
 
         if skipped_keys:
             print(f"Skipped {len(skipped_keys)} incompatible checkpoint keys.")
-        required_prefixes = [
-            "encoder.gaussian_param_head.",
-            "encoder.gs_head.",
-            "encoder.camera_head.",
-        ]
-        if getattr(cfg.model.encoder, "gir_enabled", False):
-            required_prefixes.append("gir_update_head.")
-            if (
-                str(
-                    getattr(
-                        cfg.model.encoder,
-                        "gir_old_update_mode",
-                        "pixel_topk",
-                    )
-                ).lower()
-                == "projected_shared"
-            ):
-                required_prefixes.append("gir_projected_update_head.")
+        required_prefixes = _required_test_checkpoint_prefixes(
+            cfg.model.encoder
+        )
         required_keys = {
             key
             for key in model_state

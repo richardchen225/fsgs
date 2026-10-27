@@ -1,4 +1,5 @@
 import copy
+import math
 from dataclasses import dataclass
 
 import torch
@@ -132,6 +133,14 @@ class ProjectedGSEvidence:
     projected_radius: torch.Tensor
     relative_depth: torch.Tensor
     camera_depth: torch.Tensor
+    opacity_gradient_features: torch.Tensor | None = None
+    opacity_gradient_signal: torch.Tensor | None = None
+    opacity_gradient_current_signal: torch.Tensor | None = None
+    opacity_gradient_replay_signal: torch.Tensor | None = None
+    mean_gradient_features: torch.Tensor | None = None
+    mean_gradient_signal: torch.Tensor | None = None
+    mean_gradient_current_signal: torch.Tensor | None = None
+    mean_gradient_replay_signal: torch.Tensor | None = None
 
 
 @dataclass
@@ -145,7 +154,576 @@ class ProjectedGSResidualPrediction:
     update_gate_logit: torch.Tensor
 
 
+@dataclass
+class ProjectedNewGSEvidence:
+    descriptor: torch.Tensor
+    flat_candidate_indices: torch.Tensor
+    candidate_mask: torch.Tensor
+    history_valid: torch.Tensor
+    history_consistent: torch.Tensor
+    history_in_front: torch.Tensor
+    camera_depth: torch.Tensor
+    opacity_gradient_features: torch.Tensor | None = None
+    opacity_gradient_signal: torch.Tensor | None = None
+    opacity_gradient_current_signal: torch.Tensor | None = None
+    opacity_gradient_replay_signal: torch.Tensor | None = None
+    mean_gradient_features: torch.Tensor | None = None
+    mean_gradient_signal: torch.Tensor | None = None
+    mean_gradient_current_signal: torch.Tensor | None = None
+    mean_gradient_replay_signal: torch.Tensor | None = None
+
+
+@dataclass
+class ProjectedNewGSResidualPrediction:
+    delta_mean_camera: torch.Tensor
+    delta_rotation: torch.Tensor
+    delta_log_scale: torch.Tensor
+    delta_opacity_logit: torch.Tensor
+    delta_harmonics: torch.Tensor
+    update_gate_logit: torch.Tensor
+
+
 PROJECTED_GS_STATE_DIM = 30
+OPACITY_GRADIENT_FEATURE_DIM = 8
+MEAN_GRADIENT_FEATURE_DIM = 10
+OPACITY_GRADIENT_STAT_KEYS = (
+    "gradient_current_positive_mean",
+    "gradient_current_negative_mean",
+    "gradient_current_nonzero_ratio",
+    "gradient_replay_positive_mean",
+    "gradient_replay_negative_mean",
+    "gradient_replay_nonzero_mean",
+    "gradient_replay_positive_ratio",
+    "gradient_replay_negative_ratio",
+    "gradient_signal_abs_mean",
+    "gradient_signal_positive_ratio",
+    "gradient_update_alignment",
+)
+OLD_OPACITY_GRADIENT_EFFECTIVE_STAT_KEYS = (
+    "gradient_consistent_alignment",
+    "gradient_front_alignment",
+    "gradient_effective_alignment",
+    "gradient_current_effective_alignment",
+    "gradient_replay_effective_alignment",
+    "gradient_current_replay_conflict_ratio",
+)
+MEAN_GRADIENT_STAT_KEYS = (
+    "mean_gradient_current_norm_mean",
+    "mean_gradient_replay_norm_mean",
+    "mean_gradient_signal_norm_mean",
+    "mean_gradient_current_replay_cosine",
+    "mean_gradient_current_replay_conflict_ratio",
+    "mean_gradient_raw_update_alignment",
+    "mean_gradient_effective_update_alignment",
+)
+
+
+@dataclass
+class OpacityGradientEvidence:
+    features: torch.Tensor
+    signal: torch.Tensor
+    current_signal: torch.Tensor
+    replay_signal: torch.Tensor
+
+
+@dataclass
+class MeanGradientEvidence:
+    features: torch.Tensor
+    signal: torch.Tensor
+    current_signal: torch.Tensor
+    replay_signal: torch.Tensor
+
+
+def gate_front_conflict_decay(
+    front_conflict_mask: torch.Tensor,
+    opacity_gradient_evidence: OpacityGradientEvidence | None,
+    *,
+    enabled: bool,
+    threshold: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gate deterministic front-conflict decay with the combined RGB gradient."""
+    if front_conflict_mask.dtype != torch.bool:
+        raise TypeError(
+            "Front-conflict decay mask must be boolean, got "
+            f"{front_conflict_mask.dtype}."
+        )
+    threshold = float(threshold)
+    if not math.isfinite(threshold) or threshold < 0.0:
+        raise ValueError(
+            "Front-conflict opacity-gradient threshold must be finite and "
+            "non-negative, got "
+            f"{threshold}."
+        )
+
+    gated_mask = front_conflict_mask
+    if enabled and opacity_gradient_evidence is not None:
+        signal = opacity_gradient_evidence.signal
+        if signal.shape != front_conflict_mask.shape:
+            raise ValueError(
+                "Front-conflict mask and opacity-gradient signal must have the "
+                "same shape, got "
+                f"{tuple(front_conflict_mask.shape)} and {tuple(signal.shape)}."
+            )
+        # Positive dL/d(logit(opacity)) means gradient descent lowers opacity.
+        gated_mask = front_conflict_mask & (signal.detach() > threshold)
+
+    conflict_count = front_conflict_mask.float().sum()
+    gate_ratio = torch.where(
+        conflict_count > 0,
+        gated_mask.float().sum() / conflict_count.clamp_min(1.0),
+        conflict_count,
+    )
+    return gated_mask, gate_ratio
+
+
+def build_opacity_gradient_evidence(
+    opacity_logit_gradients: torch.Tensor,
+    *,
+    gradient_scale: float = 1000.0,
+    gradient_clip: float = 20.0,
+    gradient_threshold: float = 1e-3,
+    current_weight: float = 1.0,
+    replay_weight: float = 0.5,
+    active_mask: torch.Tensor | None = None,
+) -> OpacityGradientEvidence:
+    """Convert current/replay opacity gradients into detached RetroSplat evidence."""
+    if opacity_logit_gradients.ndim != 3:
+        raise ValueError(
+            "Opacity gradients must be [B,V,N], got "
+            f"{tuple(opacity_logit_gradients.shape)}."
+        )
+    batch, views, count = opacity_logit_gradients.shape
+    if views < 1:
+        raise ValueError("Opacity-gradient evidence requires a current view.")
+    if active_mask is None:
+        active_mask = torch.ones(
+            (batch, count),
+            device=opacity_logit_gradients.device,
+            dtype=torch.bool,
+        )
+    if active_mask.shape != (batch, count):
+        raise ValueError(
+            "Opacity-gradient active mask must be [B,N], got "
+            f"{tuple(active_mask.shape)}."
+        )
+
+    current_weight = float(current_weight)
+    replay_weight = float(replay_weight)
+    if not math.isfinite(current_weight) or current_weight < 0.0:
+        raise ValueError(
+            "Opacity-gradient current_weight must be finite and non-negative, "
+            f"got {current_weight}."
+        )
+    if not math.isfinite(replay_weight) or replay_weight < 0.0:
+        raise ValueError(
+            "Opacity-gradient replay_weight must be finite and non-negative, "
+            f"got {replay_weight}."
+        )
+
+    with torch.no_grad():
+        scaled = torch.nan_to_num(
+            opacity_logit_gradients.detach().float()
+            * max(0.0, float(gradient_scale)),
+            nan=0.0,
+            posinf=float(gradient_clip),
+            neginf=-float(gradient_clip),
+        ).clamp(-abs(float(gradient_clip)), abs(float(gradient_clip)))
+        scaled = torch.where(
+            scaled.abs() > max(0.0, float(gradient_threshold)),
+            scaled,
+            torch.zeros_like(scaled),
+        )
+        scaled = scaled * active_mask[:, None].to(scaled.dtype)
+        current = scaled[:, 0]
+        replay = scaled[:, 1:]
+        current_signal = current * current_weight
+        current_positive = current_signal.clamp_min(0.0)
+        current_negative = (-current_signal).clamp_min(0.0)
+        if replay.shape[1]:
+            weighted_replay = replay * replay_weight
+            replay_positive = weighted_replay.clamp_min(0.0).mean(dim=1)
+            replay_negative = (-weighted_replay).clamp_min(0.0).mean(dim=1)
+            replay_nonzero = replay != 0
+            replay_nonzero_count = replay_nonzero.sum(dim=1).float()
+            denominator = replay_nonzero_count.clamp_min(1.0)
+            replay_positive_ratio = (replay > 0).sum(dim=1).float() / denominator
+            replay_negative_ratio = (replay < 0).sum(dim=1).float() / denominator
+            replay_signal = weighted_replay.mean(dim=1)
+        else:
+            replay_positive = torch.zeros_like(current)
+            replay_negative = torch.zeros_like(current)
+            replay_nonzero_count = torch.zeros_like(current)
+            replay_positive_ratio = torch.zeros_like(current)
+            replay_negative_ratio = torch.zeros_like(current)
+            replay_signal = torch.zeros_like(current)
+
+        transform = lambda value: torch.log1p(value.clamp_min(0.0)) / 5.0
+        features = torch.stack(
+            [
+                transform(current_positive),
+                transform(current_negative),
+                (current != 0).float(),
+                transform(replay_positive),
+                transform(replay_negative),
+                transform(replay_nonzero_count),
+                replay_positive_ratio,
+                replay_negative_ratio,
+            ],
+            dim=-1,
+        )
+        features = features * active_mask.unsqueeze(-1).to(features.dtype)
+        signal = (current_signal + replay_signal) * active_mask.to(current.dtype)
+    return OpacityGradientEvidence(
+        features=features,
+        signal=signal,
+        current_signal=current_signal,
+        replay_signal=replay_signal,
+    )
+
+
+def build_mean_gradient_evidence(
+    mean_camera_gradients: torch.Tensor,
+    *,
+    gradient_scale: float = 1.0,
+    gradient_clip: float = 20.0,
+    gradient_threshold: float = 1e-6,
+    current_weight: float = 1.0,
+    replay_weight: float = 0.5,
+    active_mask: torch.Tensor | None = None,
+) -> MeanGradientEvidence:
+    """Pack current/replay RGB gradients for camera-space mean residuals."""
+    if mean_camera_gradients.ndim != 4 or mean_camera_gradients.shape[-1] != 3:
+        raise ValueError(
+            "Mean gradients must be [B,V,N,3], got "
+            f"{tuple(mean_camera_gradients.shape)}."
+        )
+    batch, views, count, _ = mean_camera_gradients.shape
+    if views < 1:
+        raise ValueError("Mean-gradient evidence requires a current view.")
+    if active_mask is None:
+        active_mask = torch.ones(
+            (batch, count),
+            device=mean_camera_gradients.device,
+            dtype=torch.bool,
+        )
+    if active_mask.shape != (batch, count):
+        raise ValueError(
+            "Mean-gradient active mask must be [B,N], got "
+            f"{tuple(active_mask.shape)}."
+        )
+    for name, value in (
+        ("current_weight", current_weight),
+        ("replay_weight", replay_weight),
+    ):
+        if not math.isfinite(float(value)) or float(value) < 0.0:
+            raise ValueError(
+                f"Mean-gradient {name} must be finite and non-negative, got "
+                f"{value}."
+            )
+
+    with torch.no_grad():
+        clip = abs(float(gradient_clip))
+        scaled = torch.nan_to_num(
+            mean_camera_gradients.detach().float()
+            * max(0.0, float(gradient_scale)),
+            nan=0.0,
+            posinf=clip,
+            neginf=-clip,
+        ).clamp(-clip, clip)
+        norm = scaled.norm(dim=-1)
+        scaled = torch.where(
+            (norm > max(0.0, float(gradient_threshold))).unsqueeze(-1),
+            scaled,
+            torch.zeros_like(scaled),
+        )
+        scaled = scaled * active_mask[:, None, :, None].to(scaled.dtype)
+        current_signal = scaled[:, 0] * float(current_weight)
+        replay = scaled[:, 1:]
+        if replay.shape[1]:
+            weighted_replay = replay * float(replay_weight)
+            replay_signal = weighted_replay.mean(dim=1)
+            replay_nonzero_ratio = (replay.norm(dim=-1) > 0).float().mean(dim=1)
+        else:
+            replay_signal = torch.zeros_like(current_signal)
+            replay_nonzero_ratio = torch.zeros_like(current_signal[..., 0])
+        signal = current_signal + replay_signal
+
+        current_norm = current_signal.norm(dim=-1)
+        replay_norm = replay_signal.norm(dim=-1)
+        current_direction = F.normalize(current_signal, dim=-1, eps=1e-8)
+        replay_direction = F.normalize(replay_signal, dim=-1, eps=1e-8)
+        both = (current_norm > 0) & (replay_norm > 0)
+        cosine = (current_direction * replay_direction).sum(dim=-1)
+        cosine = torch.where(both, cosine, torch.zeros_like(cosine))
+        transform = lambda value: torch.log1p(value.clamp_min(0.0)) / 5.0
+        features = torch.cat(
+            [
+                current_direction,
+                transform(current_norm).unsqueeze(-1),
+                replay_direction,
+                transform(replay_norm).unsqueeze(-1),
+                cosine.unsqueeze(-1),
+                replay_nonzero_ratio.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        features = features * active_mask.unsqueeze(-1).to(features.dtype)
+    return MeanGradientEvidence(
+        features=features,
+        signal=signal,
+        current_signal=current_signal,
+        replay_signal=replay_signal,
+    )
+
+
+def select_current_and_recent_replay_gradients(
+    gradients: torch.Tensor,
+    replay_views: int,
+) -> torch.Tensor:
+    """Select the current view and a causal suffix from a joint gradient probe."""
+    if gradients.ndim < 2 or gradients.shape[1] < 1:
+        raise ValueError(
+            "Gradient probes must have a non-empty view dimension at index 1, "
+            f"got {tuple(gradients.shape)}."
+        )
+    replay_views = int(replay_views)
+    if replay_views < -1:
+        raise ValueError(
+            "replay_views must be -1, 0, or positive; "
+            f"got {replay_views}."
+        )
+    available = gradients.shape[1] - 1
+    selected = available if replay_views == -1 else min(replay_views, available)
+    if selected == available:
+        return gradients
+    if selected == 0:
+        return gradients[:, :1]
+    return torch.cat((gradients[:, :1], gradients[:, -selected:]), dim=1)
+
+
+def build_provisional_gaussians(
+    history: Gaussians,
+    current: Gaussians,
+    current_opacity_weight: torch.Tensor,
+    current_mask: torch.Tensor,
+) -> tuple[Gaussians, torch.Tensor]:
+    """Compose a detached old+new map while retaining dense new-anchor indexing."""
+    batch, current_count = current.opacities.shape
+    if history.opacities.shape[0] != batch:
+        raise ValueError("Historical and current Gaussians must share a batch size.")
+    weight = current_opacity_weight.reshape(batch, current_count).detach().float()
+    mask = current_mask.reshape(batch, current_count).detach().bool()
+    current_opacity = current.opacities.detach().float() * weight * mask.float()
+    provisional = Gaussians(
+        means=torch.cat([history.means.detach(), current.means.detach()], dim=1),
+        harmonics=torch.cat(
+            [history.harmonics.detach(), current.harmonics.detach()], dim=1
+        ),
+        opacities=torch.cat(
+            [history.opacities.detach(), current_opacity], dim=1
+        ),
+        scales=torch.cat([history.scales.detach(), current.scales.detach()], dim=1),
+        rotations=torch.cat(
+            [history.rotations.detach(), current.rotations.detach()], dim=1
+        ),
+    )
+    history_active = history.opacities.detach() > 0
+    active_mask = torch.cat([history_active, mask & (weight > 0)], dim=1)
+    return provisional, active_mask
+
+
+def _opacity_gradient_update_stats(
+    features: torch.Tensor | None,
+    signal: torch.Tensor | None,
+    delta_opacity_logit: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    if features is None or signal is None:
+        zero = delta_opacity_logit.new_zeros(())
+        return {key: zero for key in OPACITY_GRADIENT_STAT_KEYS}
+    if features.shape[-1] != OPACITY_GRADIENT_FEATURE_DIM:
+        raise ValueError(
+            "Packed opacity-gradient features must have 8 channels, got "
+            f"{tuple(features.shape)}."
+        )
+    if features.shape[0] == 0:
+        zero = features.new_zeros(())
+        return {key: zero for key in OPACITY_GRADIENT_STAT_KEYS}
+    signal = signal.float()
+    delta = delta_opacity_logit.float()
+    nonzero = signal != 0
+    nonzero_count = nonzero.float().sum().clamp_min(1.0)
+    return {
+        "gradient_current_positive_mean": features[:, 0].float().mean(),
+        "gradient_current_negative_mean": features[:, 1].float().mean(),
+        "gradient_current_nonzero_ratio": features[:, 2].float().mean(),
+        "gradient_replay_positive_mean": features[:, 3].float().mean(),
+        "gradient_replay_negative_mean": features[:, 4].float().mean(),
+        "gradient_replay_nonzero_mean": features[:, 5].float().mean(),
+        "gradient_replay_positive_ratio": features[:, 6].float().mean(),
+        "gradient_replay_negative_ratio": features[:, 7].float().mean(),
+        "gradient_signal_abs_mean": signal.abs().mean(),
+        "gradient_signal_positive_ratio": (
+            ((signal > 0).float() * nonzero.float()).sum() / nonzero_count
+        ),
+        "gradient_update_alignment": (
+            (((signal * delta) < 0).float() * nonzero.float()).sum()
+            / nonzero_count
+        ),
+    }
+
+
+def _mean_gradient_update_stats(
+    signal: torch.Tensor | None,
+    current_signal: torch.Tensor | None,
+    replay_signal: torch.Tensor | None,
+    raw_delta_mean_camera: torch.Tensor,
+    effective_delta_mean_camera: torch.Tensor,
+    update_mask: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    zero = raw_delta_mean_camera.new_zeros(())
+    if signal is None or current_signal is None or replay_signal is None:
+        return {key: zero for key in MEAN_GRADIENT_STAT_KEYS}
+    if signal.shape != raw_delta_mean_camera.shape:
+        raise ValueError(
+            "Mean-gradient signal and residual must have the same shape, got "
+            f"{tuple(signal.shape)} and {tuple(raw_delta_mean_camera.shape)}."
+        )
+    if signal.shape[0] == 0:
+        return {key: zero for key in MEAN_GRADIENT_STAT_KEYS}
+    if update_mask is not None and update_mask.shape != signal.shape[:-1]:
+        raise ValueError(
+            "Mean-gradient update mask must match the packed signal shape, got "
+            f"{tuple(update_mask.shape)} and {tuple(signal.shape[:-1])}."
+        )
+
+    with torch.no_grad():
+        signal = signal.detach().float()
+        current_signal = current_signal.detach().float()
+        replay_signal = replay_signal.detach().float()
+        current_norm = current_signal.norm(dim=-1)
+        replay_norm = replay_signal.norm(dim=-1)
+        signal_norm = signal.norm(dim=-1)
+        both = (current_norm > 0) & (replay_norm > 0)
+        both_count = both.float().sum()
+        cosine = F.cosine_similarity(
+            current_signal, replay_signal, dim=-1, eps=1e-8
+        )
+        cosine_mean = torch.where(
+            both_count > 0,
+            (cosine * both.float()).sum() / both_count.clamp_min(1.0),
+            zero.float(),
+        )
+        conflict_ratio = torch.where(
+            both_count > 0,
+            ((cosine < 0) & both).float().sum() / both_count.clamp_min(1.0),
+            zero.float(),
+        )
+        valid = signal_norm > 0
+        if update_mask is not None:
+            valid = valid & update_mask.detach().bool()
+        valid_count = valid.float().sum()
+
+        def alignment(delta: torch.Tensor) -> torch.Tensor:
+            dot = (signal * delta.detach().float()).sum(dim=-1)
+            return torch.where(
+                valid_count > 0,
+                ((dot < 0) & valid).float().sum()
+                / valid_count.clamp_min(1.0),
+                zero.float(),
+            )
+
+        return {
+            "mean_gradient_current_norm_mean": current_norm.mean(),
+            "mean_gradient_replay_norm_mean": replay_norm.mean(),
+            "mean_gradient_signal_norm_mean": signal_norm.mean(),
+            "mean_gradient_current_replay_cosine": cosine_mean,
+            "mean_gradient_current_replay_conflict_ratio": conflict_ratio,
+            "mean_gradient_raw_update_alignment": alignment(
+                raw_delta_mean_camera
+            ),
+            "mean_gradient_effective_update_alignment": alignment(
+                effective_delta_mean_camera
+            ),
+        }
+
+
+def compute_old_opacity_gradient_effective_stats(
+    evidence: ProjectedGSEvidence,
+    original_opacities: torch.Tensor,
+    updated_opacities: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Measure old-GS gradient alignment from the final opacity-logit change."""
+    zero = original_opacities.new_zeros(())
+    if (
+        evidence.opacity_gradient_signal is None
+        or evidence.opacity_gradient_current_signal is None
+        or evidence.opacity_gradient_replay_signal is None
+        or evidence.flat_candidate_indices.numel() == 0
+    ):
+        return {
+            key: zero for key in OLD_OPACITY_GRADIENT_EFFECTIVE_STAT_KEYS
+        }
+    if original_opacities.shape != updated_opacities.shape:
+        raise ValueError(
+            "Old-GS effective alignment requires matching opacity tensors, got "
+            f"{tuple(original_opacities.shape)} and "
+            f"{tuple(updated_opacities.shape)}."
+        )
+
+    flat_indices = evidence.flat_candidate_indices.long()
+    with torch.no_grad():
+        original = original_opacities.detach().float().reshape(-1).index_select(
+            0, flat_indices
+        )
+        updated = updated_opacities.detach().float().reshape(-1).index_select(
+            0, flat_indices
+        )
+        effective_delta = torch.logit(updated.clamp(1e-5, 1.0 - 1e-5)) - torch.logit(
+            original.clamp(1e-5, 1.0 - 1e-5)
+        )
+        signal = evidence.opacity_gradient_signal.detach().float()
+        current_signal = evidence.opacity_gradient_current_signal.detach().float()
+        replay_signal = evidence.opacity_gradient_replay_signal.detach().float()
+        consistent = evidence.surface_consistent.reshape(-1).index_select(
+            0, flat_indices
+        )
+        front = evidence.old_in_front.reshape(-1).index_select(0, flat_indices)
+
+        def alignment(
+            selected_signal: torch.Tensor,
+            mask: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            valid = selected_signal != 0
+            if mask is not None:
+                valid = valid & mask.bool()
+            count = valid.float().sum()
+            return torch.where(
+                count > 0,
+                (((selected_signal * effective_delta) < 0) & valid)
+                .float()
+                .sum()
+                / count.clamp_min(1.0),
+                zero.float(),
+            )
+
+        both_signals = (current_signal != 0) & (replay_signal != 0)
+        conflict_count = both_signals.float().sum()
+        conflict_ratio = torch.where(
+            conflict_count > 0,
+            (
+                ((current_signal * replay_signal) < 0) & both_signals
+            ).float().sum()
+            / conflict_count.clamp_min(1.0),
+            zero.float(),
+        )
+        return {
+            "gradient_consistent_alignment": alignment(signal, consistent),
+            "gradient_front_alignment": alignment(signal, front),
+            "gradient_effective_alignment": alignment(signal),
+            "gradient_current_effective_alignment": alignment(current_signal),
+            "gradient_replay_effective_alignment": alignment(replay_signal),
+            "gradient_current_replay_conflict_ratio": conflict_ratio,
+        }
 
 
 @torch.no_grad()
@@ -554,6 +1132,8 @@ def build_projected_gaussian_evidence(
     min_projected_radius: float,
     covariance_extent_sigma: float,
     chunk_size: int = 65536,
+    opacity_gradient_evidence: OpacityGradientEvidence | None = None,
+    mean_gradient_evidence: MeanGradientEvidence | None = None,
 ) -> ProjectedGSEvidence:
     """Build packed descriptors for revisable historical Gaussians."""
     b, n = state.gaussians.means.shape[:2]
@@ -575,6 +1155,74 @@ def build_projected_gaussian_evidence(
     camera_depth = torch.zeros_like(projected_radius)
     packed_descriptors = []
     packed_indices = []
+    packed_gradient_features = []
+    packed_gradient_signals = []
+    packed_gradient_current_signals = []
+    packed_gradient_replay_signals = []
+    packed_mean_gradient_features = []
+    packed_mean_gradient_signals = []
+    packed_mean_gradient_current_signals = []
+    packed_mean_gradient_replay_signals = []
+    has_opacity_gradient_evidence = opacity_gradient_evidence is not None
+    if opacity_gradient_evidence is None:
+        gradient_features = torch.zeros(
+            (b, n, OPACITY_GRADIENT_FEATURE_DIM),
+            device=device,
+            dtype=torch.float32,
+        )
+        gradient_signal = torch.zeros((b, n), device=device, dtype=torch.float32)
+        gradient_current_signal = torch.zeros_like(gradient_signal)
+        gradient_replay_signal = torch.zeros_like(gradient_signal)
+    else:
+        gradient_features = opacity_gradient_evidence.features
+        gradient_signal = opacity_gradient_evidence.signal
+        gradient_current_signal = opacity_gradient_evidence.current_signal
+        gradient_replay_signal = opacity_gradient_evidence.replay_signal
+        if gradient_features.shape != (b, n, OPACITY_GRADIENT_FEATURE_DIM):
+            raise ValueError(
+                "Historical opacity-gradient features must be [B,N,8], got "
+                f"{tuple(gradient_features.shape)}."
+            )
+        if gradient_signal.shape != (b, n):
+            raise ValueError(
+                "Historical opacity-gradient signal must be [B,N], got "
+                f"{tuple(gradient_signal.shape)}."
+            )
+        if gradient_current_signal.shape != (b, n):
+            raise ValueError(
+                "Historical current opacity-gradient signal must be [B,N], got "
+                f"{tuple(gradient_current_signal.shape)}."
+            )
+        if gradient_replay_signal.shape != (b, n):
+            raise ValueError(
+                "Historical replay opacity-gradient signal must be [B,N], got "
+                f"{tuple(gradient_replay_signal.shape)}."
+            )
+    if mean_gradient_evidence is None:
+        mean_gradient_features = None
+        mean_gradient_signal = None
+        mean_gradient_current_signal = None
+        mean_gradient_replay_signal = None
+    else:
+        mean_gradient_features = mean_gradient_evidence.features
+        mean_gradient_signal = mean_gradient_evidence.signal
+        mean_gradient_current_signal = mean_gradient_evidence.current_signal
+        mean_gradient_replay_signal = mean_gradient_evidence.replay_signal
+        if mean_gradient_features.shape != (b, n, MEAN_GRADIENT_FEATURE_DIM):
+            raise ValueError(
+                "Historical mean-gradient features must be [B,N,10], got "
+                f"{tuple(mean_gradient_features.shape)}."
+            )
+        for name, value in (
+            ("combined", mean_gradient_signal),
+            ("current", mean_gradient_current_signal),
+            ("replay", mean_gradient_replay_signal),
+        ):
+            if value.shape != (b, n, 3):
+                raise ValueError(
+                    f"Historical {name} mean-gradient signal must be [B,N,3], "
+                    f"got {tuple(value.shape)}."
+                )
 
     with torch.no_grad():
         world_to_camera = torch.linalg.inv(camera_to_world.detach().float())
@@ -808,6 +1456,36 @@ def build_projected_gaussian_evidence(
         packed_descriptors.append(
             descriptor_chunk.reshape(-1, expected_dim)[flat_chunk_mask]
         )
+        packed_gradient_features.append(
+            gradient_features[:, start:end]
+            .reshape(-1, OPACITY_GRADIENT_FEATURE_DIM)[flat_chunk_mask]
+        )
+        packed_gradient_signals.append(
+            gradient_signal[:, start:end].reshape(-1)[flat_chunk_mask]
+        )
+        packed_gradient_current_signals.append(
+            gradient_current_signal[:, start:end].reshape(-1)[flat_chunk_mask]
+        )
+        packed_gradient_replay_signals.append(
+            gradient_replay_signal[:, start:end].reshape(-1)[flat_chunk_mask]
+        )
+        if mean_gradient_features is not None:
+            packed_mean_gradient_features.append(
+                mean_gradient_features[:, start:end]
+                .reshape(-1, MEAN_GRADIENT_FEATURE_DIM)[flat_chunk_mask]
+            )
+            packed_mean_gradient_signals.append(
+                mean_gradient_signal[:, start:end]
+                .reshape(-1, 3)[flat_chunk_mask]
+            )
+            packed_mean_gradient_current_signals.append(
+                mean_gradient_current_signal[:, start:end]
+                .reshape(-1, 3)[flat_chunk_mask]
+            )
+            packed_mean_gradient_replay_signals.append(
+                mean_gradient_replay_signal[:, start:end]
+                .reshape(-1, 3)[flat_chunk_mask]
+            )
         global_indices = (
             torch.arange(b, device=device)[:, None] * n
             + torch.arange(start, end, device=device)[None]
@@ -831,6 +1509,468 @@ def build_projected_gaussian_evidence(
         projected_radius=projected_radius,
         relative_depth=relative_depth.detach(),
         camera_depth=camera_depth,
+        opacity_gradient_features=(
+            torch.cat(packed_gradient_features, dim=0).to(current_feature.dtype)
+            if has_opacity_gradient_evidence
+            else None
+        ),
+        opacity_gradient_signal=(
+            torch.cat(packed_gradient_signals, dim=0)
+            if has_opacity_gradient_evidence
+            else None
+        ),
+        opacity_gradient_current_signal=(
+            torch.cat(packed_gradient_current_signals, dim=0)
+            if has_opacity_gradient_evidence
+            else None
+        ),
+        opacity_gradient_replay_signal=(
+            torch.cat(packed_gradient_replay_signals, dim=0)
+            if has_opacity_gradient_evidence
+            else None
+        ),
+        mean_gradient_features=(
+            torch.cat(packed_mean_gradient_features, dim=0).to(
+                current_feature.dtype
+            )
+            if packed_mean_gradient_features
+            else None
+        ),
+        mean_gradient_signal=(
+            torch.cat(packed_mean_gradient_signals, dim=0)
+            if packed_mean_gradient_signals
+            else None
+        ),
+        mean_gradient_current_signal=(
+            torch.cat(packed_mean_gradient_current_signals, dim=0)
+            if packed_mean_gradient_current_signals
+            else None
+        ),
+        mean_gradient_replay_signal=(
+            torch.cat(packed_mean_gradient_replay_signals, dim=0)
+            if packed_mean_gradient_replay_signals
+            else None
+        ),
+    )
+
+
+def build_projected_new_gaussian_evidence(
+    current: Gaussians,
+    append_mask: torch.Tensor,
+    current_feature: torch.Tensor,
+    current_rgb: torch.Tensor,
+    current_depth: torch.Tensor,
+    current_depth_confidence: torch.Tensor,
+    old_rgb: torch.Tensor,
+    old_depth: torch.Tensor,
+    old_alpha: torch.Tensor,
+    camera_to_world: torch.Tensor,
+    intrinsics: torch.Tensor,
+    alpha_threshold: float,
+    depth_relative_tolerance: float,
+    covariance_extent_sigma: float,
+    opacity_gradient_evidence: OpacityGradientEvidence | None = None,
+    mean_gradient_evidence: MeanGradientEvidence | None = None,
+) -> ProjectedNewGSEvidence:
+    """Pack append-selected DPT anchors for the shared pointwise decoder."""
+    b, n = current.means.shape[:2]
+    h, w = current_depth.shape[-2:]
+    if n != h * w:
+        raise RuntimeError(
+            "Projected new-GS evidence expects one anchor per image pixel: "
+            f"gaussians={n}, image_shape={(h, w)}."
+        )
+    if current_depth.shape[:2] != (b, 1):
+        raise ValueError(
+            "Projected new-GS evidence expects current_depth [B,1,H,W], got "
+            f"{tuple(current_depth.shape)}."
+        )
+    if append_mask.shape == (b, h, w):
+        append_mask = append_mask.unsqueeze(1)
+    elif append_mask.shape == (b, n):
+        append_mask = append_mask.reshape(b, 1, h, w)
+    if append_mask.shape != (b, 1, h, w):
+        raise ValueError(
+            "Projected new-GS append mask must be [B,1,H,W], [B,H,W], or "
+            f"[B,H*W], got {tuple(append_mask.shape)}."
+        )
+
+    def resize_image(value: torch.Tensor, mode: str) -> torch.Tensor:
+        if value.shape[-2:] == (h, w):
+            return value
+        kwargs = {"size": (h, w), "mode": mode}
+        if mode != "nearest":
+            kwargs["align_corners"] = False
+        return F.interpolate(value.float(), **kwargs).to(value.dtype)
+
+    old_rgb = resize_image(old_rgb, "bilinear")
+    old_depth = resize_image(old_depth, "bilinear")
+    old_alpha = resize_image(old_alpha, "bilinear")
+    current_depth_confidence = resize_image(
+        current_depth_confidence, "bilinear"
+    )
+
+    candidate_mask = append_mask[:, 0].bool()
+    flat_candidate_indices = torch.nonzero(
+        candidate_mask.reshape(-1), as_tuple=False
+    ).squeeze(1)
+    candidate_count = flat_candidate_indices.numel()
+    feature_dim = current_feature.shape[1]
+    expected_dim = feature_dim + PROJECTED_GS_STATE_DIM
+    device = current.means.device
+    has_opacity_gradient_evidence = opacity_gradient_evidence is not None
+    if opacity_gradient_evidence is None:
+        gradient_features = torch.zeros(
+            (b, n, OPACITY_GRADIENT_FEATURE_DIM),
+            device=device,
+            dtype=torch.float32,
+        )
+        gradient_signal = torch.zeros((b, n), device=device, dtype=torch.float32)
+        gradient_current_signal = torch.zeros_like(gradient_signal)
+        gradient_replay_signal = torch.zeros_like(gradient_signal)
+    else:
+        gradient_features = opacity_gradient_evidence.features
+        gradient_signal = opacity_gradient_evidence.signal
+        gradient_current_signal = opacity_gradient_evidence.current_signal
+        gradient_replay_signal = opacity_gradient_evidence.replay_signal
+        if gradient_features.shape != (b, n, OPACITY_GRADIENT_FEATURE_DIM):
+            raise ValueError(
+                "New-GS opacity-gradient features must be [B,N,8], got "
+                f"{tuple(gradient_features.shape)}."
+            )
+        if gradient_signal.shape != (b, n):
+            raise ValueError(
+                "New-GS opacity-gradient signal must be [B,N], got "
+                f"{tuple(gradient_signal.shape)}."
+            )
+        if gradient_current_signal.shape != (b, n):
+            raise ValueError(
+                "New-GS current opacity-gradient signal must be [B,N], got "
+                f"{tuple(gradient_current_signal.shape)}."
+            )
+        if gradient_replay_signal.shape != (b, n):
+            raise ValueError(
+                "New-GS replay opacity-gradient signal must be [B,N], got "
+                f"{tuple(gradient_replay_signal.shape)}."
+            )
+    if mean_gradient_evidence is None:
+        mean_gradient_features = None
+        mean_gradient_signal = None
+        mean_gradient_current_signal = None
+        mean_gradient_replay_signal = None
+    else:
+        mean_gradient_features = mean_gradient_evidence.features
+        mean_gradient_signal = mean_gradient_evidence.signal
+        mean_gradient_current_signal = mean_gradient_evidence.current_signal
+        mean_gradient_replay_signal = mean_gradient_evidence.replay_signal
+        if mean_gradient_features.shape != (b, n, MEAN_GRADIENT_FEATURE_DIM):
+            raise ValueError(
+                "New-GS mean-gradient features must be [B,N,10], got "
+                f"{tuple(mean_gradient_features.shape)}."
+            )
+        for name, value in (
+            ("combined", mean_gradient_signal),
+            ("current", mean_gradient_current_signal),
+            ("replay", mean_gradient_replay_signal),
+        ):
+            if value.shape != (b, n, 3):
+                raise ValueError(
+                    f"New-GS {name} mean-gradient signal must be [B,N,3], "
+                    f"got {tuple(value.shape)}."
+                )
+
+    if candidate_count:
+        batch_indices = torch.div(
+            flat_candidate_indices, n, rounding_mode="floor"
+        )
+        local_indices = flat_candidate_indices.remainder(n)
+        pixel_y = torch.div(local_indices, w, rounding_mode="floor")
+        pixel_x = local_indices.remainder(w)
+        feature_chunks = []
+        for batch_idx in range(b):
+            selected = batch_indices == batch_idx
+            if not bool(selected.any()):
+                continue
+            x = pixel_x[selected].to(torch.float32)
+            y = pixel_y[selected].to(torch.float32)
+            grid = torch.stack(
+                [
+                    2.0 * x / max(w - 1, 1) - 1.0,
+                    2.0 * y / max(h - 1, 1) - 1.0,
+                ],
+                dim=-1,
+            ).to(current_feature.dtype)
+            feature_chunks.append(
+                _sample_at_projected_centers(
+                    current_feature[batch_idx : batch_idx + 1],
+                    grid.unsqueeze(0),
+                )[0]
+            )
+        sampled_feature = torch.cat(feature_chunks, dim=0)
+    else:
+        batch_indices = flat_candidate_indices
+        sampled_feature = current_feature.new_empty((0, feature_dim))
+
+    def select_image(value: torch.Tensor) -> torch.Tensor:
+        channels = value.shape[1]
+        flat = value.permute(0, 2, 3, 1).reshape(b * n, channels)
+        return flat.index_select(0, flat_candidate_indices)
+
+    selected_means = current.means.reshape(b * n, 3).index_select(
+        0, flat_candidate_indices
+    )
+    selected_scales = current.scales.reshape(b * n, 3).index_select(
+        0, flat_candidate_indices
+    )
+    selected_rotations = current.rotations.reshape(b * n, 4).index_select(
+        0, flat_candidate_indices
+    )
+    harmonics_shape = current.harmonics.shape
+    selected_harmonics = current.harmonics.reshape(
+        b * n, *harmonics_shape[2:]
+    ).index_select(0, flat_candidate_indices)
+    selected_opacity = current.opacities.reshape(-1).index_select(
+        0, flat_candidate_indices
+    )
+
+    # Evidence geometry is a conditioning signal, not a camera objective.
+    # Detaching here also avoids the ill-conditioned inverse gradient from a
+    # newly initialized/predicted camera entering the camera head.
+    with torch.autocast(device_type=device.type, enabled=False):
+        world_to_camera = torch.linalg.inv(camera_to_world.detach().float())
+        selected_w2c = world_to_camera.index_select(0, batch_indices)
+        ones = torch.ones_like(selected_means[..., :1], dtype=torch.float32)
+        camera_points = torch.bmm(
+            selected_w2c,
+            torch.cat([selected_means.float(), ones], dim=-1).unsqueeze(-1),
+        ).squeeze(-1)[..., :3]
+        z = camera_points[..., 2].clamp_min(1e-6)
+
+        selected_rotation_w2c = selected_w2c[:, :3, :3]
+        covariance_world = build_covariance(
+            selected_scales.float().clamp_min(1e-8),
+            selected_rotations.float(),
+        )
+        covariance_camera = (
+            selected_rotation_w2c
+            @ covariance_world
+            @ selected_rotation_w2c.transpose(-1, -2)
+        )
+        fx = (
+            intrinsics[:, 0, 0]
+            .detach()
+            .float()
+            .index_select(0, batch_indices)
+            * w
+        )
+        fy = (
+            intrinsics[:, 1, 1]
+            .detach()
+            .float()
+            .index_select(0, batch_indices)
+            * h
+        )
+        jacobian = torch.zeros(
+            (candidate_count, 2, 3), device=device, dtype=torch.float32
+        )
+        jacobian[:, 0, 0] = fx / z
+        jacobian[:, 0, 2] = -fx * camera_points[:, 0] / z.square()
+        jacobian[:, 1, 1] = fy / z
+        jacobian[:, 1, 2] = -fy * camera_points[:, 1] / z.square()
+        covariance_2d = (
+            jacobian @ covariance_camera @ jacobian.transpose(-1, -2)
+        )
+        cov_xx = covariance_2d[:, 0, 0].clamp_min(0.0)
+        cov_xy = covariance_2d[:, 0, 1]
+        cov_yy = covariance_2d[:, 1, 1].clamp_min(0.0)
+        max_eigenvalue = 0.5 * (
+            cov_xx
+            + cov_yy
+            + torch.sqrt(
+                (cov_xx - cov_yy).square() + 4.0 * cov_xy.square()
+            )
+        ).clamp_min(0.0)
+        sigma = max(float(covariance_extent_sigma), 0.0)
+        projected_radius = sigma * torch.sqrt(max_eigenvalue + 1e-12)
+        depth_extent = sigma * torch.sqrt(
+            covariance_camera[:, 2, 2].clamp_min(0.0) + 1e-12
+        )
+
+    sampled_current_rgb = select_image(current_rgb.float())
+    sampled_current_depth = select_image(current_depth.float()).squeeze(-1)
+    sampled_confidence = select_image(
+        current_depth_confidence.float()
+    ).squeeze(-1)
+    sampled_old_rgb = select_image(old_rgb.float())
+    sampled_old_depth = select_image(old_depth.float()).squeeze(-1)
+    sampled_old_alpha = select_image(old_alpha.float()).squeeze(-1)
+    current_depth_safe = sampled_current_depth.clamp_min(1e-4)
+    old_depth_safe = sampled_old_depth.clamp_min(1e-4)
+
+    with torch.no_grad():
+        history_valid_selected = (
+            torch.isfinite(sampled_old_depth.detach())
+            & (sampled_old_depth.detach() > 1e-5)
+            & (sampled_old_alpha.detach() >= float(alpha_threshold))
+        )
+        tolerance = (
+            float(depth_relative_tolerance) * current_depth_safe.detach()
+        )
+        history_consistent_selected = history_valid_selected & (
+            (sampled_old_depth.detach() - z.detach()).abs()
+            <= tolerance + depth_extent.detach()
+        )
+        history_in_front_selected = history_valid_selected & (
+            sampled_old_depth.detach() + depth_extent.detach()
+            < z.detach() - tolerance
+        )
+
+    if harmonics_shape[-1] == 3:
+        sh_coefficient_count = harmonics_shape[-2]
+        harmonics_for_eval = selected_harmonics.float().transpose(-1, -2)
+    elif harmonics_shape[-2] == 3:
+        sh_coefficient_count = harmonics_shape[-1]
+        harmonics_for_eval = selected_harmonics.float()
+    else:
+        raise RuntimeError(
+            "New Gaussian SH must have an RGB dimension of size 3; "
+            f"got shape={tuple(harmonics_shape)}."
+        )
+    sh_degree = int(sh_coefficient_count**0.5) - 1
+    if (sh_degree + 1) ** 2 != sh_coefficient_count or not 0 <= sh_degree <= 4:
+        raise RuntimeError(
+            "New Gaussian SH coefficient count must be a supported square "
+            f"number, got {sh_coefficient_count}."
+        )
+    camera_centers = camera_to_world.detach().float()[:, :3, 3].index_select(
+        0, batch_indices
+    )
+    world_direction = F.normalize(
+        selected_means.float() - camera_centers, dim=-1, eps=1e-8
+    )
+    sh_color = (
+        sh_utils.eval_sh(sh_degree, harmonics_for_eval, world_direction) + 0.5
+    ).clamp(0.0, 1.0)
+    relative_depth = (z - current_depth_safe) / current_depth_safe
+    relative_old_depth = torch.where(
+        history_valid_selected,
+        (z - old_depth_safe) / old_depth_safe,
+        torch.zeros_like(z),
+    )
+    descriptor = torch.cat(
+        [
+            sampled_feature.float(),
+            sampled_current_rgb,
+            sampled_old_rgb,
+            sampled_current_rgb - sampled_old_rgb,
+            current_depth_safe.log().unsqueeze(-1).clamp(-8.0, 8.0),
+            z.log().unsqueeze(-1).clamp(-8.0, 8.0),
+            relative_depth.unsqueeze(-1).clamp(-2.0, 2.0),
+            relative_old_depth.unsqueeze(-1).clamp(-2.0, 2.0),
+            sampled_confidence.unsqueeze(-1).clamp(0.0, 1.0),
+            sampled_old_alpha.unsqueeze(-1).clamp(0.0, 1.0),
+            selected_opacity.float().unsqueeze(-1),
+            selected_scales.float().clamp_min(1e-8).log().clamp(-12.0, 2.0),
+            F.normalize(camera_points, dim=-1, eps=1e-8),
+            sh_color,
+            history_valid_selected.float().unsqueeze(-1),
+            projected_radius.log1p().unsqueeze(-1),
+            (depth_extent / z).unsqueeze(-1).clamp(0.0, 2.0),
+            history_consistent_selected.float().unsqueeze(-1),
+            history_in_front_selected.float().unsqueeze(-1),
+        ],
+        dim=-1,
+    )
+    descriptor = torch.nan_to_num(
+        descriptor, nan=0.0, posinf=8.0, neginf=-8.0
+    ).to(current_feature.dtype)
+    if descriptor.shape != (candidate_count, expected_dim):
+        raise RuntimeError(
+            "Projected new-GS descriptor shape mismatch: "
+            f"got={tuple(descriptor.shape)}, "
+            f"expected={(candidate_count, expected_dim)}."
+        )
+
+    history_valid = torch.zeros((b, n), device=device, dtype=torch.bool)
+    history_consistent = torch.zeros_like(history_valid)
+    history_in_front = torch.zeros_like(history_valid)
+    camera_depth = torch.zeros((b, n), device=device, dtype=torch.float32)
+    history_valid.reshape(-1).index_copy_(
+        0, flat_candidate_indices, history_valid_selected
+    )
+    history_consistent.reshape(-1).index_copy_(
+        0, flat_candidate_indices, history_consistent_selected
+    )
+    history_in_front.reshape(-1).index_copy_(
+        0, flat_candidate_indices, history_in_front_selected
+    )
+    camera_depth.reshape(-1).index_copy_(
+        0,
+        flat_candidate_indices,
+        z.detach().to(camera_depth.dtype),
+    )
+    return ProjectedNewGSEvidence(
+        descriptor=descriptor,
+        flat_candidate_indices=flat_candidate_indices,
+        candidate_mask=candidate_mask.reshape(b, n),
+        history_valid=history_valid,
+        history_consistent=history_consistent,
+        history_in_front=history_in_front,
+        camera_depth=camera_depth,
+        opacity_gradient_features=(
+            gradient_features.reshape(b * n, OPACITY_GRADIENT_FEATURE_DIM)
+            .index_select(0, flat_candidate_indices)
+            .to(current_feature.dtype)
+            if has_opacity_gradient_evidence
+            else None
+        ),
+        opacity_gradient_signal=(
+            gradient_signal.reshape(-1).index_select(0, flat_candidate_indices)
+            if has_opacity_gradient_evidence
+            else None
+        ),
+        opacity_gradient_current_signal=(
+            gradient_current_signal.reshape(-1).index_select(
+                0, flat_candidate_indices
+            )
+            if has_opacity_gradient_evidence
+            else None
+        ),
+        opacity_gradient_replay_signal=(
+            gradient_replay_signal.reshape(-1).index_select(
+                0, flat_candidate_indices
+            )
+            if has_opacity_gradient_evidence
+            else None
+        ),
+        mean_gradient_features=(
+            mean_gradient_features.reshape(
+                b * n, MEAN_GRADIENT_FEATURE_DIM
+            ).index_select(0, flat_candidate_indices).to(current_feature.dtype)
+            if mean_gradient_features is not None
+            else None
+        ),
+        mean_gradient_signal=(
+            mean_gradient_signal.reshape(b * n, 3).index_select(
+                0, flat_candidate_indices
+            )
+            if mean_gradient_signal is not None
+            else None
+        ),
+        mean_gradient_current_signal=(
+            mean_gradient_current_signal.reshape(b * n, 3).index_select(
+                0, flat_candidate_indices
+            )
+            if mean_gradient_current_signal is not None
+            else None
+        ),
+        mean_gradient_replay_signal=(
+            mean_gradient_replay_signal.reshape(b * n, 3).index_select(
+                0, flat_candidate_indices
+            )
+            if mean_gradient_replay_signal is not None
+            else None
+        ),
     )
 
 
@@ -858,13 +1998,155 @@ class ProjectedGSResidualHead(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(inplace=True),
         )
+        self.opacity_gradient_adapter = nn.Sequential(
+            nn.LayerNorm(OPACITY_GRADIENT_FEATURE_DIM),
+            nn.Linear(OPACITY_GRADIENT_FEATURE_DIM, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.mean_gradient_adapter = nn.Sequential(
+            nn.LayerNorm(MEAN_GRADIENT_FEATURE_DIM),
+            nn.Linear(MEAN_GRADIENT_FEATURE_DIM, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.new_mean_gradient_adapter = nn.Sequential(
+            nn.LayerNorm(MEAN_GRADIENT_FEATURE_DIM),
+            nn.Linear(MEAN_GRADIENT_FEATURE_DIM, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
         self.output_dim = 12 + self.harmonic_dim
         self.output = nn.Linear(hidden_dim, self.output_dim)
+        # Match the historical branch's parameter residuals, excluding only
+        # front-surface decay, which does not apply to newly appended GS.
+        self.new_output_dim = 11 + self.harmonic_dim
+        self.new_output = nn.Linear(hidden_dim, self.new_output_dim)
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
+        nn.init.zeros_(self.new_output.weight)
+        nn.init.zeros_(self.new_output.bias)
+        nn.init.zeros_(self.opacity_gradient_adapter[-1].weight)
+        nn.init.zeros_(self.opacity_gradient_adapter[-1].bias)
+        nn.init.zeros_(self.mean_gradient_adapter[-1].weight)
+        nn.init.zeros_(self.mean_gradient_adapter[-1].bias)
+        nn.init.zeros_(self.new_mean_gradient_adapter[-1].weight)
+        nn.init.zeros_(self.new_mean_gradient_adapter[-1].bias)
         with torch.no_grad():
             self.output.bias[10 + self.harmonic_dim] = -4.0
             self.output.bias[11 + self.harmonic_dim] = 2.0
+            self.new_output.bias[10 + self.harmonic_dim] = 2.0
+
+    def _decode(
+        self,
+        descriptor: torch.Tensor,
+        opacity_gradient_features: torch.Tensor | None,
+        output_head: nn.Linear,
+        mean_gradient_features: torch.Tensor | None = None,
+        mean_gradient_adapter: nn.Module | None = None,
+        inactive_mean_gradient_adapter: nn.Module | None = None,
+        mean_gradient_output_channels: int | None = None,
+    ) -> torch.Tensor:
+        selected = descriptor
+        selected_gradient = opacity_gradient_features
+        if selected_gradient is not None and selected_gradient.shape != (
+            descriptor.shape[0], OPACITY_GRADIENT_FEATURE_DIM
+        ):
+            raise RuntimeError(
+                "Opacity-gradient feature mismatch: "
+                f"got={tuple(selected_gradient.shape)}, "
+                f"expected={(descriptor.shape[0], OPACITY_GRADIENT_FEATURE_DIM)}."
+            )
+        no_candidates = selected.shape[0] == 0
+        selected_mean_gradient = mean_gradient_features
+        if selected_mean_gradient is not None and selected_mean_gradient.shape != (
+            descriptor.shape[0],
+            MEAN_GRADIENT_FEATURE_DIM,
+        ):
+            raise RuntimeError(
+                "Mean-gradient feature mismatch: "
+                f"got={tuple(selected_mean_gradient.shape)}, "
+                f"expected={(descriptor.shape[0], MEAN_GRADIENT_FEATURE_DIM)}."
+            )
+        if selected_mean_gradient is not None and mean_gradient_adapter is None:
+            raise RuntimeError(
+                "Mean-gradient features require a branch-specific adapter."
+            )
+        if mean_gradient_output_channels is not None and not (
+            0 < mean_gradient_output_channels <= output_head.out_features
+        ):
+            raise ValueError(
+                "mean_gradient_output_channels must select a non-empty output "
+                f"prefix, got {mean_gradient_output_channels}."
+            )
+        if no_candidates:
+            # Keep both the shared trunk and selected output head in the DDP
+            # graph for batches where this branch has no append candidates.
+            selected = descriptor.new_zeros((1, self.input_dim))
+            if selected_gradient is not None:
+                selected_gradient = descriptor.new_zeros(
+                    (1, OPACITY_GRADIENT_FEATURE_DIM)
+                )
+            if selected_mean_gradient is not None:
+                selected_mean_gradient = descriptor.new_zeros(
+                    (1, MEAN_GRADIENT_FEATURE_DIM)
+                )
+        selected_outputs = []
+        for start in range(0, selected.shape[0], self.chunk_size):
+            chunk = selected[start : start + self.chunk_size]
+            hidden = self.decoder(chunk)
+            if selected_gradient is not None:
+                gradient_chunk = selected_gradient[
+                    start : start + self.chunk_size
+                ]
+                hidden = hidden + self.opacity_gradient_adapter(gradient_chunk)
+            else:
+                # Keep shared adapter parameters in the DDP graph while fully
+                # bypassing their learned weights and biases for this branch.
+                hidden = hidden + sum(
+                    parameter.sum() * 0.0
+                    for parameter in self.opacity_gradient_adapter.parameters()
+                )
+            mean_gradient_hidden = None
+            if selected_mean_gradient is not None:
+                mean_gradient_hidden = mean_gradient_adapter(
+                    selected_mean_gradient[start : start + self.chunk_size]
+                )
+                if mean_gradient_output_channels is None:
+                    hidden = hidden + mean_gradient_hidden
+            elif mean_gradient_adapter is not None:
+                hidden = hidden + sum(
+                    parameter.sum() * 0.0
+                    for parameter in mean_gradient_adapter.parameters()
+                )
+            if inactive_mean_gradient_adapter is not None:
+                hidden = hidden + sum(
+                    parameter.sum() * 0.0
+                    for parameter in inactive_mean_gradient_adapter.parameters()
+                )
+            chunk_output = output_head(hidden)
+            if (
+                mean_gradient_hidden is not None
+                and mean_gradient_output_channels is not None
+            ):
+                channels = mean_gradient_output_channels
+                mean_gradient_output = F.linear(
+                    mean_gradient_hidden,
+                    output_head.weight[:channels],
+                    bias=None,
+                )
+                chunk_output = torch.cat(
+                    (
+                        chunk_output[:, :channels] + mean_gradient_output,
+                        chunk_output[:, channels:],
+                    ),
+                    dim=-1,
+                )
+            selected_outputs.append(chunk_output)
+        selected_output = torch.cat(selected_outputs, dim=0)
+        if no_candidates:
+            selected_output = selected_output[:0] + selected_output.sum() * 0.0
+        return selected_output
 
     def forward(self, evidence: ProjectedGSEvidence) -> ProjectedGSResidualPrediction:
         descriptor = evidence.descriptor
@@ -880,19 +2162,14 @@ class ProjectedGSResidualHead(nn.Module):
                 "Projected GS packed evidence mismatch: "
                 f"descriptors={descriptor.shape[0]}, indices={candidate_indices.numel()}."
             )
-        selected = descriptor
-        no_candidates = selected.shape[0] == 0
-        if no_candidates:
-            # Keep the shared head in the DDP graph even for views with no
-            # eligible old GS, while preserving an exact identity update.
-            selected = descriptor.new_zeros((1, self.input_dim))
-        selected_outputs = []
-        for start in range(0, selected.shape[0], self.chunk_size):
-            chunk = selected[start : start + self.chunk_size]
-            selected_outputs.append(self.output(self.decoder(chunk)))
-        selected_output = torch.cat(selected_outputs, dim=0)
-        if no_candidates:
-            selected_output = selected_output[:0] + selected_output.sum() * 0.0
+        selected_output = self._decode(
+            descriptor,
+            evidence.opacity_gradient_features,
+            self.output,
+            mean_gradient_features=evidence.mean_gradient_features,
+            mean_gradient_adapter=self.mean_gradient_adapter,
+            inactive_mean_gradient_adapter=self.new_mean_gradient_adapter,
+        )
         harmonic_end = 10 + self.harmonic_dim
         return ProjectedGSResidualPrediction(
             delta_mean_camera=selected_output[:, 0:3],
@@ -903,6 +2180,261 @@ class ProjectedGSResidualHead(nn.Module):
             front_decay_logit=selected_output[:, harmonic_end],
             update_gate_logit=selected_output[:, harmonic_end + 1],
         )
+
+    def forward_new(
+        self,
+        evidence: ProjectedNewGSEvidence,
+    ) -> ProjectedNewGSResidualPrediction:
+        descriptor = evidence.descriptor
+        if descriptor.ndim != 2 or descriptor.shape[-1] != self.input_dim:
+            raise RuntimeError(
+                "Projected new-GS head input mismatch: "
+                f"got={tuple(descriptor.shape)}, "
+                f"expected=[candidates,{self.input_dim}]."
+            )
+        candidate_indices = evidence.flat_candidate_indices
+        if descriptor.shape[0] != candidate_indices.numel():
+            raise RuntimeError(
+                "Projected new-GS packed evidence mismatch: "
+                f"descriptors={descriptor.shape[0]}, "
+                f"indices={candidate_indices.numel()}."
+            )
+        selected_output = self._decode(
+            descriptor,
+            evidence.opacity_gradient_features,
+            self.new_output,
+            mean_gradient_features=evidence.mean_gradient_features,
+            mean_gradient_adapter=self.new_mean_gradient_adapter,
+            inactive_mean_gradient_adapter=self.mean_gradient_adapter,
+            mean_gradient_output_channels=3,
+        )
+        harmonic_end = 10 + self.harmonic_dim
+        return ProjectedNewGSResidualPrediction(
+            delta_mean_camera=selected_output[:, 0:3],
+            delta_rotation=selected_output[:, 3:6],
+            delta_log_scale=selected_output[:, 6:9],
+            delta_opacity_logit=selected_output[:, 9],
+            delta_harmonics=selected_output[:, 10:harmonic_end],
+            update_gate_logit=selected_output[:, harmonic_end],
+        )
+
+
+def apply_projected_new_gaussian_residual(
+    current: Gaussians,
+    evidence: ProjectedNewGSEvidence,
+    prediction: ProjectedNewGSResidualPrediction,
+    camera_to_world: torch.Tensor,
+    opacity_logit_scale: float = 1.0,
+    mean_update_mode: str = "relative_depth",
+    raw_scale_residual: bool = False,
+    raw_opacity_residual: bool = False,
+    raw_rotation_residual: bool = False,
+    raw_harmonics_residual: bool = False,
+    mean_relative_scale: float = 0.02,
+    rotation_scale: float = 0.05,
+    harmonics_scale: float = 0.10,
+) -> tuple[Gaussians, dict[str, torch.Tensor]]:
+    """Refine append-selected anchors with the historical-GS parameterization."""
+    b, n = current.means.shape[:2]
+    mean_update_mode = str(mean_update_mode).lower()
+    if mean_update_mode not in {"absolute", "relative_depth"}:
+        raise ValueError(
+            "mean_update_mode must be absolute or relative_depth; "
+            f"got {mean_update_mode!r}."
+        )
+    flat_indices = evidence.flat_candidate_indices.long()
+    candidate_count_int = flat_indices.numel()
+    harmonic_dim = current.harmonics.shape[-2] * current.harmonics.shape[-1]
+    expected_vectors = (
+        ("delta_mean_camera", prediction.delta_mean_camera, 3),
+        ("delta_rotation", prediction.delta_rotation, 3),
+        ("delta_log_scale", prediction.delta_log_scale, 3),
+        ("delta_harmonics", prediction.delta_harmonics, harmonic_dim),
+    )
+    for name, value, channels in expected_vectors:
+        if value.shape != (candidate_count_int, channels):
+            raise RuntimeError(
+                f"Projected new-GS {name} shape mismatch: "
+                f"got={tuple(value.shape)}, "
+                f"expected={(candidate_count_int, channels)}."
+            )
+    for name, value in (
+        ("delta_opacity_logit", prediction.delta_opacity_logit),
+        ("update_gate_logit", prediction.update_gate_logit),
+    ):
+        if value.shape != (candidate_count_int,):
+            raise RuntimeError(
+                f"Projected new-GS {name} shape mismatch: "
+                f"got={tuple(value.shape)}, "
+                f"expected={(candidate_count_int,)}."
+            )
+    if candidate_count_int and (
+        int(flat_indices.min()) < 0 or int(flat_indices.max()) >= b * n
+    ):
+        raise RuntimeError("Projected new-GS candidate indices are out of range.")
+
+    gate = prediction.update_gate_logit.float().sigmoid()
+    batch_indices = torch.div(flat_indices, n, rounding_mode="floor")
+    means_flat = current.means.reshape(b * n, 3)
+    selected_means = means_flat.index_select(0, flat_indices).float()
+    raw_mean = prediction.delta_mean_camera.float()
+    if mean_update_mode == "relative_depth":
+        camera_depth = (
+            evidence.camera_depth.reshape(-1)
+            .index_select(0, flat_indices)
+            .float()
+            .clamp_min(1e-4)
+        )
+        delta_mean_camera = (
+            raw_mean.tanh()
+            * min(max(float(mean_relative_scale), 0.0), 0.999)
+            * camera_depth.unsqueeze(-1)
+        )
+    else:
+        delta_mean_camera = raw_mean
+    delta_mean_camera = delta_mean_camera * gate.unsqueeze(-1)
+    camera_rotation = camera_to_world.detach().float()[batch_indices, :3, :3]
+    delta_mean_world = torch.bmm(
+        delta_mean_camera.unsqueeze(1), camera_rotation.transpose(1, 2)
+    ).squeeze(1)
+    updated_means_selected = selected_means + delta_mean_world
+
+    raw_rotation = prediction.delta_rotation.float()
+    delta_rotation = (
+        raw_rotation
+        if raw_rotation_residual
+        else raw_rotation.tanh()
+        * min(max(float(rotation_scale), 0.0), 0.999)
+    )
+    delta_rotation = delta_rotation * gate.unsqueeze(-1)
+    rotations_flat = current.rotations.reshape(b * n, 4)
+    selected_rotations = rotations_flat.index_select(0, flat_indices).float()
+    updated_rotations_selected = F.normalize(
+        _quat_multiply_xyzw(
+            _axis_angle_to_quaternion_xyzw(delta_rotation),
+            selected_rotations,
+        ),
+        dim=-1,
+        eps=1e-8,
+    )
+
+    raw_scale = prediction.delta_log_scale.float()
+    delta_log_scale = (
+        raw_scale if raw_scale_residual else raw_scale.tanh()
+    ) * gate.unsqueeze(-1)
+    scales_flat = current.scales.reshape(b * n, 3)
+    selected_scales = scales_flat.index_select(0, flat_indices).float()
+    updated_scales_selected = (
+        selected_scales * torch.exp(delta_log_scale.clamp(-2.0, 2.0))
+    ).clamp(1e-6, 0.1)
+
+    raw_opacity = prediction.delta_opacity_logit.float()
+    delta_opacity = (
+        raw_opacity if raw_opacity_residual else raw_opacity.tanh()
+    )
+    delta_opacity = (
+        delta_opacity * max(0.0, float(opacity_logit_scale)) * gate
+    )
+    opacities_flat = current.opacities.reshape(-1)
+    selected_opacities = opacities_flat.index_select(0, flat_indices).float()
+    updated_opacities_selected = torch.sigmoid(
+        torch.logit(selected_opacities.clamp(1e-5, 1.0 - 1e-5))
+        + delta_opacity
+    )
+
+    raw_harmonics = prediction.delta_harmonics.float()
+    delta_harmonics = (
+        raw_harmonics
+        if raw_harmonics_residual
+        else raw_harmonics.tanh()
+        * min(max(float(harmonics_scale), 0.0), 0.999)
+    )
+    delta_harmonics = delta_harmonics * gate.unsqueeze(-1)
+    harmonics_flat = _flatten_harmonics(current.harmonics).reshape(
+        b * n, harmonic_dim
+    )
+    selected_harmonics = harmonics_flat.index_select(0, flat_indices).float()
+    updated_harmonics_selected = selected_harmonics + delta_harmonics
+
+    means = means_flat.index_copy(
+        0, flat_indices, updated_means_selected.to(means_flat.dtype)
+    ).reshape_as(current.means)
+    rotations = rotations_flat.index_copy(
+        0,
+        flat_indices,
+        updated_rotations_selected.to(rotations_flat.dtype),
+    ).reshape_as(current.rotations)
+    scales = scales_flat.index_copy(
+        0, flat_indices, updated_scales_selected.to(scales_flat.dtype)
+    ).reshape_as(current.scales)
+    opacities = opacities_flat.index_copy(
+        0,
+        flat_indices,
+        updated_opacities_selected.to(opacities_flat.dtype),
+    ).reshape_as(current.opacities)
+    harmonics = harmonics_flat.index_copy(
+        0,
+        flat_indices,
+        updated_harmonics_selected.to(harmonics_flat.dtype),
+    ).reshape_as(current.harmonics)
+
+    raw_energy = (
+        raw_mean.square().sum(dim=-1)
+        + raw_rotation.square().sum(dim=-1)
+        + raw_scale.square().sum(dim=-1)
+        + raw_opacity.square()
+        + raw_harmonics.square().mean(dim=-1)
+    )
+    candidate_count = prediction.update_gate_logit.new_tensor(
+        float(candidate_count_int)
+    ).clamp_min(1.0)
+    regularization = raw_energy.sum() / candidate_count
+    mean_shift = (updated_means_selected - selected_means).norm(dim=-1)
+    rotation_shift = delta_rotation.norm(dim=-1)
+    scale_relative_shift = (
+        updated_scales_selected / selected_scales.clamp_min(1e-8) - 1.0
+    ).abs().mean(dim=-1)
+    opacity_shift = (updated_opacities_selected - selected_opacities).abs()
+    harmonics_shift = delta_harmonics.abs().mean(dim=-1)
+    return (
+        Gaussians(
+            means=means,
+            harmonics=harmonics,
+            opacities=opacities,
+            scales=scales,
+            rotations=rotations,
+        ),
+        {
+            "regularization": regularization,
+            "candidate_ratio": evidence.candidate_mask.float().mean(),
+            "gate_mean": gate.sum() / candidate_count,
+            "raw_mean": raw_mean.norm(dim=-1).sum() / candidate_count,
+            "mean_shift_mean": mean_shift.sum() / candidate_count,
+            "raw_rotation": raw_rotation.norm(dim=-1).sum() / candidate_count,
+            "rotation_shift_mean": rotation_shift.sum() / candidate_count,
+            "raw_log_scale": raw_scale.abs().mean(dim=-1).sum()
+            / candidate_count,
+            "scale_relative_shift_mean": scale_relative_shift.sum()
+            / candidate_count,
+            "raw_opacity_logit": raw_opacity.abs().sum() / candidate_count,
+            "opacity_shift_mean": opacity_shift.sum() / candidate_count,
+            "raw_harmonics": raw_harmonics.abs().mean(dim=-1).sum()
+            / candidate_count,
+            "harmonics_shift_mean": harmonics_shift.sum() / candidate_count,
+            **_opacity_gradient_update_stats(
+                evidence.opacity_gradient_features,
+                evidence.opacity_gradient_signal,
+                delta_opacity,
+            ),
+            **_mean_gradient_update_stats(
+                evidence.mean_gradient_signal,
+                evidence.mean_gradient_current_signal,
+                evidence.mean_gradient_replay_signal,
+                raw_mean,
+                delta_mean_camera,
+            ),
+        },
+    )
 
 
 def apply_current_gaussian_residual(
@@ -1921,6 +3453,24 @@ class StreamingGaussianState:
                 front_decay_probability * old_in_front
             ).sum()
             / old_in_front.sum().clamp_min(1.0),
+            **_opacity_gradient_update_stats(
+                evidence.opacity_gradient_features,
+                evidence.opacity_gradient_signal,
+                delta_opacity,
+            ),
+            **_mean_gradient_update_stats(
+                evidence.mean_gradient_signal,
+                evidence.mean_gradient_current_signal,
+                evidence.mean_gradient_replay_signal,
+                raw_mean,
+                delta_mean_camera,
+                update_mask=consistent.bool(),
+            ),
+            **compute_old_opacity_gradient_effective_stats(
+                evidence,
+                self.gaussians.opacities,
+                state.gaussians.opacities,
+            ),
         }
 
     def update_historical(

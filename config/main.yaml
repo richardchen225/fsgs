@@ -27,6 +27,10 @@ test:
   gir_add_gate_prune_threshold: 0.0
   gir_test_top1_confidence_mode: inherit
   gir_test_top1_confidence_floor: 0.25
+  # Opt-in GIR rollout visualization. max_scenes=-1 exports every scene.
+  gir_debug_save_intermediates: false
+  gir_debug_max_scenes: 10
+  gir_debug_view_stride: 1
   
 data_loader:
   # Avoid having to spin up new processes to print out visualizations.
