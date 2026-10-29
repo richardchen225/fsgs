@@ -67,6 +67,7 @@ class VGGT_DPT_GS_Head(DPTHead):
         patch_start_idx: int = 5,
         image_size=None,
         frames_chunk_size: int = 8,
+        predict_depth: bool = True,
     ):
         # H, W = input_info['image_size']
         B, S, _, H, W = imgs.shape
@@ -74,7 +75,12 @@ class VGGT_DPT_GS_Head(DPTHead):
 
         # If frames_chunk_size is not specified or greater than S, process all frames at once
         if frames_chunk_size is None or frames_chunk_size >= S:
-            return self._forward_impl(encoder_tokens, imgs, patch_start_idx)
+            return self._forward_impl(
+                encoder_tokens,
+                imgs,
+                patch_start_idx,
+                predict_depth=predict_depth,
+            )
 
         # Otherwise, process frames in chunks to manage memory usage
         assert frames_chunk_size > 0
@@ -90,15 +96,28 @@ class VGGT_DPT_GS_Head(DPTHead):
 
             # Process batch of frames
             chunk_output, depth, conf, out_tmp = self._forward_impl(
-                encoder_tokens, imgs, patch_start_idx, frames_start_idx, frames_end_idx
+                encoder_tokens,
+                imgs,
+                patch_start_idx,
+                frames_start_idx,
+                frames_end_idx,
+                predict_depth=predict_depth,
             )
             all_preds.append(chunk_output)
-            depth_chunks.append(depth)
-            conf_chunks.append(conf)
+            if depth is not None:
+                depth_chunks.append(depth)
+                conf_chunks.append(conf)
             out_tmp_chunks.append(out_tmp)
             # intermediate_chunks.append(intermediate_feature)
         # Concatenate results along the sequence dimension
-        return torch.cat(all_preds, dim=1), torch.cat(depth_chunks, dim=1), torch.cat(conf_chunks, dim=1), torch.cat(out_tmp_chunks, dim=1)
+        depth = torch.cat(depth_chunks, dim=1) if depth_chunks else None
+        conf = torch.cat(conf_chunks, dim=1) if conf_chunks else None
+        return (
+            torch.cat(all_preds, dim=1),
+            depth,
+            conf,
+            torch.cat(out_tmp_chunks, dim=1),
+        )
 
     def _forward_impl(
         self,
@@ -107,6 +126,7 @@ class VGGT_DPT_GS_Head(DPTHead):
         patch_start_idx: int = 5,
         frames_start_idx: int = None,
         frames_end_idx: int = None,
+        predict_depth: bool = True,
     ):
 
         if frames_start_idx is not None and frames_end_idx is not None:
@@ -151,20 +171,17 @@ class VGGT_DPT_GS_Head(DPTHead):
         if self.pos_embed:
             out = self._apply_pos_embed(out, W, H)
         
-        out1 = self.scratch.output_conv2(out)
-        feat = out1.permute(0, 2, 3, 1)
-        attr = feat[..., 0:1]
-        # print(attr)
-        # This head is trainable in fsgs-main. Bound the log-depth before the
-        # exponential so one outlier cannot create inf and poison every
-        # gradient through the shared DPT norm.
-        preds = torch.exp(attr.clamp(min=-10.0, max=math.log(100.0)))
-        # print(preds)
-        preds = preds.reshape(B, S, *preds.shape[1:])
-        
-        conf = feat[..., 1:2]
-        conf = 1 + torch.exp(conf.clamp(min=-10.0, max=math.log(100.0)))
-        conf = conf.reshape(B, S, *conf.shape[1:])
+        preds = conf = None
+        if predict_depth:
+            out1 = self.scratch.output_conv2(out)
+            feat = out1.permute(0, 2, 3, 1)
+            attr = feat[..., 0:1]
+            preds = torch.exp(attr.clamp(min=-10.0, max=math.log(100.0)))
+            preds = preds.reshape(B, S, *preds.shape[1:])
+
+            conf = feat[..., 1:2]
+            conf = 1 + torch.exp(conf.clamp(min=-10.0, max=math.log(100.0)))
+            conf = conf.reshape(B, S, *conf.shape[1:])
         
         # off = feat[..., 2:]
         # off = off.reshape(B, S, *off.shape[1:])

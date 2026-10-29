@@ -4,12 +4,18 @@ defaults:
 name: anysplat
 mode: ${mode}
 
-# The encoder uses ZipMap features/cameras with the shared DPT and GS heads.
+# Reconstruction features/cameras: zipmap or streamvggt, with shared GS heads.
 reconstruction_backbone: zipmap
+# native: use the selected backbone's pretrained DPT depth head.
+# world_mirror: use the depth output inside the WorldMirror GS feature head.
+depth_head_source: native
+streamvggt_weights_path: weights/pre_svggt.safetensors
 depth_teacher: ${oc.select:loss.depth.teacher,dav3}
 # Experiments with direct pose/FOV supervision can detach rasterizer geometry
 # from the camera head when camera gradients are unstable.
 detach_predicted_camera_for_geometry: false
+# Share the first input frame's predicted intrinsics across the sequence.
+share_first_frame_intrinsics: false
 
 opacity_mapping:
   initial: 0.0

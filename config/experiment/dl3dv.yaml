@@ -14,10 +14,14 @@ model:
   encoder:
     mode: ${mode}
     reconstruction_backbone: zipmap
+    depth_head_source: native  # native | world_mirror
+    streamvggt_weights_path: null
     zipmap_weights_path: weights/pre_zipmap.pt
     # Keep photometric gradients to the camera head. The decoder uses rigid
     # pose inversion and the configured 0.01 near plane for stable backprop.
     detach_predicted_camera_for_geometry: false
+    # Use the first source frame's predicted intrinsics for every view.
+    share_first_frame_intrinsics: true
     depth_refine_downsample_factor: 4
     depth_refine_enabled: false
     gir_enabled: true
@@ -46,8 +50,16 @@ model:
     gir_old_opacity_gradient_enabled: true
     gir_new_opacity_gradient_enabled: true
     gir_opacity_gradient_front_decay_gate_enabled: true
-    # Keep mean-gradient conditioning disabled in this experiment.
-    gir_mean_gradient_enabled: false
+    # Match overfit old-GS camera-space mean-gradient conditioning. Use the
+    # current frame plus every causally available replay frame.
+    gir_mean_gradient_enabled: true
+    gir_mean_gradient_scale: 1.0
+    gir_mean_gradient_clip: 20.0
+    gir_mean_gradient_threshold: 1.0e-6
+    gir_mean_gradient_replay_views: -1
+    gir_old_mean_gradient_current_weight: 1.0
+    gir_old_mean_gradient_replay_weight: 0.5
+    # This experiment conditions only historical GS updates on mean gradients.
     gir_new_mean_gradient_enabled: false
     gir_old_delete_enabled: false
     gir_old_delete_warmup_steps: 1000

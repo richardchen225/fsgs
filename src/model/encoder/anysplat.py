@@ -88,7 +88,8 @@ class EncoderAnySplatCfg:
     gs_keep_ratio: float = 1.0
     opacity_conf: bool = False
     # Model weights paths
-    reconstruction_backbone: Literal["zipmap"] = "zipmap"
+    reconstruction_backbone: Literal["zipmap", "streamvggt"] = "zipmap"
+    depth_head_source: Literal["native", "world_mirror"] = "native"
     depth_teacher: Literal["dav3"] = "dav3"
     streamvggt_weights_path: Optional[str] = None
     zipmap_weights_path: Optional[str] = None
@@ -107,6 +108,7 @@ class EncoderAnySplatCfg:
     # Camera parameters are supervised directly. Detaching their derived
     # matrices keeps rasterizer and geometry gradients out of the camera MLP.
     detach_predicted_camera_for_geometry: bool = False
+    share_first_frame_intrinsics: bool = False
     gir_enabled: bool = False
     gir_render_scale: float = 0.25
     gir_raster_evidence_enabled: bool = False
@@ -733,6 +735,45 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
     backbone: nn.Module
     gaussian_adapter: GaussianAdapter
 
+    def _init_streamvggt(self, cfg: EncoderAnySplatCfg) -> None:
+        from src.model.encoder.streamvggt.models.aggregator import Aggregator
+        from src.model.encoder.streamvggt.heads.camera_head import CameraHead
+        from src.model.encoder.streamvggt.heads.dpt_head import DPTHead
+
+        if cfg.streamvggt_weights_path is None:
+            raise ValueError("StreamVGGT requires streamvggt_weights_path.")
+        checkpoint_path = Path(cfg.streamvggt_weights_path)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"StreamVGGT weights not found: {checkpoint_path}")
+        if checkpoint_path.suffix == ".safetensors":
+            checkpoint = load_file(str(checkpoint_path))
+        else:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        checkpoint = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
+        checkpoint = {
+            key.removeprefix("module.").removeprefix("model.").removeprefix("encoder."): value
+            for key, value in checkpoint.items()
+        }
+        self.aggregator = Aggregator()
+        self.camera_head = CameraHead(dim_in=2048)
+        self.depth_head = DPTHead(
+            dim_in=2048,
+            output_dim=2,
+            activation="exp",
+            conf_activation="expp1",
+        )
+        for name in ("aggregator", "camera_head", "depth_head"):
+            state = {
+                key.removeprefix(f"{name}."): value
+                for key, value in checkpoint.items()
+                if key.startswith(f"{name}.")
+            }
+            getattr(self, name).load_state_dict(state, strict=True)
+        print(
+            "Loaded StreamVGGT aggregator, camera head, and native depth head "
+            f"from {checkpoint_path}"
+        )
+
     def _init_zipmap(self, cfg: EncoderAnySplatCfg) -> None:
         from src.model.encoder.zipmap.models.ZipMap_AR import ZipMap
 
@@ -743,7 +784,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             "enable_camera": False,
             "enable_camera_mlp": True,
             "enable_local_point": False,
-            "enable_depth": False,
+            "enable_depth": True,
             "ttt_config": {
                 "ttt_mode": True,
                 "params": {
@@ -809,15 +850,21 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 for key, value in ckpt.items()
             }
             missing, unexpected = model_full.load_state_dict(ckpt, strict=False)
+            missing_depth = [key for key in missing if key.startswith("depth_head.")]
+            if missing_depth:
+                preview = ", ".join(missing_depth[:4])
+                raise RuntimeError(
+                    "ZipMap checkpoint does not contain a complete native depth "
+                    f"head. Missing keys include: {preview}"
+                )
             print(
                 f"Loaded ZipMap weights from {loaded_zipmap_ckpt_path} "
                 f"(missing={len(missing)}, unexpected={len(unexpected)})"
             )
         else:
-            print(
-                "ZipMap weights not found or failed to load. Tried: "
-                f"{zipmap_ckpt_candidates}. Errors: {zipmap_load_errors}. "
-                "Using initialized ZipMap weights."
+            raise FileNotFoundError(
+                "ZipMap weights are required for its native depth head. Tried: "
+                f"{zipmap_ckpt_candidates}. Errors: {zipmap_load_errors}."
             )
 
         self.aggregator = ZipMapStreamingAggregatorAdapter(
@@ -828,19 +875,32 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             model_full.camera_head,
             model_full.camera_mlp_head,
         )
+        self.depth_head = model_full.depth_head
+        if self.depth_head is None:
+            raise RuntimeError("ZipMap native depth head was not constructed.")
+        print("Loaded ZipMap native depth head from the backbone checkpoint")
 
     def __init__(self, cfg: EncoderAnySplatCfg) -> None:
         super().__init__(cfg)
         if cfg.depth_teacher != "dav3":
             raise ValueError(f"Unknown depth teacher: {cfg.depth_teacher}")
-        if cfg.reconstruction_backbone != "zipmap":
+        if cfg.reconstruction_backbone == "zipmap":
+            self._init_zipmap(cfg)
+        elif cfg.reconstruction_backbone == "streamvggt":
+            self._init_streamvggt(cfg)
+        else:
             raise ValueError(
-                "Only reconstruction_backbone='zipmap' is supported in fsgs-main."
+                f"Unknown reconstruction_backbone: {cfg.reconstruction_backbone!r}."
             )
-        self._init_zipmap(cfg)
-        print("Reconstruction backbone: zipmap (frozen)")
+        if cfg.depth_head_source not in {"native", "world_mirror"}:
+            raise ValueError(
+                "depth_head_source must be 'native' or 'world_mirror', got "
+                f"{cfg.depth_head_source!r}."
+            )
+        print(f"Reconstruction backbone: {cfg.reconstruction_backbone} (frozen)")
+        print(f"Depth head source: {cfg.depth_head_source}")
 
-        for module in [self.aggregator, self.camera_head]:
+        for module in [self.aggregator, self.camera_head, self.depth_head]:
             for param in module.parameters():
                 param.requires_grad = False
 
@@ -852,6 +912,9 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             activation="norm_exp",
             conf_activation="expp1",
             features=head_params.feature_dim,
+        )
+        self.gaussian_param_head.scratch.output_conv2.requires_grad_(
+            cfg.depth_head_source == "world_mirror"
         )
         
         self.feature_dim = 256
@@ -921,7 +984,19 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 )
 
         with torch.amp.autocast("cuda", enabled=False):
-            pred_pose_enc_list = self.camera_head(aggregated_tokens_list)
+            camera_features = aggregated_tokens_list
+            if self.cfg.reconstruction_backbone == "streamvggt":
+                camera_features = [aggregated_tokens_list[-1].float()]
+            pred_pose_enc_list = self.camera_head(camera_features)
+            if self.cfg.share_first_frame_intrinsics:
+                shared_pose_encodings = []
+                for pose_encoding in pred_pose_enc_list:
+                    fov = pose_encoding[..., 7:9]
+                    shared_fov = fov[:, :1].expand_as(fov)
+                    shared_pose_encodings.append(
+                        torch.cat([pose_encoding[..., :7], shared_fov], dim=-1)
+                    )
+                pred_pose_enc_list = shared_pose_encodings
             last_pred_pose_enc = pred_pose_enc_list[-1]
             raw_quaternion = last_pred_pose_enc[..., 3:7]
             quaternion_norm = raw_quaternion.norm(dim=-1, keepdim=True)
@@ -990,19 +1065,57 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             ctx_agg_token_list = [
                 token[:, :ctx_img_num, ...] for token in aggregated_tokens_list
             ]
-            out, depth_map, depth_conf, out_tmp = self.gaussian_param_head(
+            use_world_mirror_depth = (
+                self.cfg.depth_head_source == "world_mirror"
+            )
+            out, wm_depth, wm_depth_conf, out_tmp = self.gaussian_param_head(
                 ctx_agg_token_list,
                 image[:, :ctx_img_num, ...],
                 patch_start_idx=patch_start_idx,
                 image_size=(h, w),
+                predict_depth=use_world_mirror_depth,
             )
             del out_tmp
-            # The DPT depth channel is exp(raw). Once raw becomes large, the
-            # exponential can overflow before the loss-level nan_to_num sees
-            # it. In that case the forward loss may look finite while exp's
-            # backward still produces inf * 0 -> NaN. Keep the depth attached
-            # for supervision, but make out-of-range values have zero local
-            # gradient before they reach either DAV3 or geometry.
+            if use_world_mirror_depth:
+                depth_map = wm_depth
+                depth_conf = wm_depth_conf
+            else:
+                native_depth, native_depth_conf = self.depth_head(
+                    ctx_agg_token_list,
+                    images=image[:, :ctx_img_num, ...].float(),
+                    patch_start_idx=patch_start_idx,
+                )
+                if native_depth.ndim != 5:
+                    raise RuntimeError(
+                        "Native depth head must return a rank-5 tensor, got "
+                        f"{tuple(native_depth.shape)}."
+                    )
+                if native_depth.shape[-1] == 1:
+                    depth_map = native_depth
+                elif native_depth.shape[2] == 1:
+                    depth_map = native_depth.movedim(2, -1)
+                else:
+                    raise RuntimeError(
+                        "Native depth head must have one depth channel, got "
+                        f"{tuple(native_depth.shape)}."
+                    )
+                if native_depth_conf.ndim == 4:
+                    depth_conf = native_depth_conf.unsqueeze(-1)
+                elif (
+                    native_depth_conf.ndim == 5
+                    and native_depth_conf.shape[-1] == 1
+                ):
+                    depth_conf = native_depth_conf
+                elif (
+                    native_depth_conf.ndim == 5
+                    and native_depth_conf.shape[2] == 1
+                ):
+                    depth_conf = native_depth_conf.movedim(2, -1)
+                else:
+                    raise RuntimeError(
+                        "Native depth confidence must have one channel, got "
+                        f"{tuple(native_depth_conf.shape)}."
+                    )
             depth_for_loss = torch.nan_to_num(
                 depth_map.float(),
                 nan=1e-4,

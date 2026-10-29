@@ -24,6 +24,7 @@ from PIL import Image
 from safetensors.torch import load_file
 
 from src.config import load_typed_root_config
+from src.misc.backbone_checkpoint import backbone_signature, validate_backbone_checkpoint
 from src.model.encoder import act_gs, sh_utils
 from src.model.encoder.vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from src.model.model import get_model
@@ -699,19 +700,43 @@ def _load_checkpoint(model: torch.nn.Module, checkpoint: str | None) -> dict[str
     if not isinstance(model_payload, dict):
         raise TypeError(f"Unsupported checkpoint payload: {type(model_payload)}")
 
+    normalized = {}
+    for key, value in model_payload.items():
+        if not torch.is_tensor(value):
+            continue
+        for prefix in ("module.", "model."):
+            key = key.removeprefix(prefix)
+        normalized[key] = value
+    wm_initialization = any(
+        key.startswith(
+            ("visual_geometry_transformer.", "cam_head.", "gs_renderer.", "gs_head.")
+        )
+        for key in normalized
+    )
+    if not wm_initialization:
+        checkpoint_signature = {"state_dict": normalized}
+        if "reconstruction_backbone" in payload:
+            checkpoint_signature["reconstruction_backbone"] = payload["reconstruction_backbone"]
+        validate_backbone_checkpoint(checkpoint_signature, model.encoder.cfg)
+    prefixes = (
+        "encoder.gaussian_param_head.",
+        "encoder.gs_head.",
+        "encoder.depth_head.",
+        "encoder.camera_head.",
+        "encoder.depth_refiner.",
+        "gir_update_head.",
+        "gir_projected_update_head.",
+    )
+    # WM initializes only the GS heads. Its non-causal transformer and camera
+    # share names/shapes with StreamVGGT, but must not replace streaming weights.
+    load_prefixes = prefixes[:2] if wm_initialization else prefixes
     model_state = model.state_dict()
     compatible = {}
     optimizer_compatible = True
-    for original_key, value in model_payload.items():
-        if not torch.is_tensor(value):
-            continue
-        stripped = original_key
-        for prefix in ("module.", "model."):
-            if stripped.startswith(prefix):
-                stripped = stripped[len(prefix) :]
+    for stripped, value in normalized.items():
         candidates = (stripped, _rename_wm_key(stripped))
         for candidate in candidates:
-            if candidate not in model_state:
+            if candidate not in model_state or not candidate.startswith(load_prefixes):
                 continue
             if model_state[candidate].shape == value.shape:
                 compatible[candidate] = value
@@ -720,6 +745,12 @@ def _load_checkpoint(model: torch.nn.Module, checkpoint: str | None) -> dict[str
                 "gir_projected_update_head.new_output."
             ):
                 optimizer_compatible = False
+    if not compatible:
+        raise RuntimeError(
+            f"No compatible GS/GIR or camera head weights found in {path}. "
+            "Set the selected reconstruction backbone's pretrained weights; "
+            "toy.checkpoint initializes or restores reconstruction heads."
+        )
     model.load_state_dict(compatible, strict=False)
     copied_rank_heads = 0
     additional_heads = getattr(
@@ -734,18 +765,23 @@ def _load_checkpoint(model: torch.nn.Module, checkpoint: str | None) -> dict[str
         if not expected_keys.issubset(compatible):
             head.load_state_dict(model.gir_update_head.prediction.state_dict())
             copied_rank_heads += 1
-    prefixes = (
-        "encoder.gaussian_param_head.",
-        "encoder.gs_head.",
-        "encoder.camera_head.",
-        "gir_update_head.",
-        "gir_projected_update_head.",
-    )
     loaded_heads = sum(key.startswith(prefixes) for key in compatible)
     print(
         f"Loaded {len(compatible)} compatible tensors from {path}; "
         f"{loaded_heads} belong to the trainable toy heads."
     )
+    if wm_initialization:
+        print(
+            "WorldMirror initialization: GS heads only; pretrained backbone, "
+            "camera, and native depth head preserved."
+        )
+    else:
+        print("Restored reconstruction heads; frozen backbone retains its configured pretrained weights.")
+    for prefix in prefixes:
+        expected = sum(key.startswith(prefix) for key in model_state)
+        if expected:
+            loaded = sum(key.startswith(prefix) for key in compatible)
+            print(f"  {prefix[:-1]}: loaded {loaded}/{expected} tensors")
     if copied_rank_heads:
         print(
             f"Initialized {copied_rank_heads} missing contributor heads from "
@@ -779,9 +815,22 @@ def _configure_trainable_modules(
 ) -> list[dict[str, Any]]:
     model.requires_grad_(False)
     model.encoder.gaussian_param_head.requires_grad_(train_gaussian_param_head)
-    model.encoder.gaussian_param_head.scratch.output_conv2.requires_grad_(
-        train_gaussian_param_head and train_depth_head
+    depth_head_source = str(
+        getattr(model.encoder.cfg, "depth_head_source", "native")
+    ).lower()
+    if depth_head_source not in {"native", "world_mirror"}:
+        raise ValueError(
+            "model.encoder.depth_head_source must be native or world_mirror, "
+            f"got {depth_head_source!r}."
+        )
+    wm_depth_head = model.encoder.gaussian_param_head.scratch.output_conv2
+    wm_depth_head.requires_grad_(
+        train_depth_head and depth_head_source == "world_mirror"
     )
+    depth_head = getattr(model.encoder, "depth_head", None)
+    if depth_head is None:
+        raise RuntimeError("The reconstruction backbone has no native depth head.")
+    depth_head.requires_grad_(train_depth_head and depth_head_source == "native")
     model.encoder.camera_head.requires_grad_(train_camera_head)
     model.encoder.gs_head.requires_grad_(train_gs_head)
     residual_mode = str(residual_mode).lower()
@@ -828,11 +877,33 @@ def _configure_trainable_modules(
         projected_head.new_output.requires_grad_(new_residual_enabled)
 
     groups = []
+    wm_depth_parameter_ids = {
+        id(parameter) for parameter in wm_depth_head.parameters()
+    }
     if train_gaussian_param_head:
         groups.append({
             "name": "gaussian_param_head",
-            "params": [p for p in model.encoder.gaussian_param_head.parameters() if p.requires_grad],
+            "params": [
+                parameter
+                for parameter in model.encoder.gaussian_param_head.parameters()
+                if parameter.requires_grad
+                and id(parameter) not in wm_depth_parameter_ids
+            ],
         })
+    if train_depth_head:
+        selected_depth_head = (
+            depth_head if depth_head_source == "native" else wm_depth_head
+        )
+        groups.append(
+            {
+                "name": "depth_head",
+                "params": [
+                    parameter
+                    for parameter in selected_depth_head.parameters()
+                    if parameter.requires_grad
+                ],
+            }
+        )
     if train_gs_head:
         groups.append(
             {"name": "gs_head", "params": list(model.encoder.gs_head.parameters())}
@@ -2439,12 +2510,54 @@ def _save_mask(path: Path, tensor: torch.Tensor) -> None:
 
 def _extract_features(model, tokens, patch_start_idx, images, image_shape, use_amp):
     del use_amp
+    depth_head_source = str(
+        getattr(model.encoder.cfg, "depth_head_source", "native")
+    ).lower()
+    if depth_head_source not in {"native", "world_mirror"}:
+        raise ValueError(
+            "model.encoder.depth_head_source must be native or world_mirror, "
+            f"got {depth_head_source!r}."
+        )
+    use_world_mirror_depth = depth_head_source == "world_mirror"
     with torch.autocast("cuda", enabled=False):
-        features, predicted_depth, depth_confidence, _ = model.encoder.gaussian_param_head(
+        features, wm_depth, wm_confidence, _ = model.encoder.gaussian_param_head(
             tokens,
             images.float(),
             patch_start_idx=patch_start_idx,
             image_size=image_shape,
+            predict_depth=use_world_mirror_depth,
+        )
+        if use_world_mirror_depth:
+            return features, wm_depth, wm_confidence
+        native_depth, native_confidence = model.encoder.depth_head(
+            tokens,
+            images=images.float(),
+            patch_start_idx=patch_start_idx,
+        )
+    if native_depth.ndim != 5:
+        raise RuntimeError(
+            "Native depth head must return a rank-5 tensor, got "
+            f"{tuple(native_depth.shape)}."
+        )
+    if native_depth.shape[-1] == 1:
+        predicted_depth = native_depth
+    elif native_depth.shape[2] == 1:
+        predicted_depth = native_depth.movedim(2, -1)
+    else:
+        raise RuntimeError(
+            "Native depth head must have one depth channel, got "
+            f"{tuple(native_depth.shape)}."
+        )
+    if native_confidence.ndim == 4:
+        depth_confidence = native_confidence.unsqueeze(-1)
+    elif native_confidence.ndim == 5 and native_confidence.shape[-1] == 1:
+        depth_confidence = native_confidence
+    elif native_confidence.ndim == 5 and native_confidence.shape[2] == 1:
+        depth_confidence = native_confidence.movedim(2, -1)
+    else:
+        raise RuntimeError(
+            "Native depth confidence must have one channel, got "
+            f"{tuple(native_confidence.shape)}."
         )
     return features, predicted_depth, depth_confidence
 
@@ -2458,7 +2571,18 @@ def _as_homogeneous_transform(extrinsic: torch.Tensor) -> torch.Tensor:
 
 
 def _predict_camera_geometry(model, tokens, image_shape, gt_c2w):
-    pose_encoding = model.encoder.camera_head(tokens)[-1].float()
+    with torch.autocast("cuda", enabled=False):
+        camera_tokens = tokens
+        if model.encoder.cfg.reconstruction_backbone == "streamvggt":
+            camera_tokens = [tokens[-1].float()]
+        raw_pose_encoding = model.encoder.camera_head(camera_tokens)[-1].float()
+    pose_encoding = raw_pose_encoding
+    if model.encoder.cfg.share_first_frame_intrinsics:
+        fov = raw_pose_encoding[..., 7:9]
+        pose_encoding = torch.cat(
+            [raw_pose_encoding[..., :7], fov[:, :1].expand_as(fov)],
+            dim=-1,
+        )
     # The decoder is scale-invariant for nonzero quaternions, but explicit
     # normalization avoids an undefined rotation if a trainable head approaches 0.
     raw_quaternion = pose_encoding[..., 3:7]
@@ -2494,11 +2618,29 @@ def _predict_camera_geometry(model, tokens, image_shape, gt_c2w):
     gt_relative_c2w = torch.linalg.inv(gt_c2w[:, :1]) @ gt_c2w
     return {
         "pose_encoding": pose_encoding,
+        "raw_pose_encoding": raw_pose_encoding,
         "c2w": aligned_predicted_c2w,
         "relative_c2w": predicted_relative_c2w,
         "gt_relative_c2w": gt_relative_c2w,
         "intrinsic_px": predicted_intrinsic_px,
     }
+
+
+def _slice_camera_prediction(
+    prediction: dict[str, torch.Tensor],
+    start: int,
+    end: int,
+    *,
+    gt_relative_c2w: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    sliced = {
+        key: value[:, start:end]
+        for key, value in prediction.items()
+        if key != "gt_relative_c2w"
+    }
+    if gt_relative_c2w is not None:
+        sliced["gt_relative_c2w"] = gt_relative_c2w
+    return sliced
 
 
 def _camera_supervision_losses(
@@ -2558,11 +2700,67 @@ def _forward_experiment(
     gt_c2w = data["c2w"]
     gt_intrinsic_px = data["intrinsic_px"]
     image_shape = data["image_shape"]
+    source_view_count = images.shape[1]
+    source_tokens = [token[:, :source_view_count] for token in tokens]
     features, predicted_depth, depth_confidence = _extract_features(
-        model, tokens, patch_start_idx, images, image_shape, use_amp
+        model, source_tokens, patch_start_idx, images, image_shape, use_amp
     )
-    camera_prediction = _predict_camera_geometry(
+    all_camera_prediction = _predict_camera_geometry(
         model, tokens, image_shape, gt_c2w
+    )
+    camera_prediction = _slice_camera_prediction(
+        all_camera_prediction,
+        0,
+        source_view_count,
+        gt_relative_c2w=all_camera_prediction["gt_relative_c2w"],
+    )
+    target_camera_source = str(
+        cfg.get("target_camera_source", "predicted")
+    ).lower()
+    if target_camera_source not in {"gt", "predicted"}:
+        raise ValueError(
+            "toy.target_camera_source must be 'gt' or 'predicted', got "
+            f"{cfg.get('target_camera_source')!r}."
+        )
+    heldout_loss_count = len(data["heldout_loss"]["ids"])
+    heldout_test_count = len(data["heldout_test"]["ids"])
+    expected_camera_views = (
+        source_view_count + heldout_loss_count + heldout_test_count
+        if target_camera_source == "predicted"
+        else source_view_count
+    )
+    if all_camera_prediction["c2w"].shape[1] != expected_camera_views:
+        raise RuntimeError(
+            "Camera token sequence does not match the configured source/target "
+            "views: "
+            f"predicted={all_camera_prediction['c2w'].shape[1]}, "
+            f"expected={expected_camera_views}."
+        )
+
+    def target_render_camera(
+        target: dict[str, Any], start: int
+    ) -> dict[str, torch.Tensor]:
+        if target_camera_source == "gt":
+            return {
+                "c2w": target["c2w"],
+                "intrinsic": target["intrinsic"],
+            }
+        end = start + len(target["ids"])
+        prediction = _slice_camera_prediction(all_camera_prediction, start, end)
+        target_c2w = prediction["c2w"]
+        target_intrinsic = _normalized_intrinsic(
+            prediction["intrinsic_px"], image_shape[0], image_shape[1]
+        )
+        if bool(cfg.detach_predicted_camera):
+            target_c2w = target_c2w.detach()
+            target_intrinsic = target_intrinsic.detach()
+        return {"c2w": target_c2w, "intrinsic": target_intrinsic}
+
+    heldout_loss_camera = target_render_camera(
+        data["heldout_loss"], source_view_count
+    )
+    heldout_test_camera = target_render_camera(
+        data["heldout_test"], source_view_count + heldout_loss_count
     )
     camera_source = str(cfg.camera_source).lower()
     depth_source = str(cfg.depth_source).lower()
@@ -2917,12 +3115,11 @@ def _forward_experiment(
         )
     heldout_loss_render = None
     if render_heldout_loss:
-        heldout_loss = data["heldout_loss"]
         heldout_loss_render = _render(
             model,
             state.gaussians,
-            heldout_loss["c2w"],
-            heldout_loss["intrinsic"],
+            heldout_loss_camera["c2w"],
+            heldout_loss_camera["intrinsic"],
             image_shape,
         )
     return {
@@ -2935,6 +3132,9 @@ def _forward_experiment(
         "predicted_depth": predicted_depth,
         "depth_confidence": depth_confidence,
         "camera_prediction": camera_prediction,
+        "heldout_loss_camera": heldout_loss_camera,
+        "heldout_test_camera": heldout_test_camera,
+        "target_camera_source": target_camera_source,
         "camera_losses": _camera_supervision_losses(
             camera_prediction, gt_intrinsic_px, image_shape, cfg
         ),
@@ -3037,6 +3237,7 @@ def _flatten_residual_update_stats(summary: dict[str, Any]) -> dict[str, float]:
 @torch.no_grad()
 def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_dir):
     model.encoder.gaussian_param_head.eval()
+    model.encoder.depth_head.eval()
     model.encoder.camera_head.eval()
     model.encoder.gs_head.eval()
     model.gir_update_head.eval()
@@ -3148,6 +3349,9 @@ def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_d
         ).lower(),
         "camera_source": str(cfg.camera_source).lower(),
         "depth_source": str(cfg.depth_source).lower(),
+        "depth_head_source": str(
+            getattr(model.encoder.cfg, "depth_head_source", "native")
+        ).lower(),
         "base_first_psnr": _psnr(base_render.color[:, 0], images[:, 0]),
         "global_first_psnr": input_psnr[0],
         "global_current_psnr": input_psnr[-1],
@@ -3276,7 +3480,10 @@ def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_d
             / gt_focal.clamp_min(1e-4)
         ).mean().item()
     )
-    raw_fov = result["camera_prediction"]["pose_encoding"][..., 7:9]
+    raw_fov = result["camera_prediction"].get(
+        "raw_pose_encoding",
+        result["camera_prediction"]["pose_encoding"],
+    )[..., 7:9]
     metrics["camera_raw_fov_min"] = float(raw_fov.min().item())
     metrics["camera_raw_fov_max"] = float(raw_fov.max().item())
     metrics["detach_predicted_camera"] = bool(cfg.detach_predicted_camera)
@@ -3292,14 +3499,18 @@ def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_d
         sum(heldout_loss_psnrs) / len(heldout_loss_psnrs)
     )
     heldout_test = data["heldout_test"]
-    if heldout_test["ids"] == heldout_loss["ids"]:
+    if (
+        heldout_test["ids"] == heldout_loss["ids"]
+        and result["target_camera_source"] == "gt"
+    ):
         heldout_test_render = heldout_loss_render
     else:
+        heldout_test_camera = result["heldout_test_camera"]
         heldout_test_render = _render(
             model,
             updated,
-            heldout_test["c2w"],
-            heldout_test["intrinsic"],
+            heldout_test_camera["c2w"],
+            heldout_test_camera["intrinsic"],
             data["image_shape"],
         )
     heldout_test_psnrs = [
@@ -3311,6 +3522,7 @@ def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_d
     )
     metrics["heldout_loss_frames"] = heldout_loss["ids"]
     metrics["heldout_test_frames"] = heldout_test["ids"]
+    metrics["target_camera_source"] = result["target_camera_source"]
     for frame_id, frame_psnr in zip(heldout_loss["ids"], heldout_loss_psnrs):
         metrics[f"heldout_loss_frame_{frame_id:03d}_psnr"] = frame_psnr
     for frame_id, frame_psnr in zip(heldout_test["ids"], heldout_test_psnrs):
@@ -3373,6 +3585,11 @@ def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_d
     model.encoder.gaussian_param_head.train(
         bool(cfg.get("train_gaussian_param_head", True))
     )
+    model.encoder.depth_head.train(
+        bool(cfg.train_depth_head)
+        and str(getattr(model.encoder.cfg, "depth_head_source", "native")).lower()
+        == "native"
+    )
     model.encoder.camera_head.train(bool(cfg.train_camera_head))
     model.encoder.gs_head.train(bool(cfg.get("train_gs_head", True)))
     model.gir_update_head.train(
@@ -3402,6 +3619,8 @@ def _save_checkpoint(model, optimizer, scheduler, scaler, step: int, output_dir:
         ("encoder.gs_head", model.encoder.gs_head),
         ("gir_update_head", model.gir_update_head),
     ]
+    if any(parameter.requires_grad for parameter in model.encoder.depth_head.parameters()):
+        modules.append(("encoder.depth_head", model.encoder.depth_head))
     if model.gir_projected_update_head is not None:
         modules.append(
             ("gir_projected_update_head", model.gir_projected_update_head)
@@ -3415,6 +3634,7 @@ def _save_checkpoint(model, optimizer, scheduler, scaler, step: int, output_dir:
     torch.save(
         {
             "step": step,
+            "reconstruction_backbone": backbone_signature(model.encoder.cfg),
             "state_dict": state,
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
@@ -3788,9 +4008,12 @@ def main(cfg_dict: DictConfig) -> None:
         "replay_weight="
         f"{float(toy_cfg.get('new_mean_gradient_replay_weight', 0.0)):g}"
     )
-    print(f"Train Gaussian feature/depth head: {train_gaussian_param_head}")
+    print(f"Train WorldMirror Gaussian feature head: {train_gaussian_param_head}")
     print(f"Train base GS parameter head: {train_gs_head}")
-    print(f"Train depth output head: {train_depth_head}")
+    print(
+        "Depth head: source="
+        f"{model.encoder.cfg.depth_head_source}, train={train_depth_head}"
+    )
     print(
         f"Depth loss enabled: {depth_loss_enabled} "
         f"(target={depth_loss_target if depth_loss_enabled else 'none'})"
@@ -3803,6 +4026,11 @@ def main(cfg_dict: DictConfig) -> None:
             f"{float(toy_cfg.get('depth_absolute_log_scale_weight', 0.1)):g}"
         )
     print(f"Train camera head: {train_camera_head}")
+    print(
+        f"Reconstruction backbone: {model.encoder.cfg.reconstruction_backbone}; "
+        "share first-frame predicted intrinsics: "
+        f"{model.encoder.cfg.share_first_frame_intrinsics}"
+    )
     print(
         f"Input geometry sources: camera={str(toy_cfg.camera_source).lower()}, "
         f"depth={str(toy_cfg.depth_source).lower()}"
@@ -3830,11 +4058,6 @@ def main(cfg_dict: DictConfig) -> None:
     if depth_loss_enabled and not train_depth_head:
         raise ValueError(
             "toy.depth_loss_enabled=true requires toy.train_depth_head=true."
-        )
-    if train_depth_head and not train_gaussian_param_head:
-        raise ValueError(
-            "toy.train_depth_head=true requires "
-            "toy.train_gaussian_param_head=true."
         )
     group_defs = _configure_trainable_modules(
         model,
@@ -3871,6 +4094,15 @@ def main(cfg_dict: DictConfig) -> None:
         f"(loss frames {data['heldout_loss']['ids']}, "
         f"test frames {data['heldout_test']['ids']})"
     )
+    target_camera_source = str(
+        toy_cfg.get("target_camera_source", "predicted")
+    ).lower()
+    if target_camera_source not in {"gt", "predicted"}:
+        raise ValueError(
+            "toy.target_camera_source must be 'gt' or 'predicted', got "
+            f"{toy_cfg.get('target_camera_source')!r}."
+        )
+    print(f"Held-out target camera source: {target_camera_source}")
     supervised_test_frames = sorted(
         set(data["heldout_loss"]["ids"]) & set(data["heldout_test"]["ids"])
     )
@@ -3880,8 +4112,18 @@ def main(cfg_dict: DictConfig) -> None:
             f"therefore supervised: {supervised_test_frames}."
         )
     use_amp = bool(toy_cfg.mixed_precision)
+    camera_input_images = data["images"]
+    if target_camera_source == "predicted":
+        camera_input_images = torch.cat(
+            [
+                camera_input_images,
+                data["heldout_loss"]["rgb"],
+                data["heldout_test"]["rgb"],
+            ],
+            dim=1,
+        )
     tokens, patch_start_idx = _cache_backbone_tokens(
-        model, data["images"], use_amp
+        model, camera_input_images, use_amp
     )
 
     # These frozen modules are no longer needed after token extraction.
@@ -3905,6 +4147,9 @@ def main(cfg_dict: DictConfig) -> None:
 
     learning_rates = {
         "gaussian_param_head": float(toy_cfg.gaussian_head_lr),
+        "depth_head": float(
+            toy_cfg.get("depth_head_lr", toy_cfg.gaussian_head_lr)
+        ),
         "gs_head": float(toy_cfg.gs_head_lr),
         "old_residual_head": float(toy_cfg.residual_head_lr),
         "projected_residual_head": float(toy_cfg.residual_head_lr),
@@ -3948,6 +4193,10 @@ def main(cfg_dict: DictConfig) -> None:
                 )
                 resume_state = None
     model.encoder.gaussian_param_head.train(train_gaussian_param_head)
+    model.encoder.depth_head.train(
+        train_depth_head
+        and str(model.encoder.cfg.depth_head_source).lower() == "native"
+    )
     model.encoder.camera_head.train(train_camera_head)
     model.encoder.gs_head.train(train_gs_head)
     model.gir_update_head.train(

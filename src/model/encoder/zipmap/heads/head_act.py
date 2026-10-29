@@ -1,6 +1,8 @@
 # Code for ZipMap (CVPR 2026); created by Haian Jin
 
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -136,7 +138,7 @@ def activate_head(out, activation="norm_exp", conf_activation="expp1"):
     elif activation == "norm":
         pts3d = xyz / xyz.norm(dim=-1, keepdim=True)
     elif activation == "exp":
-        pts3d = torch.exp(xyz)
+        pts3d = torch.exp(xyz.clamp(min=-10.0, max=math.log(100.0)))
     elif activation == "relu":
         pts3d = F.relu(xyz)
     elif activation == "inv_log":
@@ -162,9 +164,9 @@ def activate_head(out, activation="norm_exp", conf_activation="expp1"):
         raise ValueError(f"Unknown activation: {activation}")
 
     if conf_activation == "expp1":
-        conf_out = 1 + conf.exp()
+        conf_out = 1 + conf.clamp(min=-10.0, max=math.log(100.0)).exp()
     elif conf_activation == "expp0":
-        conf_out = conf.exp()
+        conf_out = conf.clamp(min=-10.0, max=math.log(100.0)).exp()
     elif conf_activation == "sigmoid":
         conf_out = torch.sigmoid(conf)
     elif conf_activation == "none":

@@ -39,6 +39,7 @@ def test_october_baseline_does_not_require_new_projected_parameters() -> None:
 
     assert "gir_projected_update_head.decoder." in prefixes
     assert "gir_projected_update_head.output." in prefixes
+    assert "encoder.depth_head." in prefixes
     assert "gir_projected_update_head.new_output." not in prefixes
     assert "gir_projected_update_head.opacity_gradient_adapter." not in prefixes
     assert "gir_projected_update_head.mean_gradient_adapter." not in prefixes
@@ -65,3 +66,15 @@ def test_enabled_projected_branches_require_their_checkpoint_parameters() -> Non
     assert "gir_projected_update_head.opacity_gradient_adapter." in prefixes
     assert "gir_projected_update_head.mean_gradient_adapter." in prefixes
     assert "gir_projected_update_head.new_mean_gradient_adapter." in prefixes
+
+
+def test_world_mirror_depth_does_not_require_native_depth_checkpoint() -> None:
+    prefixes = REQUIRED_PREFIXES(
+        SimpleNamespace(
+            gir_enabled=False,
+            depth_head_source="world_mirror",
+        )
+    )
+
+    assert "encoder.gaussian_param_head." in prefixes
+    assert "encoder.depth_head." not in prefixes

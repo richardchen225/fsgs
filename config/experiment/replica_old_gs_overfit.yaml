@@ -11,8 +11,11 @@ mode: train
 model:
   encoder:
     mode: train
-    reconstruction_backbone: zipmap
-    zipmap_weights_path: weights/pre_zipmap.pt
+    reconstruction_backbone: streamvggt
+    depth_head_source: native  # native | world_mirror
+    streamvggt_weights_path: weights/pre_svggt.safetensors
+    zipmap_weights_path: null
+    share_first_frame_intrinsics: true
     gir_enabled: true
     depth_refine_enabled: false
     gir_render_scale: 1.0
@@ -72,6 +75,8 @@ toy:
   image_dir: images_8
   # DL3DV resize shape [height, width]. Both dimensions must be divisible by 14.
   resize_shape: [252, 518]
+  # WorldMirror initializes GS heads only; native backbone/camera/depth stay intact.
+  # An overfit checkpoint restores its trained heads and optimizer instead.
   checkpoint: weights/pre_wm.safetensors
   dav3_weights_path: weights/pre_dav3.safetensors
   train_frames: [28, 29]
@@ -140,6 +145,7 @@ toy:
   train_gaussian_param_head: true
   train_gs_head: true
   train_camera_head: true
+  # Fine-tune the selected ZipMap/StreamVGGT native DPT depth head.
   train_depth_head: true
   depth_loss_enabled: true
   # gt: absolute metric Z-depth L1; dav3: structure + weak absolute log-scale.
@@ -149,6 +155,9 @@ toy:
   # Report DAV3 directly against Replica GT even when DAV3 is not the training target.
   dav3_gt_metrics_enabled: true
   camera_source: predicted  # gt | predicted
+  # Match the main test path: append held-out RGB frames only for camera-head
+  # pose/FOV prediction, while excluding them from depth/GS map construction.
+  target_camera_source: predicted  # predicted | gt
   depth_source: predicted   # gt | predicted
   detach_predicted_camera: false
   detach_predicted_depth: false
@@ -189,6 +198,7 @@ toy:
   opacity_decay_prune_threshold: 0.005
 
   gaussian_head_lr: 1.0e-5
+  depth_head_lr: 1.0e-5
   gs_head_lr: 5.0e-5
   residual_head_lr: 5.0e-5
   camera_head_lr: 1.0e-5

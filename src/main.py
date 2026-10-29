@@ -28,6 +28,8 @@ def _required_test_checkpoint_prefixes(encoder_cfg) -> list[str]:
         "encoder.gs_head.",
         "encoder.camera_head.",
     ]
+    if str(getattr(encoder_cfg, "depth_head_source", "native")).lower() == "native":
+        prefixes.append("encoder.depth_head.")
     if not bool(getattr(encoder_cfg, "gir_enabled", False)):
         return prefixes
 
@@ -228,11 +230,28 @@ def train(cfg_dict: DictConfig):
                 ckpt = load_file(cfg.checkpointing.train_pretrained_weights)
             else:
                 ckpt = torch.load(cfg.checkpointing.train_pretrained_weights, map_location='cpu')
-            validate_backbone_checkpoint(
-                ckpt, cfg.model.encoder,
-                allow_transfer=cfg.optimizer.train_base_heads,
+            checkpoint_state = ckpt.get("state_dict", ckpt)
+            normalized_source_keys = [
+                key.removeprefix("module.").removeprefix("model.")
+                for key in checkpoint_state
+            ]
+            wm_initialization = any(
+                key.startswith(
+                    (
+                        "visual_geometry_transformer.",
+                        "cam_head.",
+                        "gs_renderer.",
+                        "gs_head.",
+                    )
+                )
+                for key in normalized_source_keys
             )
-            ckpt = ckpt.get("state_dict", ckpt)
+            if not wm_initialization:
+                validate_backbone_checkpoint(
+                    ckpt, cfg.model.encoder,
+                    allow_transfer=cfg.optimizer.train_base_heads,
+                )
+            ckpt = checkpoint_state
         def rename_key(key: str) -> str:
             if key.startswith("gs_head"):
                 key = key.replace("gs_head", "encoder.gaussian_param_head", 1)
@@ -261,14 +280,22 @@ def train(cfg_dict: DictConfig):
                 new_k = rename_key(new_k)
                 new_ckpt[new_k] = v
 
-            load_prefixes = (
+            all_load_prefixes = (
                 "encoder.gaussian_param_head.",
                 "encoder.gs_head.",
+                "encoder.depth_head.",
                 "encoder.camera_head.",
                 "encoder.cam_dec.",
                 "encoder.depth_refiner.",
                 "gir_update_head.",
                 "gir_projected_update_head.",
+            )
+            # A WorldMirror checkpoint owns only the GS heads. Backbone-native
+            # camera and depth heads were loaded from ZipMap/StreamVGGT above.
+            load_prefixes = (
+                all_load_prefixes[:2]
+                if wm_initialization
+                else all_load_prefixes
             )
             model_state = model.state_dict()
             compatible_ckpt = {
@@ -289,6 +316,10 @@ def train(cfg_dict: DictConfig):
                     "encoder.gaussian_param_head.",
                     "encoder.gs_head.",
                 )
+                if str(
+                    getattr(cfg.model.encoder, "depth_head_source", "native")
+                ).lower() == "native":
+                    required_base_prefixes += ("encoder.depth_head.",)
                 missing_base_keys = sorted(
                     key
                     for key in model_state
@@ -307,6 +338,11 @@ def train(cfg_dict: DictConfig):
                 "Loaded "
                 f"{len(compatible_ckpt)} compatible pretrained head tensors."
             )
+            if wm_initialization:
+                print(
+                    "WorldMirror initialization: GS heads only; native "
+                    "backbone camera and depth heads preserved."
+                )
             for prefix in load_prefixes:
                 head_keys = [key for key in model_state if key.startswith(prefix)]
                 if not head_keys:
@@ -335,6 +371,7 @@ def train(cfg_dict: DictConfig):
             for key, value in ckpt.items()
             if "gaussian_param_head" in key
             or "gs_head" in key
+            or "depth_head" in key
             or "camera_head" in key
             or "cam_dec" in key
             or "depth_refiner" in key

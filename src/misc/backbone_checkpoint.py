@@ -12,8 +12,16 @@ def validate_backbone_checkpoint(checkpoint, encoder_cfg, *, allow_transfer=Fals
     if actual is None:
         state = checkpoint.get("state_dict", checkpoint)
         keys = [key.removeprefix("model.") for key in state]
-        if any(key.startswith("encoder.aggregator.aggregator.") for key in keys):
+        if any(key.startswith((
+            "encoder.aggregator.aggregator.",
+            "encoder.camera_head.camera_mlp_head.",
+            "encoder.camera_head.camera_head.",
+        )) for key in keys):
             actual = {"name": "zipmap"}
+        elif any(
+            key.startswith("encoder.camera_head.trunk.") for key in keys
+        ):
+            actual = {"name": "streamvggt"}
     if actual is None:
         return
     mismatch = actual.get("name") != expected["name"]

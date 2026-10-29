@@ -211,6 +211,22 @@ loss:
 python -m src.main +experiment=dl3dv
 ```
 
+For the StreamVGGT reconstruction backbone, place its pretrained weights at
+`weights/pre_svggt.safetensors` and run:
+
+```bash
+python -m src.main +experiment=dl3dv_streamvggt
+```
+
+Override `model.encoder.streamvggt_weights_path=/path/to/checkpoint` to use a
+different `.safetensors`, `.pt`, or `.pth` file. This uses StreamVGGT's causal
+aggregator and iterative camera head with the existing GS/GIR heads. The feature
+aggregator stays frozen; the camera head follows `optimizer.train_base_heads`.
+The first-frame intrinsic-sharing switch applies to both backbones. Test with
+the same experiment and a checkpoint trained with that backbone; cross-backbone
+checkpoint resume/test is rejected. Pretrained backbone weights are needed for
+both training and testing.
+
 默认 `config/experiment/dl3dv.yaml` 使用 4 张 GPU：
 
 ```yaml

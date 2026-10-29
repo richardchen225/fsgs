@@ -63,6 +63,116 @@ from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 from .encoder.vggt.utils.rotation import quat_to_mat
 from .ply_export import export_ply
 from lightning.pytorch.loggers.wandb import WandbLogger
+from .streaming_gir import (
+    MEAN_GRADIENT_STAT_KEYS,
+    OLD_OPACITY_GRADIENT_EFFECTIVE_STAT_KEYS,
+)
+
+
+def _gir_training_metric_names(cfg) -> tuple[str, ...]:
+    """Select live diagnostics for the configured streaming update paths."""
+    if not bool(getattr(cfg, "gir_enabled", False)):
+        return ()
+    names = [
+        "gir_add_gate",
+        "gir_map_gaussians",
+        "gir_visible_ratio",
+        "gir_raster_alpha",
+        "gir_effective_new_ratio",
+    ]
+    append_mode = str(getattr(cfg, "gir_append_mode", "learned")).lower()
+    if append_mode == "point_map":
+        names.extend((
+            "gir_point_coverage_ratio",
+            "gir_point_append_ratio",
+            "gir_point_front_conflict_ratio",
+            "gir_point_front_decay_mass_ratio",
+            "gir_point_depth_scale",
+        ))
+        if bool(getattr(cfg, "gir_opacity_gradient_front_decay_gate_enabled", False)):
+            names.append("gir_point_front_gradient_decay_gate_ratio")
+    if append_mode == "learned":
+        names.extend(("gir_add_gate_learned", "gir_add_rate"))
+
+    opacity_keys = (
+        "gradient_current_nonzero_ratio",
+        "gradient_signal_abs_mean",
+        "gradient_signal_positive_ratio",
+        "gradient_update_alignment",
+    )
+    old_enabled = bool(getattr(cfg, "gir_old_residual_enabled", True))
+    projected = str(getattr(cfg, "gir_old_update_mode", "pixel_topk")).lower() == "projected_shared"
+    if old_enabled and projected:
+        names.extend((
+            "gir_projected_candidate_ratio",
+            "gir_projected_consistent_ratio",
+            "gir_projected_front_ratio",
+            "gir_projected_gate_mean",
+            "gir_projected_opacity_shift",
+        ))
+        if float(getattr(cfg, "gir_projected_front_decay_strength", 0.02)) > 0.0:
+            names.append("gir_projected_front_decay_probability")
+        if bool(getattr(cfg, "gir_old_opacity_gradient_enabled", False)):
+            names.extend(
+                f"gir_projected_{key}"
+                for key in (*opacity_keys, *OLD_OPACITY_GRADIENT_EFFECTIVE_STAT_KEYS)
+            )
+        if bool(getattr(cfg, "gir_mean_gradient_enabled", False)):
+            names.extend(f"gir_projected_{key}" for key in MEAN_GRADIENT_STAT_KEYS)
+    elif old_enabled:
+        names.extend((
+            "gir_historical_gate",
+            "gir_residual_magnitude",
+            "gir_dominant_weight",
+            "gir_top1_ownership_mean",
+            "gir_top1_ownership_above_0_1_ratio",
+            "gir_top1_ownership_above_0_25_ratio",
+        ))
+        if str(getattr(cfg, "gir_top1_confidence_mode", "none")).lower() != "none":
+            names.append("gir_top1_confidence_mean")
+
+    if bool(getattr(cfg, "gir_new_residual_enabled", False)):
+        names.extend(
+            f"gir_new_residual_{key}"
+            for key in (
+                "candidate_ratio",
+                "gate_mean",
+                "raw_mean",
+                "mean_shift_mean",
+                "raw_rotation",
+                "rotation_shift_mean",
+                "raw_log_scale",
+                "scale_relative_shift_mean",
+                "raw_opacity_logit",
+                "opacity_shift_mean",
+                "raw_harmonics",
+                "harmonics_shift_mean",
+                "regularization",
+            )
+        )
+        if bool(getattr(cfg, "gir_new_opacity_gradient_enabled", False)):
+            names.extend(f"gir_new_residual_{key}" for key in opacity_keys)
+        if bool(getattr(cfg, "gir_new_mean_gradient_enabled", False)):
+            names.extend(f"gir_new_residual_{key}" for key in MEAN_GRADIENT_STAT_KEYS)
+
+    if bool(getattr(cfg, "gir_old_delete_enabled", False)):
+        names.extend(
+            f"gir_old_delete_{key}"
+            for key in (
+                "candidate_probability", "candidate_count", "candidate_rate",
+                "hard_ratio", "removed_opacity_mass_ratio",
+                "map_count_before", "map_count_after",
+            )
+        )
+    if bool(getattr(cfg, "gir_old_decay_enabled", False)):
+        names.extend(
+            f"gir_old_decay_{key}"
+            for key in (
+                "candidate_probability", "candidate_count", "opacity_mass_ratio",
+                "hard_pruned_ratio", "map_count_before", "map_count_after",
+            )
+        )
+    return tuple(names)
 
 @dataclass
 class OptimizerCfg:
@@ -307,7 +417,7 @@ class ModelWrapper(LightningModule):
             # Stage 2 starts from a fixed stage-1 model and only learns GIR.
             self.model.requires_grad_(False)
 
-        for module_name in ("gaussian_param_head", "gs_head"):
+        for module_name in ("gaussian_param_head", "gs_head", "depth_head"):
             module = getattr(self.model.encoder, module_name, None)
             if module is None:
                 raise RuntimeError(
@@ -315,19 +425,42 @@ class ModelWrapper(LightningModule):
                 )
             module.requires_grad_(train_base_heads)
 
+        wm_depth_output = getattr(
+            getattr(self.model.encoder.gaussian_param_head, "scratch", None),
+            "output_conv2",
+            None,
+        )
+        depth_head_source = str(
+            getattr(self.model.encoder.cfg, "depth_head_source", "native")
+        ).lower()
+        if depth_head_source not in {"native", "world_mirror"}:
+            raise ValueError(
+                "model.encoder.depth_head_source must be native or "
+                f"world_mirror, got {depth_head_source!r}."
+            )
+        self.model.encoder.depth_head.requires_grad_(
+            train_base_heads and depth_head_source == "native"
+        )
+        if wm_depth_output is None and depth_head_source == "world_mirror":
+            raise RuntimeError("WorldMirror depth output head is missing.")
+        if wm_depth_output is not None:
+            wm_depth_output.requires_grad_(
+                train_base_heads and depth_head_source == "world_mirror"
+            )
+
         camera_head = getattr(self.model.encoder, "camera_head", None)
         reconstruction_backbone = getattr(
             self.model.encoder.cfg, "reconstruction_backbone", "zipmap"
         )
-        if reconstruction_backbone == "zipmap":
+        if reconstruction_backbone in {"zipmap", "streamvggt"}:
             if camera_head is None:
-                raise RuntimeError("ZipMap training requires encoder.camera_head.")
+                raise RuntimeError(f"{reconstruction_backbone} training requires encoder.camera_head.")
             camera_head.requires_grad_(train_base_heads)
             if train_base_heads and self.train_cfg.weight_pose != 0 and not any(
                 parameter.requires_grad for parameter in camera_head.parameters()
             ):
                 raise RuntimeError(
-                    "GT camera loss is enabled, but the ZipMap camera head "
+                    "GT camera loss is enabled, but the reconstruction camera head "
                     "has no trainable parameters."
                 )
 
@@ -519,7 +652,9 @@ class ModelWrapper(LightningModule):
             "Training stage: "
             f"gir_enabled={gir_enabled}, "
             f"train_base_heads={train_base_heads}, "
-            f"train_camera_head={reconstruction_backbone == 'zipmap' and train_base_heads}, "
+            f"train_camera_head={reconstruction_backbone in {'zipmap', 'streamvggt'} and train_base_heads}, "
+            f"depth_head_source={depth_head_source}, "
+            f"train_depth_head={train_base_heads}, "
             f"train_gir={train_gir}"
         )
 
@@ -637,95 +772,8 @@ class ModelWrapper(LightningModule):
         
         distill_infos = encoder_output.distill_infos
         if encoder_output.infos is not None and "gir_add_gate" in encoder_output.infos:
-            self.log(
-                "train/gir_add_gate",
-                encoder_output.infos["gir_add_gate"].float(),
-            )
-            for metric_name in (
-                "gir_add_gate_enabled",
-                "gir_append_mode_code",
-                "gir_point_append_depth_check_enabled",
-                "gir_point_append_hybrid_enabled",
-                "gir_point_coverage_ratio",
-                "gir_point_append_ratio",
-                "gir_point_front_conflict_ratio",
-                "gir_point_front_gradient_decay_gate_ratio",
-                "gir_point_front_decay_mass_ratio",
-                "gir_point_depth_scale",
-                "gir_add_gate_learned",
-                "gir_add_gate_warmup_progress",
-                "gir_add_rate",
-                "gir_effective_new_ratio",
-            ):
+            for metric_name in _gir_training_metric_names(self.model.encoder.cfg):
                 if metric_name in encoder_output.infos:
-                    self.log(
-                        f"train/{metric_name}",
-                        encoder_output.infos[metric_name].float(),
-                    )
-            self.log(
-                "train/gir_historical_gate",
-                encoder_output.infos["gir_historical_gate"].float(),
-            )
-            self.log(
-                "train/gir_map_gaussians",
-                encoder_output.infos["gir_map_gaussians"].float(),
-            )
-            self.log(
-                "train/gir_visible_ratio",
-                encoder_output.infos["gir_visible_ratio"].float(),
-            )
-            self.log(
-                "train/gir_residual_magnitude",
-                encoder_output.infos["gir_residual_magnitude"].float(),
-            )
-            if "gir_raster_alpha" in encoder_output.infos:
-                self.log(
-                    "train/gir_raster_alpha",
-                    encoder_output.infos["gir_raster_alpha"].float(),
-                )
-            if "gir_dominant_weight" in encoder_output.infos:
-                self.log(
-                    "train/gir_dominant_weight",
-                    encoder_output.infos["gir_dominant_weight"].float(),
-                )
-            for metric_name in (
-                "gir_top1_ownership_mean",
-                "gir_top1_confidence_mean",
-                "gir_top1_ownership_above_0_1_ratio",
-                "gir_top1_ownership_above_0_25_ratio",
-                "gir_top1_confidence_mode_code",
-                "gir_top1_confidence_floor",
-            ):
-                if metric_name in encoder_output.infos:
-                    self.log(
-                        f"train/{metric_name}",
-                        encoder_output.infos[metric_name].float(),
-                    )
-            if "gir_new_residual_magnitude" in encoder_output.infos:
-                for metric_name in (
-                    "gir_new_residual_candidate_ratio",
-                    "gir_new_residual_gate_mean",
-                    "gir_new_residual_raw_mean",
-                    "gir_new_residual_mean_shift_mean",
-                    "gir_new_residual_raw_rotation",
-                    "gir_new_residual_rotation_shift_mean",
-                    "gir_new_residual_raw_log_scale",
-                    "gir_new_residual_scale_relative_shift_mean",
-                    "gir_new_residual_raw_opacity_logit",
-                    "gir_new_residual_opacity_shift_mean",
-                    "gir_new_residual_raw_harmonics",
-                    "gir_new_residual_harmonics_shift_mean",
-                    "gir_new_residual_regularization",
-                    "gir_new_residual_mean_gradient_current_norm_mean",
-                    "gir_new_residual_mean_gradient_replay_norm_mean",
-                    "gir_new_residual_mean_gradient_signal_norm_mean",
-                    "gir_new_residual_mean_gradient_current_replay_cosine",
-                    "gir_new_residual_mean_gradient_current_replay_conflict_ratio",
-                    "gir_new_residual_mean_gradient_raw_update_alignment",
-                    "gir_new_residual_mean_gradient_effective_update_alignment",
-                    "gir_new_residual_magnitude",
-                    "gir_new_residual_gate",
-                ):
                     self.log(
                         f"train/{metric_name}",
                         encoder_output.infos[metric_name].float(),
@@ -756,47 +804,6 @@ class ModelWrapper(LightningModule):
                     "train/gir_history_past_degradation",
                     encoder_output.infos["gir_history_past_degradation"].float(),
                 )
-            for metric_name in (
-                "gir_old_residual_enabled",
-                "gir_old_update_mode_code",
-                "gir_residual_topk",
-                "gir_residual_independent_heads",
-                "gir_projected_candidate_ratio",
-                "gir_projected_consistent_ratio",
-                "gir_projected_front_ratio",
-                "gir_projected_gate_mean",
-                "gir_projected_opacity_shift",
-                "gir_projected_front_decay_probability",
-                "gir_projected_mean_gradient_current_norm_mean",
-                "gir_projected_mean_gradient_replay_norm_mean",
-                "gir_projected_mean_gradient_signal_norm_mean",
-                "gir_projected_mean_gradient_current_replay_cosine",
-                "gir_projected_mean_gradient_current_replay_conflict_ratio",
-                "gir_projected_mean_gradient_raw_update_alignment",
-                "gir_projected_mean_gradient_effective_update_alignment",
-                "gir_old_delete_target_ratio",
-                "gir_old_delete_candidate_probability",
-                "gir_old_delete_candidate_count",
-                "gir_old_delete_candidate_rate",
-                "gir_old_delete_hard_ratio",
-                "gir_old_delete_removed_opacity_mass_ratio",
-                "gir_old_delete_map_count_before",
-                "gir_old_delete_map_count_after",
-                "gir_old_decay_topk",
-                "gir_old_decay_strength",
-                "gir_old_decay_prune_threshold",
-                "gir_old_decay_candidate_probability",
-                "gir_old_decay_candidate_count",
-                "gir_old_decay_opacity_mass_ratio",
-                "gir_old_decay_hard_pruned_ratio",
-                "gir_old_decay_map_count_before",
-                "gir_old_decay_map_count_after",
-            ):
-                if metric_name in encoder_output.infos:
-                    self.log(
-                        f"train/{metric_name}",
-                        encoder_output.infos[metric_name].float(),
-                    )
         
         target_gt = (batch["context"]["image"] + 1) / 2
         num_context_views = target_gt.shape[1]
@@ -816,14 +823,15 @@ class ModelWrapper(LightningModule):
         if encoder_output.infos is not None and "gir_aux_loss" in encoder_output.infos:
             gir_aux_loss = encoder_output.infos["gir_aux_loss"]
             gir_aux_weight = float(self.model.encoder.cfg.gir_aux_loss_weight)
-            self.log("loss/gir_aux", gir_aux_loss.item())
+            if gir_aux_weight != 0.0:
+                self.log("loss/gir_aux", gir_aux_loss.item())
             for metric_name in (
                 "gir_base_rgb_loss",
                 "gir_current_rgb_loss",
                 "gir_new_hole_rgb_loss",
                 "gir_replay_rgb_loss",
             ):
-                if metric_name in encoder_output.infos:
+                if gir_aux_weight != 0.0 and metric_name in encoder_output.infos:
                     self.log(
                         f"loss/{metric_name}",
                         encoder_output.infos[metric_name].item(),
@@ -840,8 +848,8 @@ class ModelWrapper(LightningModule):
             old_delete_budget_weight = float(
                 self.model.encoder.cfg.gir_old_delete_budget_weight
             )
-            self.log("loss/gir_old_delete_budget", old_delete_budget_loss.item())
             if old_delete_budget_weight != 0.0:
+                self.log("loss/gir_old_delete_budget", old_delete_budget_loss.item())
                 total_loss = (
                     total_loss
                     + old_delete_budget_weight * old_delete_budget_loss
@@ -856,8 +864,8 @@ class ModelWrapper(LightningModule):
             old_decay_budget_weight = float(
                 self.model.encoder.cfg.gir_old_delete_budget_weight
             )
-            self.log("loss/gir_old_decay_budget", old_decay_budget_loss.item())
             if old_decay_budget_weight != 0.0:
+                self.log("loss/gir_old_decay_budget", old_decay_budget_loss.item())
                 total_loss = total_loss + (
                     old_decay_budget_weight * old_decay_budget_loss
                 )
@@ -869,8 +877,8 @@ class ModelWrapper(LightningModule):
             adapt_weight = float(
                 self.model.encoder.cfg.gir_history_adapt_weight
             )
-            self.log("loss/gir_history_adapt", gir_history_adapt.item())
             if adapt_weight != 0.0:
+                self.log("loss/gir_history_adapt", gir_history_adapt.item())
                 total_loss = total_loss + adapt_weight * gir_history_adapt
         if (
             encoder_output.infos is not None
@@ -882,11 +890,8 @@ class ModelWrapper(LightningModule):
             preserve_weight = float(
                 self.model.encoder.cfg.gir_history_preserve_weight
             )
-            self.log(
-                "loss/gir_history_preserve",
-                gir_history_preserve.item(),
-            )
             if preserve_weight != 0.0:
+                self.log("loss/gir_history_preserve", gir_history_preserve.item())
                 total_loss = total_loss + preserve_weight * gir_history_preserve
         if (
             encoder_output.infos is not None
@@ -896,8 +901,8 @@ class ModelWrapper(LightningModule):
             gir_add_rate_weight = float(
                 self.model.encoder.cfg.gir_add_rate_loss_weight
             )
-            self.log("loss/gir_add_rate", gir_add_rate_loss.item())
             if gir_add_rate_weight != 0.0:
+                self.log("loss/gir_add_rate", gir_add_rate_loss.item())
                 total_loss = (
                     total_loss + gir_add_rate_weight * gir_add_rate_loss
                 )
@@ -909,8 +914,8 @@ class ModelWrapper(LightningModule):
             regularization_weight = float(
                 self.model.encoder.cfg.gir_regularization_weight
             )
-            self.log("loss/gir_regularization", gir_regularization.item())
             if regularization_weight != 0.0:
+                self.log("loss/gir_regularization", gir_regularization.item())
                 total_loss = total_loss + regularization_weight * gir_regularization
 
         with torch.amp.autocast("cuda", enabled=False):
@@ -932,8 +937,15 @@ class ModelWrapper(LightningModule):
             for component_name, component_value in getattr(
                 depth_loss_module, "last_depth_components", {}
             ).items():
+                if component_name == "depth_absolute_log_scale_weighted":
+                    continue
+                namespace = (
+                    "diagnostics"
+                    if component_name.startswith("depth_camera_scale_alignment_")
+                    else "loss"
+                )
                 self.log(
-                    f"loss/{component_name}",
+                    f"{namespace}/{component_name}",
                     component_value,
                     on_step=True,
                     on_epoch=False,
@@ -945,7 +957,7 @@ class ModelWrapper(LightningModule):
                 depth_loss_module, "last_teacher_gt_metrics", {}
             ).items():
                 self.log(
-                    f"train/{metric_name}",
+                    f"diagnostics/{metric_name}",
                     metric_value,
                     on_step=True,
                     on_epoch=False,
@@ -1659,6 +1671,13 @@ class ModelWrapper(LightningModule):
                 "gir_old_decay_map_count_before",
                 "gir_old_decay_map_count_after",
             )
+            info_keys += tuple(
+                key
+                for key in encoder_output.infos
+                if key.startswith(("gir_projected_", "gir_new_residual_"))
+                and "gradient_" in key
+                and key not in info_keys
+            )
             for key in info_keys:
                 if key in encoder_output.infos:
                     gir_diagnostics[key.removeprefix("gir_")] = float(
@@ -2213,6 +2232,7 @@ class ModelWrapper(LightningModule):
             "model.encoder.gaussian_param_head",
             "model.encoder.gs_head",
             "model.encoder.camera_head",
+            "model.encoder.depth_head",
         )
         scratch_keys = (
             "model.encoder.depth_refiner",
