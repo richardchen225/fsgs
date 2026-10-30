@@ -183,6 +183,9 @@ checkpointing:
   every_n_train_steps: 500
   save_weights_only: false
   save_top_k: 10
+
+test:
+  save_unfiltered_ply: true
   
 train:
   pose_loss_alpha: 1.0

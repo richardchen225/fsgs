@@ -47,6 +47,7 @@ def experiment(**overrides):
         gir_opacity_gradient_front_decay_gate_enabled=True,
         gir_mean_gradient_enabled=False,
         gir_new_mean_gradient_enabled=False,
+        gir_add_gate_enabled=False,
         gir_old_delete_enabled=False,
         gir_old_decay_enabled=False,
     )
@@ -60,6 +61,7 @@ class TrainingMetricTests(unittest.TestCase):
         self.assertIn("gir_projected_gradient_current_replay_conflict_ratio", names)
         self.assertIn("gir_new_residual_gradient_update_alignment", names)
         self.assertIn("gir_point_front_gradient_decay_gate_ratio", names)
+        self.assertNotIn("gir_add_gate", names)
         self.assertFalse(any("mean_gradient_" in name for name in names))
         self.assertFalse(any(name.endswith(("_enabled", "_mode_code", "_warmup_progress")) for name in names))
         for removed in (
@@ -67,6 +69,9 @@ class TrainingMetricTests(unittest.TestCase):
             "gir_historical_gate", "gir_residual_magnitude",
             "gir_new_residual_magnitude", "gir_new_residual_gate",
             "gir_projected_front_decay_probability", "gir_add_rate", "gir_add_gate_learned",
+            "gir_visible_ratio", "gir_raster_alpha", "gir_effective_new_ratio",
+            "gir_new_residual_candidate_ratio", "gir_new_residual_raw_mean",
+            "gir_new_residual_regularization",
         ):
             self.assertNotIn(removed, names)
 
@@ -85,9 +90,10 @@ class TrainingMetricTests(unittest.TestCase):
             gir_projected_front_decay_strength=0.02,
             gir_old_delete_enabled=True,
         ))
-        self.assertEqual(sum("mean_gradient_" in name for name in names), 14)
+        self.assertEqual(sum("mean_gradient_" in name for name in names), 10)
         self.assertIn("gir_projected_front_decay_probability", names)
-        self.assertIn("gir_old_delete_candidate_count", names)
+        self.assertIn("gir_old_delete_candidate_rate", names)
+        self.assertNotIn("gir_old_delete_candidate_count", names)
         self.assertNotIn("gir_old_delete_target_ratio", names)
 
     def test_pixel_and_learned_paths_keep_their_own_diagnostics(self):
@@ -97,6 +103,7 @@ class TrainingMetricTests(unittest.TestCase):
         ))
         self.assertIn("gir_historical_gate", names)
         self.assertIn("gir_add_rate", names)
+        self.assertIn("gir_add_gate_learned", names)
         self.assertNotIn("gir_top1_confidence_mean", names)
         self.assertFalse(any(name.startswith(("gir_projected_", "gir_new_residual_", "gir_point_")) for name in names))
 

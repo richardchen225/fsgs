@@ -63,23 +63,14 @@ from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 from .encoder.vggt.utils.rotation import quat_to_mat
 from .ply_export import export_ply
 from lightning.pytorch.loggers.wandb import WandbLogger
-from .streaming_gir import (
-    MEAN_GRADIENT_STAT_KEYS,
-    OLD_OPACITY_GRADIENT_EFFECTIVE_STAT_KEYS,
-)
-
-
 def _gir_training_metric_names(cfg) -> tuple[str, ...]:
-    """Select live diagnostics for the configured streaming update paths."""
+    """Select compact, non-redundant diagnostics for active GIR paths."""
     if not bool(getattr(cfg, "gir_enabled", False)):
         return ()
-    names = [
-        "gir_add_gate",
-        "gir_map_gaussians",
-        "gir_visible_ratio",
-        "gir_raster_alpha",
-        "gir_effective_new_ratio",
-    ]
+    names = ["gir_map_gaussians"]
+    if bool(getattr(cfg, "gir_add_gate_enabled", False)):
+        names.append("gir_add_gate")
+
     append_mode = str(getattr(cfg, "gir_append_mode", "learned")).lower()
     if append_mode == "point_map":
         names.extend((
@@ -95,10 +86,19 @@ def _gir_training_metric_names(cfg) -> tuple[str, ...]:
         names.extend(("gir_add_gate_learned", "gir_add_rate"))
 
     opacity_keys = (
-        "gradient_current_nonzero_ratio",
         "gradient_signal_abs_mean",
-        "gradient_signal_positive_ratio",
         "gradient_update_alignment",
+    )
+    old_opacity_effective_keys = (
+        "gradient_effective_alignment",
+        "gradient_current_replay_conflict_ratio",
+    )
+    mean_gradient_keys = (
+        "mean_gradient_current_norm_mean",
+        "mean_gradient_replay_norm_mean",
+        "mean_gradient_current_replay_cosine",
+        "mean_gradient_current_replay_conflict_ratio",
+        "mean_gradient_effective_update_alignment",
     )
     old_enabled = bool(getattr(cfg, "gir_old_residual_enabled", True))
     projected = str(getattr(cfg, "gir_old_update_mode", "pixel_topk")).lower() == "projected_shared"
@@ -115,17 +115,15 @@ def _gir_training_metric_names(cfg) -> tuple[str, ...]:
         if bool(getattr(cfg, "gir_old_opacity_gradient_enabled", False)):
             names.extend(
                 f"gir_projected_{key}"
-                for key in (*opacity_keys, *OLD_OPACITY_GRADIENT_EFFECTIVE_STAT_KEYS)
+                for key in (*opacity_keys, *old_opacity_effective_keys)
             )
         if bool(getattr(cfg, "gir_mean_gradient_enabled", False)):
-            names.extend(f"gir_projected_{key}" for key in MEAN_GRADIENT_STAT_KEYS)
+            names.extend(f"gir_projected_{key}" for key in mean_gradient_keys)
     elif old_enabled:
         names.extend((
             "gir_historical_gate",
             "gir_residual_magnitude",
-            "gir_dominant_weight",
             "gir_top1_ownership_mean",
-            "gir_top1_ownership_above_0_1_ratio",
             "gir_top1_ownership_above_0_25_ratio",
         ))
         if str(getattr(cfg, "gir_top1_confidence_mode", "none")).lower() != "none":
@@ -135,41 +133,31 @@ def _gir_training_metric_names(cfg) -> tuple[str, ...]:
         names.extend(
             f"gir_new_residual_{key}"
             for key in (
-                "candidate_ratio",
                 "gate_mean",
-                "raw_mean",
                 "mean_shift_mean",
-                "raw_rotation",
                 "rotation_shift_mean",
-                "raw_log_scale",
                 "scale_relative_shift_mean",
-                "raw_opacity_logit",
                 "opacity_shift_mean",
-                "raw_harmonics",
                 "harmonics_shift_mean",
-                "regularization",
             )
         )
         if bool(getattr(cfg, "gir_new_opacity_gradient_enabled", False)):
             names.extend(f"gir_new_residual_{key}" for key in opacity_keys)
         if bool(getattr(cfg, "gir_new_mean_gradient_enabled", False)):
-            names.extend(f"gir_new_residual_{key}" for key in MEAN_GRADIENT_STAT_KEYS)
+            names.extend(f"gir_new_residual_{key}" for key in mean_gradient_keys)
 
     if bool(getattr(cfg, "gir_old_delete_enabled", False)):
         names.extend(
             f"gir_old_delete_{key}"
             for key in (
-                "candidate_probability", "candidate_count", "candidate_rate",
-                "hard_ratio", "removed_opacity_mass_ratio",
-                "map_count_before", "map_count_after",
+                "candidate_rate", "hard_ratio", "removed_opacity_mass_ratio",
             )
         )
     if bool(getattr(cfg, "gir_old_decay_enabled", False)):
         names.extend(
             f"gir_old_decay_{key}"
             for key in (
-                "candidate_probability", "candidate_count", "opacity_mass_ratio",
-                "hard_pruned_ratio", "map_count_before", "map_count_after",
+                "opacity_mass_ratio", "hard_pruned_ratio",
             )
         )
     return tuple(names)
@@ -200,6 +188,7 @@ class TestCfg:
     mode: Literal["inference", "evaluation"]
     image_folder: str
     save_metrics: bool = True
+    save_unfiltered_ply: bool = False
     gir_add_gate_prune_threshold: float = 0.0
     gir_test_top1_confidence_mode: Literal[
         "inherit", "none", "floor_sqrt", "sqrt"
@@ -825,13 +814,26 @@ class ModelWrapper(LightningModule):
             gir_aux_weight = float(self.model.encoder.cfg.gir_aux_loss_weight)
             if gir_aux_weight != 0.0:
                 self.log("loss/gir_aux", gir_aux_loss.item())
-            for metric_name in (
-                "gir_base_rgb_loss",
-                "gir_current_rgb_loss",
-                "gir_new_hole_rgb_loss",
-                "gir_replay_rgb_loss",
-            ):
-                if gir_aux_weight != 0.0 and metric_name in encoder_output.infos:
+            gir_rgb_loss_weights = {
+                "gir_base_rgb_loss": float(
+                    self.model.encoder.cfg.gir_base_loss_weight
+                ),
+                "gir_current_rgb_loss": float(
+                    self.model.encoder.cfg.gir_current_loss_weight
+                ),
+                "gir_new_hole_rgb_loss": float(
+                    self.model.encoder.cfg.gir_new_hole_loss_weight
+                ),
+                "gir_replay_rgb_loss": float(
+                    self.model.encoder.cfg.gir_replay_loss_weight
+                ),
+            }
+            for metric_name, component_weight in gir_rgb_loss_weights.items():
+                if (
+                    gir_aux_weight != 0.0
+                    and component_weight != 0.0
+                    and metric_name in encoder_output.infos
+                ):
                     self.log(
                         f"loss/{metric_name}",
                         encoder_output.infos[metric_name].item(),
@@ -1590,6 +1592,29 @@ class ModelWrapper(LightningModule):
                     return_debug_intermediates=save_gir_debug,
                     debug_view_stride=debug_view_stride,
                 )
+                if self.test_cfg.save_unfiltered_ply:
+                    safe_scene_name = scene_name.replace("/", "_").replace(
+                        "\\", "_"
+                    )
+                    ply_path = (
+                        self.test_cfg.output_path
+                        / "gaussians_unfiltered"
+                        / f"{safe_scene_name}.ply"
+                    )
+                    export_ply(
+                        gaussians.means[0],
+                        gaussians.scales[0],
+                        gaussians.rotations[0],
+                        gaussians.harmonics[0],
+                        gaussians.opacities[0],
+                        ply_path,
+                        shift_and_scale=False,
+                        filter_gaussians=False,
+                    )
+                    print(
+                        f"[test] exported {gaussians.means.shape[1]} "
+                        f"unfiltered GS to {ply_path}"
+                    )
                 if (
                     encoder_output.infos is not None
                     and "gir_history_views" in encoder_output.infos

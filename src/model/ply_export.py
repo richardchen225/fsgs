@@ -27,7 +27,9 @@ def export_ply(
     means: Float[Tensor, "gaussian 3"],
     scales: Float[Tensor, "gaussian 3"],
     rotations: Float[Tensor, "gaussian 4"],
-    harmonics: Float[Tensor, "gaussian 3 d_sh"],
+    harmonics: Float[
+        Tensor, "gaussian harmonic_or_rgb rgb_or_harmonic"
+    ],
     opacities: Float[Tensor, "gaussian"],
     path: Path,
     shift_and_scale: bool = False,
