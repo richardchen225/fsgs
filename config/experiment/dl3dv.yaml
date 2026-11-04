@@ -4,7 +4,8 @@ defaults:
   - /dataset@_group_.dl3dv: dl3dv
   - override /model/encoder: anysplat
   - override /model/encoder/backbone: croco
-  - override /loss: [mse, lpips, ssim, depth]
+  - override /loss: [mse, lpips, depth]
+  - _self_
 
 wandb:
   name: dl3dv
@@ -13,15 +14,20 @@ wandb:
 model:
   encoder:
     mode: ${mode}
-    reconstruction_backbone: zipmap
+    reconstruction_backbone: streamvggt
     depth_head_source: native  # native | world_mirror
-    streamvggt_weights_path: null
+    streamvggt_weights_path: weights/pre_svggt.safetensors
     zipmap_weights_path: weights/pre_zipmap.pt
-    # Keep photometric gradients to the camera head. The decoder uses rigid
-    # pose inversion and the configured 0.01 near plane for stable backprop.
-    detach_predicted_camera_for_geometry: false
+    # Match offline detach_predicted_camera=true: RGB geometry cannot update
+    # the camera head; only the explicit adjacent-pair camera loss can do so.
+    detach_predicted_camera_for_geometry: true
     # Use the first source frame's predicted intrinsics for every view.
-    share_first_frame_intrinsics: true
+    share_first_frame_intrinsics: false
+    # Match offline_gs_mlp_overfit: predicted geometry is aligned once to the
+    # source GT gauge, while source/heldout RGB supervision renders with GT.
+    sim3_alignment_mode: always
+    source_render_camera: gt
+    heldout_test_camera: gt
     depth_refine_downsample_factor: 4
     depth_refine_enabled: false
     gir_enabled: true
@@ -33,7 +39,9 @@ model:
     gir_dominant_min_weight: 1e-4
     gir_top1_confidence_mode: none
     gir_top1_confidence_floor: 0.25
-    gir_old_residual_enabled: true
+    # The unified learned optimizer runs after point-map append and replaces
+    # the separate old/new residual and deterministic functional-update paths.
+    gir_old_residual_enabled: false
     # GS-centric old-map update: project every old GS and decode its opacity
     # update with one shared pointwise MLP. No top-k contributor IDs are used.
     gir_old_update_mode: projected_shared
@@ -47,18 +55,89 @@ model:
     gir_projected_warmup_steps: 1000
     # Condition both old/new residual branches on rendered opacity gradients.
     # The old-GS evidence also gates deterministic front-conflict decay.
-    gir_old_opacity_gradient_enabled: true
-    gir_new_opacity_gradient_enabled: true
-    gir_opacity_gradient_front_decay_gate_enabled: true
+    gir_old_opacity_gradient_enabled: false
+    gir_new_opacity_gradient_enabled: false
+    gir_opacity_gradient_front_decay_gate_enabled: false
     # Match overfit old-GS camera-space mean-gradient conditioning. Use the
     # current frame plus every causally available replay frame.
-    gir_mean_gradient_enabled: true
+    gir_mean_gradient_enabled: false
     gir_mean_gradient_scale: 1.0
     gir_mean_gradient_clip: 20.0
     gir_mean_gradient_threshold: 1.0e-6
     gir_mean_gradient_replay_views: -1
     gir_old_mean_gradient_current_weight: 1.0
     gir_old_mean_gradient_replay_weight: 0.5
+    # Split a small top-ranked subset of large, high-gradient, geometrically
+    # consistent historical splats into two independently revisable children.
+    gir_split_enabled: false
+    gir_split_projected_radius_threshold: 4.0
+    gir_split_mean_gradient_threshold: 1.0e-6
+    gir_split_min_observations: 2
+    gir_split_max_ratio: 0.005
+    gir_split_max_generation: 1
+    gir_split_offset_scale: 0.4
+    gir_split_scale_divisor: 1.6
+    gir_split_min_opacity: 0.02
+    gir_split_max_gaussians: 0
+    gir_split_warmup_steps: 1000
+    gir_functional_update_enabled: false
+    gir_functional_update_replay_views: 2
+    gir_functional_update_top_ratio: 0.05
+    gir_functional_update_min_observations: 1
+    gir_functional_update_mean_enabled: true
+    gir_functional_update_opacity_enabled: true
+    gir_functional_update_harmonics_enabled: true
+    gir_functional_update_mean_learning_rate: 1.0e-3
+    gir_functional_update_opacity_learning_rate: 5.0e-3
+    gir_functional_update_harmonics_learning_rate: 1.0e-3
+    gir_functional_update_harmonics_gradient_scale: 1.0
+    gir_functional_update_harmonics_gradient_clip: 20.0
+    gir_functional_update_harmonics_gradient_threshold: 1.0e-6
+    gir_functional_update_current_weight: 1.0
+    gir_functional_update_replay_weight: 0.5
+    gir_functional_update_max_mean_step_scale: 0.25
+    gir_functional_update_max_opacity_logit_step: 0.10
+    gir_functional_update_max_harmonics_step: 0.05
+    gir_symmetric_multiview_update_enabled: true
+    gir_symmetric_multiview_hidden_dim: 128
+    gir_symmetric_multiview_chunk_size: 16384
+    # DeltaSplat-style image-space context, aggregated symmetrically over views.
+    gir_symmetric_multiview_visual_enabled: false
+    gir_symmetric_multiview_visual_feature_dim: 24
+    gir_symmetric_multiview_visual_hidden_dim: 32
+    gir_symmetric_multiview_visual_image_scale: 0.5
+    gir_symmetric_multiview_visual_depth_temperature: 0.10
+    gir_symmetric_multiview_visual_min_alpha: 0.01
+    gir_symmetric_multiview_opacity_gradient_scale: 1000.0
+    gir_symmetric_multiview_opacity_gradient_clip: 20.0
+    gir_symmetric_multiview_opacity_gradient_threshold: 1.0e-3
+    gir_symmetric_multiview_mean_gradient_scale: 1.0
+    gir_symmetric_multiview_mean_gradient_clip: 20.0
+    gir_symmetric_multiview_mean_gradient_threshold: 1.0e-6
+    gir_symmetric_multiview_harmonics_gradient_scale: 1.0
+    gir_symmetric_multiview_harmonics_gradient_clip: 20.0
+    gir_symmetric_multiview_harmonics_gradient_threshold: 1.0e-6
+    gir_symmetric_multiview_max_mean_step_scale: 0.10
+    gir_symmetric_multiview_max_rotation_step: 0.01
+    gir_symmetric_multiview_max_log_scale_step: 0.02
+    gir_symmetric_multiview_max_opacity_logit_step: 0.10
+    gir_symmetric_multiview_max_harmonics_step: 0.05
+    gir_symmetric_multiview_unbounded_updates: true
+    gir_training_mode: incremental_final_map
+    # Point-map anchors progressively add persistent, non-recursive children.
+    gir_anchor_child_enabled: false
+    gir_anchor_child_max_count: 8
+    gir_anchor_child_add_count: 1
+    gir_anchor_child_min_observations: 2
+    gir_anchor_child_gradient_threshold: 0.05
+    gir_anchor_child_coherence_threshold: 0.5
+    gir_anchor_child_max_conflict_ratio: 0.25
+    gir_anchor_child_cooldown_views: 2
+    gir_anchor_child_max_ratio: 0.05
+    gir_anchor_child_offset_scale: 0.4
+    gir_anchor_child_scale_divisor: 1.6
+    gir_anchor_child_min_opacity: 0.02
+    gir_anchor_child_max_gaussians: 500000
     # This experiment conditions only historical GS updates on mean gradients.
     gir_new_mean_gradient_enabled: false
     gir_old_delete_enabled: false
@@ -91,7 +170,9 @@ model:
     # matching the successful overfit rollout.
     gir_tbptt_chunk: -1
     gir_replay_views: -1
-    gir_aux_loss_weight: 1.0
+    # Final-map mode still renders causal evidence per arrival, but these
+    # intermediate RGB terms are excluded from the training objective.
+    gir_aux_loss_weight: 0.0
     gir_base_loss_weight: 1.0
     gir_current_loss_weight: 1.0
     gir_new_hole_loss_weight: 1.0
@@ -101,16 +182,33 @@ model:
     gir_history_loss_interval: 4
     gir_history_preserve_margin: 0.002
     gir_history_replay_views: -1
-    # Immediate layered fusion: decay old points in front, keep matching and
-    # behind layers, and append every reliable current surface without a match.
+    # Point-map coverage decides which later-view pixels receive new anchors.
     gir_append_mode: point_map
+    gir_tracker_backend: alltracker
+    gir_tracker_repo_path: third_party/AllTracker
+    gir_tracker_weights_path: third_party/AllTracker/ckpts/alltracker.pth
+    # Match the official AllTracker demo inference path (FP32).
+    gir_tracker_mixed_precision: false
+    gir_tracker_iterations: 4
+    gir_tracker_window_length: 16
+    # Coverage is intentionally more permissive than AllTracker's official
+    # tracking evaluation threshold (0.6): uncertain correspondences should
+    # suppress duplicate GS unless they also fail the relaxed FB cycle check.
+    gir_tracker_visibility_threshold: 0.3
+    gir_tracker_coverage_threshold: 0.05
+    gir_tracker_dilation_radius: 2
+    gir_tracker_forward_backward_enabled: true
+    gir_tracker_cycle_absolute_threshold: 3.0
+    gir_tracker_cycle_relative_threshold: 0.10
     gir_point_append_depth_check_enabled: false
+    gir_point_append_align_depth_scale_enabled: false
+    gir_point_map_follow_mean_updates_enabled: true
     gir_point_append_hybrid_enabled: true
     # Ablation: do not treat a closer current surface as automatic new geometry.
     gir_point_append_current_in_front_enabled: true
     # Ablation: do not append behind unmatched projected historical points.
     gir_point_append_history_in_front_enabled: true
-    gir_point_append_depth_relative_tolerance: 0.15
+    gir_point_append_depth_relative_tolerance: 0.10
     gir_point_append_rgb_bad_threshold: 0.08
     gir_point_append_old_alpha_threshold: 0.10
     gir_point_append_min_depth_confidence: 0.0
@@ -118,10 +216,12 @@ model:
     # Decay fraction 0.70 retains 30% opacity for a selected old GS.
     gir_point_append_front_conflict_opacity_decay: 0.70
     gir_point_append_max_ratio: 1.0
-    gir_point_append_dilation_radius: 2
+    gir_point_append_dilation_radius: 0
     gir_point_append_chunk_size: 65536
     gir_add_gate_enabled: false
-    gir_new_residual_enabled: true
+    gir_new_residual_enabled: false
+    # Use the original dense gs_head for candidate initialization.
+    gir_new_gs_shared_decoder_enabled: false
     # Preserve cross-view gradients inside each TBPTT chunk so sparse point-map
     # appends can jointly optimize the shared historical geometry.
     gir_historical_detach_mode: none
@@ -130,7 +230,7 @@ model:
     gir_residual_rgb_bad_threshold: 0.08
     gir_add_gate_warmup_steps: 1000
     gir_add_rate_loss_weight: 0.0
-    gir_regularization_weight: 1e-4
+    gir_regularization_weight: 0.0
     
 dataset:
   dl3dv:
@@ -142,6 +242,9 @@ dataset:
     tgt_list: [2, 3, 7, 12, 17, 18]
     input_image_shape: [252, 518]
     view_sampler:
+      # Training splits the sampled sequence in half. Six total views guarantee
+      # the three source cameras required by Sim(3) alignment.
+      min_context_views: 6
       num_target_views: 9
       min_distance_between_context_views: 32
       max_distance_between_context_views: 48
@@ -154,13 +257,27 @@ dataset:
 
 optimizer:
   lr: 5e-5
-  # Fine-tune the pretrained reconstruction and camera heads while training GIR.
+  # Match the independently optimized offline heads.
   pretrained_lr: 1e-5
   scratch_lr: 5e-5
+  gaussian_param_head_lr: 1e-5
+  gs_head_lr: 5e-5
+  camera_lr: 1e-5
+  depth_lr: 1e-5
+  gir_lr: 1e-4
+  base_weight_decay: 0.0
+  gir_weight_decay: 0.0
+  beta1: 0.9
+  beta2: 0.999
+  scheduler_mode: cosine
   warm_up_steps: 1000
   backbone_lr_multiplier: 0.1
   train_base_heads: true
   train_gir: true
+  train_gaussian_param_head: true
+  train_gs_head: true
+  train_camera_head: true
+  train_depth_head: true
 
 data_loader:
   train:
@@ -174,6 +291,7 @@ trainer:
   num_nodes: 1
   devices: 4
   accumulate_grad_batches: 1
+  gradient_clip_val: 0.0
   precision: 16-mixed
 
 checkpointing:
@@ -191,8 +309,16 @@ train:
   pose_loss_alpha: 1.0
   pose_loss_delta: 1.0
   camera_focal_weight: 1.0
+  camera_pose_loss_mode: adjacent_pair
+  camera_translation_direction_weight: 0.1
+  # Match offline: ignore nearly static pairs in the direction term and
+  # emphasize pairs in proportion to their GT adjacent baseline.
+  camera_translation_direction_min_baseline_ratio: 0.05
+  camera_translation_direction_baseline_weighting: true
+  camera_global_trajectory_weight: 0.1
+  camera_grad_clip: 1.0
   cxt_depth_weight: 1.0
-  weight_pose: 10.0
+  weight_pose: 1.0
   weight_depth: 1.0
   weight_normal: 0.1
 
@@ -202,15 +328,16 @@ hydra:
     
 loss:
   mse:
-    weight_ctx: 0.0
+    # Final source-map reconstruction plus the existing heldout half.
+    weight_ctx: 1.0
     weight_novel: 1.0
     conf: false
   lpips:
     weight: 0.05
     apply_after_step: 0
-  ssim:
-    weight: 0.05
-    apply_after_step: 0
+    view_group: source
+    chunk_size: 1
+    gradient_checkpointing: true
   depth:
     teacher: dav3
     alignment: sequence_scale_only_log

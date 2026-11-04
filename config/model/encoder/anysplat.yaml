@@ -4,18 +4,29 @@ defaults:
 name: anysplat
 mode: ${mode}
 
-# Reconstruction features/cameras: zipmap or streamvggt, with shared GS heads.
+# Reconstruction features/cameras: zipmap, streamvggt, or abot, with shared GS heads.
 reconstruction_backbone: zipmap
 # native: use the selected backbone's pretrained DPT depth head.
 # world_mirror: use the depth output inside the WorldMirror GS feature head.
 depth_head_source: native
 streamvggt_weights_path: weights/pre_svggt.safetensors
+abot_weights_path: null
+# Released ABot-Recon uses a fixed 12-frame local window. SDPA is portable and
+# does not require the optional FlashInfer runtime.
+abot_local_window_frames: 12
+abot_attention_backend: sdpa  # auto | sdpa | paged
+abot_amp_dtype: bf16          # fp32 | fp16 | bf16
+abot_max_frames: 4096
 depth_teacher: ${oc.select:loss.depth.teacher,dav3}
 # Experiments with direct pose/FOV supervision can detach rasterizer geometry
 # from the camera head when camera gradients are unstable.
 detach_predicted_camera_for_geometry: false
 # Share the first input frame's predicted intrinsics across the sequence.
 share_first_frame_intrinsics: false
+# Optional oracle-camera ablation matching offline_gs_mlp_overfit.
+sim3_alignment_mode: never  # auto | always | never
+source_render_camera: predicted  # gt | predicted
+heldout_test_camera: predicted  # gt | predicted
 
 opacity_mapping:
   initial: 0.0
@@ -85,6 +96,81 @@ gir_mean_gradient_threshold: 1.0e-6
 gir_mean_gradient_replay_views: 6
 gir_old_mean_gradient_current_weight: 1.0
 gir_old_mean_gradient_replay_weight: 0.5
+# Deterministic old-GS densification. The experiment must also enable old
+# mean-gradient evidence because its norm is used as the split score.
+gir_split_enabled: false
+gir_split_projected_radius_threshold: 4.0
+gir_split_mean_gradient_threshold: 1.0e-6
+gir_split_min_observations: 2
+gir_split_max_ratio: 0.005
+gir_split_max_generation: 1
+gir_split_offset_scale: 0.4
+gir_split_scale_divisor: 1.6
+gir_split_min_opacity: 0.02
+# Zero disables the absolute map-size cap.
+gir_split_max_gaussians: 0
+gir_split_warmup_steps: 1000
+# One scene-local first-order SGD step after the learned projected update.
+gir_functional_update_enabled: false
+gir_functional_update_replay_views: 2
+gir_functional_update_top_ratio: 0.05
+gir_functional_update_min_observations: 1
+gir_functional_update_mean_enabled: true
+gir_functional_update_opacity_enabled: true
+gir_functional_update_harmonics_enabled: true
+gir_functional_update_mean_learning_rate: 1.0e-3
+gir_functional_update_opacity_learning_rate: 5.0e-3
+gir_functional_update_harmonics_learning_rate: 1.0e-3
+gir_functional_update_harmonics_gradient_scale: 1.0
+gir_functional_update_harmonics_gradient_clip: 20.0
+gir_functional_update_harmonics_gradient_threshold: 1.0e-6
+gir_functional_update_current_weight: 1.0
+gir_functional_update_replay_weight: 0.5
+gir_functional_update_max_mean_step_scale: 0.25
+gir_functional_update_max_opacity_logit_step: 0.10
+gir_functional_update_max_harmonics_step: 0.05
+# Append old/new GS first, then condition one shared pointwise residual on
+# permutation-invariant gradients from every causally observed view.
+gir_symmetric_multiview_update_enabled: false
+gir_symmetric_multiview_hidden_dim: 128
+gir_symmetric_multiview_chunk_size: 65536
+# DeltaSplat-style RGB residual/render/depth/Plucker evidence. Experiments opt in.
+gir_symmetric_multiview_visual_enabled: false
+gir_symmetric_multiview_visual_feature_dim: 24
+gir_symmetric_multiview_visual_hidden_dim: 32
+gir_symmetric_multiview_visual_image_scale: 0.5
+gir_symmetric_multiview_visual_depth_temperature: 0.10
+gir_symmetric_multiview_visual_min_alpha: 0.01
+gir_symmetric_multiview_opacity_gradient_scale: 1000.0
+gir_symmetric_multiview_opacity_gradient_clip: 20.0
+gir_symmetric_multiview_opacity_gradient_threshold: 1.0e-3
+gir_symmetric_multiview_mean_gradient_scale: 1.0
+gir_symmetric_multiview_mean_gradient_clip: 20.0
+gir_symmetric_multiview_mean_gradient_threshold: 1.0e-6
+gir_symmetric_multiview_harmonics_gradient_scale: 1.0
+gir_symmetric_multiview_harmonics_gradient_clip: 20.0
+gir_symmetric_multiview_harmonics_gradient_threshold: 1.0e-6
+gir_symmetric_multiview_max_mean_step_scale: 0.10
+gir_symmetric_multiview_max_rotation_step: 0.01
+gir_symmetric_multiview_max_log_scale_step: 0.02
+gir_symmetric_multiview_max_opacity_logit_step: 0.10
+gir_symmetric_multiview_max_harmonics_step: 0.05
+gir_symmetric_multiview_unbounded_updates: false
+gir_training_mode: streaming_aux  # streaming_aux | incremental_final_map
+# Progressive, non-recursive children for point-map anchors. Experiments opt in.
+gir_anchor_child_enabled: false
+gir_anchor_child_max_count: 8
+gir_anchor_child_add_count: 1
+gir_anchor_child_min_observations: 2
+gir_anchor_child_gradient_threshold: 0.05
+gir_anchor_child_coherence_threshold: 0.5
+gir_anchor_child_max_conflict_ratio: 0.25
+gir_anchor_child_cooldown_views: 2
+gir_anchor_child_max_ratio: 0.05
+gir_anchor_child_offset_scale: 0.4
+gir_anchor_child_scale_divisor: 1.6
+gir_anchor_child_min_opacity: 0.02
+gir_anchor_child_max_gaussians: 500000
 # Use the same camera-space evidence with an independent new-GS adapter.
 gir_new_mean_gradient_enabled: false
 gir_new_mean_gradient_replay_views: 0
@@ -116,9 +202,29 @@ gir_rotation_scale: 0.05
 gir_harmonics_scale: 0.10
 # New-GS append policy. Hybrid point-map mode compares all projected point-map
 # depth layers and deterministically fades conflicting front GS.
-gir_append_mode: all  # all | point_map | learned
+gir_append_mode: all  # all | point_map | tracker | tracker_point_map | learned
+# Rolling previous-frame dense-tracker coverage. In tracker mode, no global-map
+# projection or depth consistency is used to decide which pixels append.
+gir_tracker_backend: spot  # spot | alltracker
+gir_tracker_repo_path: third_party/SPOT
+gir_tracker_weights_path: third_party/SPOT/ckpts/spot.pth
+gir_tracker_mixed_precision: true
+gir_tracker_iterations: 4
+gir_tracker_window_length: 16
+gir_tracker_visibility_threshold: 0.8
+gir_tracker_coverage_threshold: 0.05
+gir_tracker_dilation_radius: 1
+gir_tracker_forward_backward_enabled: false
+# A source track is accepted when cycle error is below
+# absolute_threshold + relative_threshold * bidirectional motion magnitude.
+gir_tracker_cycle_absolute_threshold: 1.5
+gir_tracker_cycle_relative_threshold: 0.05
 # Legacy fallback used only when hybrid mode is disabled.
 gir_point_append_depth_check_enabled: true
+# Align appended GS means/scales to the historical map's depth scale.
+gir_point_append_align_depth_scale_enabled: false
+# Use residual-updated GS means for subsequent point-map append coverage.
+gir_point_map_follow_mean_updates_enabled: false
 gir_point_append_hybrid_enabled: false
 # Whether a current surface clearly in front of all projected history may append.
 gir_point_append_current_in_front_enabled: true
@@ -146,6 +252,11 @@ gir_debug_numerics: false
 gir_debug_numerics_max_views: 2
 gir_historical_detach_mode: means
 gir_new_residual_enabled: false
+# Replace dense gs_head parameters with analytic anchors, then decode all
+# first-frame and append-selected later anchors with the shared new-GS MLP.
+gir_new_gs_shared_decoder_enabled: false
+gir_new_gs_shared_decoder_base_opacity: 0.5
+gir_new_gs_shared_decoder_scale_multiplier: 1.0
 gir_residual_alpha_threshold: 0.02
 gir_residual_depth_relative_tolerance: 0.08
 gir_residual_rgb_bad_threshold: 0.08

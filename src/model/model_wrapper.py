@@ -72,7 +72,7 @@ def _gir_training_metric_names(cfg) -> tuple[str, ...]:
         names.append("gir_add_gate")
 
     append_mode = str(getattr(cfg, "gir_append_mode", "learned")).lower()
-    if append_mode == "point_map":
+    if append_mode in {"point_map", "tracker_point_map"}:
         names.extend((
             "gir_point_coverage_ratio",
             "gir_point_append_ratio",
@@ -80,10 +80,69 @@ def _gir_training_metric_names(cfg) -> tuple[str, ...]:
             "gir_point_front_decay_mass_ratio",
             "gir_point_depth_scale",
         ))
+        if bool(
+            getattr(
+                cfg,
+                "gir_point_append_align_depth_scale_enabled",
+                False,
+            )
+        ):
+            names.extend((
+                "gir_point_depth_scale_min",
+                "gir_point_depth_scale_max",
+            ))
         if bool(getattr(cfg, "gir_opacity_gradient_front_decay_gate_enabled", False)):
             names.append("gir_point_front_gradient_decay_gate_ratio")
+    if append_mode in {"tracker", "tracker_point_map"}:
+        names.extend((
+            "gir_tracker_coverage_ratio",
+            "gir_tracker_visibility_ratio",
+            "gir_tracker_fb_consistency_ratio",
+            "gir_tracker_cycle_error_mean",
+        ))
+        if append_mode == "tracker":
+            names.extend((
+                "gir_point_coverage_ratio",
+                "gir_point_append_ratio",
+            ))
+        else:
+            names.extend((
+                "gir_tracker_point_union_coverage_ratio",
+                "gir_confirmed_current_in_front_ratio",
+            ))
     if append_mode == "learned":
         names.extend(("gir_add_gate_learned", "gir_add_rate"))
+
+    if bool(
+        getattr(cfg, "gir_symmetric_multiview_update_enabled", False)
+    ):
+        names.extend(
+            f"gir_symmetric_multiview_{key}"
+            for key in (
+                "active_count",
+                "active_ratio",
+                "visible_views_mean",
+                "mean_coherence",
+                "mean_conflict_ratio",
+                "mean_shift_mean",
+                "opacity_shift_mean",
+                "harmonics_shift_mean",
+            )
+        )
+    if bool(getattr(cfg, "gir_anchor_child_enabled", False)):
+        names.extend(
+            f"gir_anchor_child_{key}"
+            for key in (
+                "eligible_anchor_count",
+                "expanded_anchor_count",
+                "spawned_child_count",
+                "active_anchor_count",
+                "active_child_count",
+                "selected_gradient_score_mean",
+                "selected_coherence_mean",
+                "map_count_after",
+            )
+        )
 
     opacity_keys = (
         "gradient_signal_abs_mean",
@@ -119,6 +178,25 @@ def _gir_training_metric_names(cfg) -> tuple[str, ...]:
             )
         if bool(getattr(cfg, "gir_mean_gradient_enabled", False)):
             names.extend(f"gir_projected_{key}" for key in mean_gradient_keys)
+        if bool(getattr(cfg, "gir_split_enabled", False)):
+            names.extend((
+                "gir_split_count",
+                "gir_split_ratio",
+                "gir_split_selected_radius",
+                "gir_split_selected_gradient_norm",
+                "gir_split_map_count_after",
+            ))
+        if bool(getattr(cfg, "gir_functional_update_enabled", False)):
+            names.extend(
+                f"gir_functional_update_{key}"
+                for key in (
+                    "selected_count",
+                    "selected_ratio",
+                    "mean_step_norm",
+                    "opacity_logit_step_abs",
+                    "harmonics_step_norm",
+                )
+            )
     elif old_enabled:
         names.extend((
             "gir_historical_gate",
@@ -171,6 +249,20 @@ class OptimizerCfg:
     scratch_lr: float | None = None
     train_base_heads: bool = True
     train_gir: bool = False
+    train_gaussian_param_head: bool | None = None
+    train_gs_head: bool | None = None
+    train_camera_head: bool | None = None
+    train_depth_head: bool | None = None
+    gaussian_param_head_lr: float | None = None
+    gs_head_lr: float | None = None
+    camera_lr: float | None = None
+    depth_lr: float | None = None
+    gir_lr: float | None = None
+    base_weight_decay: float = 0.1
+    gir_weight_decay: float | None = None
+    beta1: float = 0.9
+    beta2: float = 0.95
+    scheduler_mode: str = "cosine"
 
 
 @dataclass
@@ -211,6 +303,16 @@ class TrainCfg:
     pose_loss_alpha: float = 1.0
     pose_loss_delta: float = 1.0
     camera_focal_weight: float = 1.0
+    camera_pose_loss_mode: str = "adjacent_pair"
+    camera_translation_direction_weight: float = 0.1
+    camera_translation_direction_min_baseline_ratio: float = 0.0
+    camera_translation_direction_baseline_weighting: bool = False
+    camera_global_trajectory_weight: float = 0.0
+    camera_grad_clip: float = 0.0
+    debug_metrics_enabled: bool = False
+    debug_metrics_every_n_steps: int = 10
+    debug_metrics_filename: str = "train_debug_metrics.jsonl"
+    debug_metrics_print: bool = True
     cxt_depth_weight: float = 0.01
     weight_pose: float = 1.0
     weight_depth: float = 1.0
@@ -226,6 +328,11 @@ def _camera_supervision_losses(
     translation_weight: float,
     rotation_weight: float,
     focal_weight: float,
+    pose_loss_mode: str = "adjacent_pair",
+    translation_direction_weight: float = 0.1,
+    translation_direction_min_baseline_ratio: float = 0.0,
+    translation_direction_baseline_weighting: bool = False,
+    global_trajectory_weight: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     """Supervise the camera encoding in the first-view coordinate frame.
 
@@ -289,11 +396,180 @@ def _camera_supervision_losses(
     target_relative_rotation, target_relative_translation = relative_c2w(
         target_c2w[..., :3, :3], target_c2w[..., :3, 3]
     )
-    translation = F.smooth_l1_loss(
-        predicted_relative_translation, target_relative_translation
+    if (
+        not math.isfinite(float(global_trajectory_weight))
+        or float(global_trajectory_weight) < 0.0
+    ):
+        raise ValueError(
+            "camera_global_trajectory_weight must be finite and non-negative, "
+            f"got {global_trajectory_weight}."
+        )
+    pose_loss_mode = str(pose_loss_mode).lower()
+    if pose_loss_mode == "adjacent_pair":
+        if predicted_relative_rotation.shape[1] < 2:
+            raise ValueError(
+                "camera_pose_loss_mode=adjacent_pair requires at least two "
+                "camera views."
+            )
+
+        def adjacent_c2w(
+            rotation: torch.Tensor, translation: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            previous_rotation_t = rotation[:, :-1].transpose(-1, -2)
+            adjacent_rotation = previous_rotation_t @ rotation[:, 1:]
+            adjacent_translation = (
+                previous_rotation_t
+                @ (translation[:, 1:] - translation[:, :-1]).unsqueeze(-1)
+            ).squeeze(-1)
+            return adjacent_rotation, adjacent_translation
+
+        predicted_for_rotation, predicted_for_translation = adjacent_c2w(
+            predicted_relative_rotation, predicted_relative_translation
+        )
+        target_for_rotation, target_for_translation = adjacent_c2w(
+            target_relative_rotation, target_relative_translation
+        )
+    elif pose_loss_mode == "first_relative":
+        predicted_for_rotation = predicted_relative_rotation
+        predicted_for_translation = predicted_relative_translation
+        target_for_rotation = target_relative_rotation
+        target_for_translation = target_relative_translation
+    else:
+        raise ValueError(
+            "camera_pose_loss_mode must be first_relative or adjacent_pair, "
+            f"got {pose_loss_mode!r}."
+        )
+
+    if pose_loss_mode == "adjacent_pair":
+        if (
+            not math.isfinite(float(translation_direction_weight))
+            or float(translation_direction_weight) < 0.0
+        ):
+            raise ValueError(
+                "camera_translation_direction_weight must be finite and "
+                f"non-negative, got {translation_direction_weight}."
+            )
+        if (
+            not math.isfinite(float(translation_direction_min_baseline_ratio))
+            or float(translation_direction_min_baseline_ratio) < 0.0
+        ):
+            raise ValueError(
+                "camera_translation_direction_min_baseline_ratio must be "
+                "finite and non-negative, got "
+                f"{translation_direction_min_baseline_ratio}."
+            )
+        predicted_flat = predicted_for_translation.reshape(
+            predicted_for_translation.shape[0], -1
+        )
+        target_flat = target_for_translation.reshape(
+            target_for_translation.shape[0], -1
+        )
+        denominator = predicted_flat.square().sum(dim=-1)
+        alignment_scale = (
+            (predicted_flat * target_flat).sum(dim=-1)
+            / denominator.clamp_min(1e-8)
+        )
+        alignment_scale = torch.where(
+            denominator > 1e-8,
+            alignment_scale.clamp(1e-3, 1e3),
+            torch.ones_like(alignment_scale),
+        ).detach()
+        translation_shape = F.smooth_l1_loss(
+            predicted_for_translation * alignment_scale[:, None, None],
+            target_for_translation,
+        )
+        predicted_norm = predicted_for_translation.norm(dim=-1)
+        target_norm = target_for_translation.norm(dim=-1)
+        reference_baseline = target_norm.mean(dim=-1).clamp_min(1e-6)
+        minimum_baseline = (
+            float(translation_direction_min_baseline_ratio)
+            * reference_baseline
+        )
+        aligned_predicted_norm = (
+            predicted_norm * alignment_scale.abs()[:, None]
+        )
+        valid_direction = (
+            (predicted_norm > 1e-6)
+            & (target_norm > 1e-6)
+            & (target_norm >= minimum_baseline[:, None])
+            & (aligned_predicted_norm >= minimum_baseline[:, None])
+        )
+        direction_error = 1.0 - F.cosine_similarity(
+            predicted_for_translation,
+            target_for_translation,
+            dim=-1,
+            eps=1e-6,
+        )
+        if translation_direction_baseline_weighting:
+            direction_pair_weight = (
+                target_norm / reference_baseline[:, None]
+            ).clamp(max=1.0)
+        else:
+            direction_pair_weight = torch.ones_like(target_norm)
+        valid_weight = (
+            direction_pair_weight * valid_direction.to(direction_pair_weight.dtype)
+        )
+        valid_weight_sum = valid_weight.sum()
+        if valid_direction.any():
+            translation_direction = (
+                direction_error * valid_weight
+            ).sum() / valid_weight_sum.clamp_min(1e-8)
+        else:
+            translation_direction = predicted_for_translation.sum() * 0.0
+        translation = (
+            translation_shape
+            + float(translation_direction_weight) * translation_direction
+        )
+    else:
+        translation_shape = F.smooth_l1_loss(
+            predicted_for_translation, target_for_translation
+        )
+        translation_direction = predicted_for_translation.sum() * 0.0
+        alignment_scale = torch.ones(
+            predicted_for_translation.shape[0],
+            device=predicted_for_translation.device,
+            dtype=predicted_for_translation.dtype,
+        )
+        valid_direction = torch.ones_like(
+            predicted_for_translation[..., 0], dtype=torch.bool
+        )
+        direction_pair_weight = torch.ones_like(
+            predicted_for_translation[..., 0]
+        )
+        reference_baseline = target_for_translation.norm(dim=-1).mean(dim=-1)
+        translation = translation_shape
+    rotation = F.mse_loss(predicted_for_rotation, target_for_rotation)
+
+    # Adjacent supervision is locally accurate but can accumulate a coherent
+    # bias over a long sequence. This weak first-relative term constrains the
+    # complete trajectory while retaining the camera head's native scale.
+    global_predicted_flat = predicted_relative_translation.reshape(
+        predicted_relative_translation.shape[0], -1
     )
-    rotation = F.mse_loss(
+    global_target_flat = target_relative_translation.reshape(
+        target_relative_translation.shape[0], -1
+    )
+    global_denominator = global_predicted_flat.square().sum(dim=-1)
+    global_alignment_scale = (
+        (global_predicted_flat * global_target_flat).sum(dim=-1)
+        / global_denominator.clamp_min(1e-8)
+    )
+    global_alignment_scale = torch.where(
+        global_denominator > 1e-8,
+        global_alignment_scale.clamp(1e-3, 1e3),
+        torch.ones_like(global_alignment_scale),
+    ).detach()
+    global_translation_shape = F.smooth_l1_loss(
+        predicted_relative_translation
+        * global_alignment_scale[:, None, None],
+        target_relative_translation,
+    )
+    global_rotation = F.mse_loss(
         predicted_relative_rotation, target_relative_rotation
+    )
+    global_trajectory = (
+        translation_weight * global_translation_shape
+        + rotation_weight * global_rotation
     )
     target_intrinsics = target_intrinsics.to(
         device=predicted_pose_encoding.device,
@@ -306,20 +582,33 @@ def _camera_supervision_losses(
         0.5 / target_intrinsics[..., 0, 0].clamp_min(1e-6)
     )
     gt_fov = torch.stack([gt_fov_h, gt_fov_w], dim=-1)
+    # Match offline_gs_mlp_overfit: supervise the raw FOV encoding. The
+    # bounded copy is only for rendering and must not saturate this loss.
     focal = F.smooth_l1_loss(
-        predicted_pose_encoding[..., 7:9].clamp(1e-3, math.pi - 1e-3),
+        predicted_pose_encoding[..., 7:9],
         gt_fov.float(),
     )
     total = (
         translation_weight * translation
         + rotation_weight * rotation
         + focal_weight * focal
+        + float(global_trajectory_weight) * global_trajectory
     )
     return {
         "total": total,
         "translation": translation,
+        "translation_shape": translation_shape,
+        "translation_direction": translation_direction,
+        "translation_alignment_scale": alignment_scale.mean(),
+        "translation_direction_valid_ratio": valid_direction.float().mean(),
+        "translation_direction_pair_weight_mean": direction_pair_weight.mean(),
+        "translation_reference_baseline": reference_baseline.mean(),
         "rotation": rotation,
         "focal": focal,
+        "global_trajectory": global_trajectory,
+        "global_translation_shape": global_translation_shape,
+        "global_rotation": global_rotation,
+        "global_translation_alignment_scale": global_alignment_scale.mean(),
     }
 
 
@@ -373,6 +662,7 @@ class ModelWrapper(LightningModule):
         self._skip_optimizer_step = False
         self._bad_grad_name = None
         self._bad_grad_summaries = []
+        self._pending_train_debug_record: dict[str, Any] | None = None
         self._val_comparison_images: list[np.ndarray] = []
         self._val_comparison_captions: list[str] = []
 
@@ -401,8 +691,37 @@ class ModelWrapper(LightningModule):
     def _configure_training_stage(self) -> None:
         train_base_heads = bool(self.optimizer_cfg.train_base_heads)
         train_gir = bool(self.optimizer_cfg.train_gir)
+        granular_base_training = any(
+            value is not None
+            for value in (
+                self.optimizer_cfg.train_gaussian_param_head,
+                self.optimizer_cfg.train_gs_head,
+                self.optimizer_cfg.train_camera_head,
+                self.optimizer_cfg.train_depth_head,
+            )
+        )
+        train_gaussian_param_head = (
+            train_base_heads and not granular_base_training
+            if self.optimizer_cfg.train_gaussian_param_head is None
+            else bool(self.optimizer_cfg.train_gaussian_param_head)
+        )
+        train_gs_head = (
+            train_base_heads
+            if self.optimizer_cfg.train_gs_head is None
+            else bool(self.optimizer_cfg.train_gs_head)
+        )
+        train_camera_head = (
+            train_base_heads
+            if self.optimizer_cfg.train_camera_head is None
+            else bool(self.optimizer_cfg.train_camera_head)
+        )
+        train_depth_head = (
+            train_base_heads
+            if self.optimizer_cfg.train_depth_head is None
+            else bool(self.optimizer_cfg.train_depth_head)
+        )
 
-        if not train_base_heads:
+        if not train_base_heads or granular_base_training:
             # Stage 2 starts from a fixed stage-1 model and only learns GIR.
             self.model.requires_grad_(False)
 
@@ -412,7 +731,30 @@ class ModelWrapper(LightningModule):
                 raise RuntimeError(
                     f"Base training module model.encoder.{module_name} is missing."
                 )
-            module.requires_grad_(train_base_heads)
+            if not granular_base_training:
+                module.requires_grad_(train_base_heads)
+
+        if granular_base_training:
+            self.model.encoder.gaussian_param_head.requires_grad_(
+                train_gaussian_param_head
+            )
+            self.model.encoder.gs_head.requires_grad_(train_gs_head)
+
+        shared_new_decoder_enabled = bool(
+            getattr(
+                self.model.encoder.cfg,
+                "gir_new_gs_shared_decoder_enabled",
+                False,
+            )
+        )
+        if shared_new_decoder_enabled:
+            if train_gaussian_param_head:
+                raise ValueError(
+                    "optimizer.train_gaussian_param_head=true requires the "
+                    "original gs_head path; disable "
+                    "gir_new_gs_shared_decoder_enabled."
+                )
+            self.model.encoder.gs_head.requires_grad_(False)
 
         wm_depth_output = getattr(
             getattr(self.model.encoder.gaussian_param_head, "scratch", None),
@@ -428,13 +770,13 @@ class ModelWrapper(LightningModule):
                 f"world_mirror, got {depth_head_source!r}."
             )
         self.model.encoder.depth_head.requires_grad_(
-            train_base_heads and depth_head_source == "native"
+            train_depth_head and depth_head_source == "native"
         )
         if wm_depth_output is None and depth_head_source == "world_mirror":
             raise RuntimeError("WorldMirror depth output head is missing.")
         if wm_depth_output is not None:
             wm_depth_output.requires_grad_(
-                train_base_heads and depth_head_source == "world_mirror"
+                train_depth_head and depth_head_source == "world_mirror"
             )
 
         camera_head = getattr(self.model.encoder, "camera_head", None)
@@ -444,22 +786,48 @@ class ModelWrapper(LightningModule):
         if reconstruction_backbone in {"zipmap", "streamvggt"}:
             if camera_head is None:
                 raise RuntimeError(f"{reconstruction_backbone} training requires encoder.camera_head.")
-            camera_head.requires_grad_(train_base_heads)
-            if train_base_heads and self.train_cfg.weight_pose != 0 and not any(
+            camera_head.requires_grad_(train_camera_head)
+            # StreamVGGT detaches each refinement prediction before feeding it
+            # to the next iteration. The empty token is used only by the first
+            # iteration, so a loss on the final prediction cannot reach it.
+            # Keep it fixed instead of registering a permanently unused DDP
+            # parameter.
+            empty_pose_tokens = getattr(camera_head, "empty_pose_tokens", None)
+            if empty_pose_tokens is not None:
+                empty_pose_tokens.requires_grad_(False)
+            if train_camera_head and self.train_cfg.weight_pose != 0 and not any(
                 parameter.requires_grad for parameter in camera_head.parameters()
             ):
                 raise RuntimeError(
                     "GT camera loss is enabled, but the reconstruction camera head "
                     "has no trainable parameters."
                 )
+        elif reconstruction_backbone == "abot":
+            # ABot's pose and local-point heads are part of its 1B frozen
+            # network, while these adapters intentionally own no parameters.
+            camera_head.requires_grad_(False)
+            if depth_head_source == "native":
+                self.model.encoder.depth_head.requires_grad_(False)
+            print(
+                "ABot native camera and depth remain frozen; base training "
+                "updates the WorldMirror GS heads only."
+            )
 
         gir_head = getattr(self.model, "gir_update_head", None)
         projected_gir_head = getattr(
             self.model, "gir_projected_update_head", None
         )
+        symmetric_gir_head = getattr(
+            self.model, "gir_symmetric_update_head", None
+        )
         gir_enabled = bool(getattr(self.model.encoder.cfg, "gir_enabled", False))
         if train_gir and (
-            not gir_enabled or (gir_head is None and projected_gir_head is None)
+            not gir_enabled
+            or (
+                gir_head is None
+                and projected_gir_head is None
+                and symmetric_gir_head is None
+            )
         ):
             raise ValueError(
                 "optimizer.train_gir=true requires model.encoder.gir_enabled=true."
@@ -509,6 +877,49 @@ class ModelWrapper(LightningModule):
                 False,
             )
         )
+        symmetric_update_enabled = bool(
+            getattr(
+                self.model.encoder.cfg,
+                "gir_symmetric_multiview_update_enabled",
+                False,
+            )
+        )
+        if train_gir and symmetric_update_enabled and symmetric_gir_head is None:
+            raise RuntimeError(
+                "Symmetric multiview GS updates require "
+                "model.gir_symmetric_update_head."
+            )
+        if symmetric_gir_head is not None:
+            symmetric_gir_head.requires_grad_(
+                train_gir and symmetric_update_enabled
+            )
+        if train_gir and symmetric_update_enabled:
+            visual_enabled = bool(
+                getattr(
+                    self.model.encoder.cfg,
+                    "gir_symmetric_multiview_visual_enabled",
+                    False,
+                )
+            )
+            unbounded_updates = bool(
+                getattr(
+                    self.model.encoder.cfg,
+                    "gir_symmetric_multiview_unbounded_updates",
+                    False,
+                )
+            )
+            if unbounded_updates:
+                # Direct residual mode intentionally bypasses learned gates.
+                # Keep that decoder out of the optimizer/DDP parameter set.
+                symmetric_gir_head.attribute_decoders["gates"].requires_grad_(
+                    False
+                )
+            print(
+                "GIR symmetric multiview update: append old/new GS first, "
+                "aggregate equal-role gradients from every causal view, "
+                f"visual_context={visual_enabled}, then apply one shared "
+                f"{'unbounded' if unbounded_updates else 'bounded'} residual head"
+            )
         projected_head_needed = projected_update_enabled or new_residual_enabled
         if train_gir and projected_head_needed and projected_gir_head is None:
             raise RuntimeError(
@@ -614,12 +1025,39 @@ class ModelWrapper(LightningModule):
                 "only; pixel rank heads and top-k decay are disabled"
             )
         if train_gir and new_residual_enabled:
+            shared_base_opacity = float(
+                getattr(
+                    self.model.encoder.cfg,
+                    "gir_new_gs_shared_decoder_base_opacity",
+                    0.5,
+                )
+            )
+            shared_scale_multiplier = float(
+                getattr(
+                    self.model.encoder.cfg,
+                    "gir_new_gs_shared_decoder_scale_multiplier",
+                    1.0,
+                )
+            )
             print(
-                "GIR new-map update: append-selected DPT anchors use the "
-                "shared projected decoder with an independent new-GS head"
+                "GIR new-map update: "
+                + (
+                    "analytic anchors from every first-frame pixel and "
+                    "append-selected later pixels use the shared projected "
+                    "decoder; dense gs_head is frozen; base_opacity="
+                    f"{shared_base_opacity:g}, "
+                    "scale_multiplier="
+                    f"{shared_scale_multiplier:g}"
+                    if shared_new_decoder_enabled
+                    else "append-selected DPT anchors use the shared projected "
+                    "decoder with an independent new-GS head"
+                )
             )
         append_mode = str(
             getattr(self.model.encoder.cfg, "gir_append_mode", "all")
+        ).lower()
+        tracker_backend = str(
+            getattr(self.model.encoder.cfg, "gir_tracker_backend", "spot")
         ).lower()
         print(
             "GIR new-GS append mode: "
@@ -627,11 +1065,72 @@ class ModelWrapper(LightningModule):
             + (
                 " (depth-consistent global point-map coverage)"
                 if append_mode == "point_map"
-                else ""
+                else (
+                    f" (rolling previous-frame {tracker_backend} coverage only)"
+                    if append_mode == "tracker"
+                    else (
+                        f" (union of rolling {tracker_backend} and "
+                        "depth-consistent global point-map coverage)"
+                        if append_mode == "tracker_point_map"
+                        else ""
+                    )
+                )
             )
         )
+        if append_mode in {"point_map", "tracker_point_map"}:
+            print(
+                "GIR point-map follows residual-updated means: "
+                f"{bool(getattr(self.model.encoder.cfg, 'gir_point_map_follow_mean_updates_enabled', False))}"
+            )
+        if bool(
+            getattr(self.model.encoder.cfg, "gir_anchor_child_enabled", False)
+        ):
+            print(
+                "GIR point-map anchor children: persistent, non-recursive; "
+                f"max_count={int(getattr(self.model.encoder.cfg, 'gir_anchor_child_max_count', 8))}, "
+                f"add_count={int(getattr(self.model.encoder.cfg, 'gir_anchor_child_add_count', 1))}, "
+                f"max_ratio={float(getattr(self.model.encoder.cfg, 'gir_anchor_child_max_ratio', 0.05)):g}, "
+                f"max_gaussians={int(getattr(self.model.encoder.cfg, 'gir_anchor_child_max_gaussians', 500000))}"
+            )
+        if append_mode in {"tracker", "tracker_point_map"}:
+            tracker_fb_enabled = bool(
+                getattr(
+                    self.model.encoder.cfg,
+                    "gir_tracker_forward_backward_enabled",
+                    False,
+                )
+            )
+            tracker_cycle_absolute = float(
+                getattr(
+                    self.model.encoder.cfg,
+                    "gir_tracker_cycle_absolute_threshold",
+                    1.5,
+                )
+            )
+            tracker_cycle_relative = float(
+                getattr(
+                    self.model.encoder.cfg,
+                    "gir_tracker_cycle_relative_threshold",
+                    0.05,
+                )
+            )
+            print(
+                f"{tracker_backend} forward-backward consistency: enabled="
+                f"{tracker_fb_enabled}, "
+                "cycle_threshold="
+                f"{tracker_cycle_absolute:g}+{tracker_cycle_relative:g}"
+                "*motion"
+            )
 
-        if not train_base_heads and not train_gir:
+        if not any(
+            (
+                train_gaussian_param_head,
+                train_gs_head,
+                train_camera_head,
+                train_depth_head,
+                train_gir,
+            )
+        ):
             raise ValueError(
                 "The training stage disables both base GS heads and GIR; "
                 "there would be no selected trainable model branch."
@@ -640,20 +1139,74 @@ class ModelWrapper(LightningModule):
         print(
             "Training stage: "
             f"gir_enabled={gir_enabled}, "
-            f"train_base_heads={train_base_heads}, "
-            f"train_camera_head={reconstruction_backbone in {'zipmap', 'streamvggt'} and train_base_heads}, "
+            f"train_gaussian_param_head={train_gaussian_param_head}, "
+            f"train_gs_head={train_gs_head}, "
+            f"train_camera_head={reconstruction_backbone in {'zipmap', 'streamvggt'} and train_camera_head}, "
             f"depth_head_source={depth_head_source}, "
-            f"train_depth_head={train_base_heads}, "
+            f"train_depth_head={train_depth_head and (depth_head_source == 'world_mirror' or reconstruction_backbone != 'abot')}, "
             f"train_gir={train_gir}"
         )
+        print(
+            "Final-map geometry/rendering: "
+            f"mode={getattr(self.model.encoder.cfg, 'gir_training_mode', 'streaming_aux')}, "
+            f"sim3={getattr(self.model.encoder.cfg, 'sim3_alignment_mode', 'never')}, "
+            f"source_camera={getattr(self.model.encoder.cfg, 'source_render_camera', 'predicted')}, "
+            f"heldout_camera={getattr(self.model.encoder.cfg, 'heldout_test_camera', 'predicted')}"
+        )
+        if train_camera_head:
+            print(
+                "Camera supervision: "
+                f"mode={self.train_cfg.camera_pose_loss_mode}, "
+                "direction_weight="
+                f"{self.train_cfg.camera_translation_direction_weight:g}, "
+                "min_baseline_ratio="
+                f"{self.train_cfg.camera_translation_direction_min_baseline_ratio:g}, "
+                "baseline_weighting="
+                f"{self.train_cfg.camera_translation_direction_baseline_weighting}, "
+                "global_trajectory_weight="
+                f"{self.train_cfg.camera_global_trajectory_weight:g}, "
+                f"grad_clip={self.train_cfg.camera_grad_clip:g}"
+            )
+
+        self._enforce_selected_module_modes()
+
+    def _enforce_selected_module_modes(self) -> None:
+        """Keep frozen feature extractors deterministic like the offline run."""
+        for module_name in ("aggregator",):
+            module = getattr(self.model.encoder, module_name, None)
+            if module is not None:
+                module.eval()
+        self.model.decoder.eval()
+
+        for module_name in (
+            "gaussian_param_head",
+            "gs_head",
+            "camera_head",
+            "depth_head",
+        ):
+            module = getattr(self.model.encoder, module_name, None)
+            if module is not None:
+                module.train(any(parameter.requires_grad for parameter in module.parameters()))
+        for module_name in (
+            "gir_update_head",
+            "gir_projected_update_head",
+            "gir_symmetric_update_head",
+        ):
+            module = getattr(self.model, module_name, None)
+            if module is not None:
+                module.train(any(parameter.requires_grad for parameter in module.parameters()))
 
     def on_train_epoch_start(self) -> None:
+        self._enforce_selected_module_modes()
         # our custom dataset and sampler has to have epoch set by calling set_epoch
         print(f"Train epoch start on rank {self.trainer.global_rank}")
         if hasattr(self.trainer.datamodule.train_loader.dataset, "set_epoch"):
             self.trainer.datamodule.train_loader.dataset.set_epoch(self.current_epoch)
         if hasattr(self.trainer.datamodule.train_loader.sampler, "set_epoch"):
             self.trainer.datamodule.train_loader.sampler.set_epoch(self.current_epoch)
+
+    def on_train_batch_start(self, batch, batch_idx: int) -> None:
+        self._enforce_selected_module_modes()
 
     def on_validation_epoch_start(self) -> None:
         print(f"Validation epoch start on rank {self.trainer.global_rank}")
@@ -675,6 +1228,77 @@ class ModelWrapper(LightningModule):
             step=self.global_step,
             caption=self._val_comparison_captions,
         )
+
+    @staticmethod
+    def _debug_scalar(value: Any) -> float | int | str | None:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            scalar = float(value)
+        elif torch.is_tensor(value) and value.numel() == 1:
+            scalar = float(value.detach().float().item())
+        else:
+            return None
+        if math.isnan(scalar):
+            return "nan"
+        if math.isinf(scalar):
+            return "+inf" if scalar > 0.0 else "-inf"
+        return scalar
+
+    @staticmethod
+    def _debug_gradient_norm(parameters: list[torch.Tensor]) -> float:
+        squared_norm = None
+        for parameter in parameters:
+            if parameter.grad is None:
+                continue
+            contribution = parameter.grad.detach().float().square().sum()
+            squared_norm = (
+                contribution
+                if squared_norm is None
+                else squared_norm + contribution
+            )
+        if squared_norm is None:
+            return 0.0
+        return float(squared_norm.sqrt().item())
+
+    def _write_train_debug_record(self, record: dict[str, Any]) -> None:
+        if self.global_rank != 0:
+            return
+        path = self.train_cfg.output_path / self.train_cfg.debug_metrics_filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+        if self.train_cfg.debug_metrics_print:
+            print(
+                "[train debug] "
+                f"step={record.get('step')} "
+                f"loss={record.get('loss_total')} "
+                f"psnr={record.get('train_psnr')} "
+                f"camera_loss={record.get('loss_camera')} "
+                f"camera_grad={record.get('grad_camera_norm')} "
+                f"sim3={record.get('sim3_scale')} "
+                f"gs={record.get('gaussian_count')} "
+                "symmetric_active="
+                f"{record.get('gir_symmetric_multiview_active_count')} "
+                f"status={record.get('status', 'ok')}"
+            )
+
+    def on_fit_start(self) -> None:
+        if not self.train_cfg.debug_metrics_enabled:
+            return
+        if self.train_cfg.debug_metrics_every_n_steps <= 0:
+            raise ValueError(
+                "train.debug_metrics_every_n_steps must be positive when "
+                "debug metrics are enabled."
+            )
+        if not self.train_cfg.debug_metrics_filename.strip():
+            raise ValueError("train.debug_metrics_filename must not be empty.")
+        if self.global_rank == 0:
+            path = (
+                self.train_cfg.output_path
+                / self.train_cfg.debug_metrics_filename
+            )
+            print(f"Training debug metrics: enabled; path={path}")
 
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
@@ -702,6 +1326,29 @@ class ModelWrapper(LightningModule):
 
         batch: BatchedExample = self.data_shim(batch)
         b, v, c, h, w = batch["context"]["image"].shape
+        self._pending_train_debug_record = None
+        debug_due = (
+            self.global_rank == 0
+            and self.train_cfg.debug_metrics_enabled
+            and self.train_cfg.debug_metrics_every_n_steps > 0
+            and self.global_step
+            % self.train_cfg.debug_metrics_every_n_steps
+            == 0
+        )
+        if debug_due:
+            self._pending_train_debug_record = {
+                "step": int(self.global_step),
+                "batch_idx": int(batch_idx),
+                "batch_size": int(b),
+                "view_count": int(v),
+                "height": int(h),
+                "width": int(w),
+                "scenes": [str(scene) for scene in batch.get("scene", [])],
+                "context_indices": batch["context"]["index"]
+                .detach()
+                .cpu()
+                .tolist(),
+            }
         context_image = (batch["context"]["image"] + 1) / 2
         reset_cuda_peak_memory()
         log_cuda_memory(
@@ -747,7 +1394,13 @@ class ModelWrapper(LightningModule):
 #                 torch.cuda.empty_cache()
 
 #             return total_loss
-        encoder_output, output = self.model(context_image, batch["context"]["index"], self.global_step)
+        encoder_output, output = self.model(
+            context_image,
+            batch["context"]["index"],
+            self.global_step,
+            gt_context_c2w=batch["context"]["extrinsics"],
+            gt_context_intrinsics=batch["context"]["intrinsics"],
+        )
         log_cuda_memory(
             "after_model_forward",
             step=int(self.global_step),
@@ -758,8 +1411,23 @@ class ModelWrapper(LightningModule):
             encoder_output.pred_pose_enc_list,
             encoder_output.depth_dict,
         )
+        debug_record = self._pending_train_debug_record
+        if debug_record is not None:
+            debug_record["gaussian_count"] = int(gaussians.means.shape[1])
+            for metric_name, metric_value in (encoder_output.infos or {}).items():
+                scalar = self._debug_scalar(metric_value)
+                if scalar is not None:
+                    debug_record[metric_name] = scalar
         
         distill_infos = encoder_output.distill_infos
+        if encoder_output.infos is not None and "sim3_scale" in encoder_output.infos:
+            self.log(
+                "train/sim3_scale",
+                encoder_output.infos["sim3_scale"].float().mean(),
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
+            )
         if encoder_output.infos is not None and "gir_add_gate" in encoder_output.infos:
             for metric_name in _gir_training_metric_names(self.model.encoder.cfg):
                 if metric_name in encoder_output.infos:
@@ -806,6 +1474,10 @@ class ModelWrapper(LightningModule):
             rearrange(output.color, "b v c h w -> (b v) c h w"),
         )
         self.log("train/psnr_probabilistic", psnr_probabilistic.mean().item())
+        if debug_record is not None:
+            debug_record["train_psnr"] = float(
+                psnr_probabilistic.mean().detach().item()
+            )
 
         total_loss = 0
 
@@ -936,6 +1608,10 @@ class ModelWrapper(LightningModule):
             self.log(
                 "loss/loss_depth_ctx",
                 loss_depth_ctx.item())
+            if debug_record is not None:
+                debug_record["loss_depth"] = float(
+                    loss_depth_ctx.detach().item()
+                )
             for component_name, component_value in getattr(
                 depth_loss_module, "last_depth_components", {}
             ).items():
@@ -953,6 +1629,10 @@ class ModelWrapper(LightningModule):
                     on_epoch=False,
                     sync_dist=True,
                 )
+                if debug_record is not None:
+                    scalar = self._debug_scalar(component_value)
+                    if scalar is not None:
+                        debug_record[f"depth_{component_name}"] = scalar
             # DAV3-vs-GT diagnostics are detached and are not part of the loss.
             # Lightning/W&B records these scalars as step curves automatically.
             for metric_name, metric_value in getattr(
@@ -987,6 +1667,10 @@ class ModelWrapper(LightningModule):
                     step=int(self.global_step),
                 )
                 self.log(f"loss/{loss_fn.name}", loss.item())
+                if debug_record is not None:
+                    debug_record[f"loss_{loss_fn.name}"] = float(
+                        loss.detach().item()
+                    )
                 total_loss = total_loss + loss
 
             predicted_context_c2w = None
@@ -1019,15 +1703,37 @@ class ModelWrapper(LightningModule):
                 and gt_context_c2w is not None
                 and gt_context_intrinsics is not None
             ):
+                source_view_count = int(depth_dict["depth"].shape[1])
                 camera_losses = _camera_supervision_losses(
-                    predicted_context_pose_encoding,
-                    gt_context_c2w,
-                    gt_context_intrinsics,
+                    predicted_context_pose_encoding[:, :source_view_count],
+                    gt_context_c2w[:, :source_view_count],
+                    gt_context_intrinsics[:, :source_view_count],
                     translation_weight=float(self.train_cfg.pose_loss_alpha),
                     rotation_weight=float(self.train_cfg.pose_loss_delta),
                     focal_weight=float(self.train_cfg.camera_focal_weight),
+                    pose_loss_mode=self.train_cfg.camera_pose_loss_mode,
+                    translation_direction_weight=float(
+                        self.train_cfg.camera_translation_direction_weight
+                    ),
+                    translation_direction_min_baseline_ratio=float(
+                        self.train_cfg.camera_translation_direction_min_baseline_ratio
+                    ),
+                    translation_direction_baseline_weighting=bool(
+                        self.train_cfg.camera_translation_direction_baseline_weighting
+                    ),
+                    global_trajectory_weight=float(
+                        self.train_cfg.camera_global_trajectory_weight
+                    ),
                 )
                 loss_camera = camera_losses["total"]
+                if debug_record is not None:
+                    for metric_name, metric_value in camera_losses.items():
+                        scalar = self._debug_scalar(metric_value)
+                        if scalar is not None:
+                            debug_record[f"camera_{metric_name}"] = scalar
+                    debug_record["loss_camera"] = float(
+                        loss_camera.detach().item()
+                    )
                 self.log("loss/camera", loss_camera.item())
                 self.log(
                     "loss/camera_translation",
@@ -1037,7 +1743,51 @@ class ModelWrapper(LightningModule):
                     "loss/camera_rotation",
                     camera_losses["rotation"].item(),
                 )
+                self.log(
+                    "loss/camera_translation_shape",
+                    camera_losses["translation_shape"].item(),
+                )
+                self.log(
+                    "loss/camera_translation_direction",
+                    camera_losses["translation_direction"].item(),
+                )
+                self.log(
+                    "camera/translation_alignment_scale",
+                    camera_losses["translation_alignment_scale"].item(),
+                )
+                self.log(
+                    "camera/translation_direction_valid_ratio",
+                    camera_losses["translation_direction_valid_ratio"].item(),
+                )
+                self.log(
+                    "camera/translation_direction_pair_weight_mean",
+                    camera_losses[
+                        "translation_direction_pair_weight_mean"
+                    ].item(),
+                )
+                self.log(
+                    "camera/translation_reference_baseline",
+                    camera_losses["translation_reference_baseline"].item(),
+                )
                 self.log("loss/camera_focal", camera_losses["focal"].item())
+                self.log(
+                    "loss/camera_global_trajectory",
+                    camera_losses["global_trajectory"].item(),
+                )
+                self.log(
+                    "loss/camera_global_translation_shape",
+                    camera_losses["global_translation_shape"].item(),
+                )
+                self.log(
+                    "loss/camera_global_rotation",
+                    camera_losses["global_rotation"].item(),
+                )
+                self.log(
+                    "camera/global_translation_alignment_scale",
+                    camera_losses[
+                        "global_translation_alignment_scale"
+                    ].item(),
+                )
                 total_loss = total_loss + self.train_cfg.weight_pose * loss_camera
 
             # int loss
@@ -1095,6 +1845,8 @@ class ModelWrapper(LightningModule):
 #                 total_loss += weights[i] * stage_loss
 
         self.log("loss/total", total_loss.item())
+        if debug_record is not None:
+            debug_record["loss_total"] = float(total_loss.detach().item())
         self.log("info/global_step", self.global_step)
         # print(f"total_loss: {total_loss}")
         # print(f"scene = {[x[:20] for x in batch['scene']]}; " )
@@ -1140,6 +1892,15 @@ class ModelWrapper(LightningModule):
             if param.requires_grad and param.grad is None
         ]
         if unused:
+            if self._pending_train_debug_record is not None:
+                self._pending_train_debug_record["status"] = (
+                    "disconnected_parameters"
+                )
+                self._pending_train_debug_record["unused_parameters"] = unused
+                self._write_train_debug_record(
+                    self._pending_train_debug_record
+                )
+                self._pending_train_debug_record = None
             details = (
                 f"[DDP unused parameters][rank={self.global_rank}]\n"
                 + "\n".join(unused)
@@ -1167,6 +1928,20 @@ class ModelWrapper(LightningModule):
                 self._bad_grad_summaries.append(
                     (name, int((~finite).sum().item()), p.grad.numel())
                 )
+
+        debug_record = self._pending_train_debug_record
+        if debug_record is not None:
+            group_norms = []
+            for group_index, group in enumerate(optimizer.param_groups):
+                group_name = str(group.get("name", f"group_{group_index}"))
+                group_parameters = list(group["params"])
+                group_norm = self._debug_gradient_norm(group_parameters)
+                group_norms.append(group_norm)
+                debug_record[f"lr_{group_name}"] = float(group["lr"])
+                debug_record[f"grad_{group_name}_norm"] = group_norm
+            debug_record["grad_total_norm"] = math.sqrt(
+                sum(norm * norm for norm in group_norms)
+            )
 
         if self._skip_optimizer_step:
             if self.global_rank == 0:
@@ -1229,6 +2004,63 @@ class ModelWrapper(LightningModule):
                                 flush=True,
                             )
 
+        if not self._skip_optimizer_step:
+            camera_head = getattr(self.model.encoder, "camera_head", None)
+            camera_parameters = (
+                [
+                    parameter
+                    for parameter in camera_head.parameters()
+                    if parameter.requires_grad and parameter.grad is not None
+                ]
+                if camera_head is not None
+                else []
+            )
+            if camera_parameters:
+                camera_grad_clip = float(self.train_cfg.camera_grad_clip)
+                camera_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    camera_parameters,
+                    (
+                        camera_grad_clip
+                        if camera_grad_clip > 0.0
+                        else float("inf")
+                    ),
+                )
+                if debug_record is not None:
+                    camera_grad_norm_value = float(
+                        camera_grad_norm.detach().item()
+                    )
+                    debug_record["grad_camera_norm"] = (
+                        camera_grad_norm_value
+                    )
+                    debug_record["camera_grad_clip"] = camera_grad_clip
+                    debug_record["camera_grad_clipped"] = int(
+                        camera_grad_clip > 0.0
+                        and camera_grad_norm_value > camera_grad_clip
+                    )
+                self.log(
+                    "train/camera_grad_norm",
+                    camera_grad_norm,
+                    on_step=True,
+                    on_epoch=False,
+                    sync_dist=True,
+                )
+
+        if debug_record is not None:
+            if self._skip_optimizer_step:
+                debug_record["status"] = "nonfinite_gradient"
+                debug_record["bad_gradients"] = [
+                    {
+                        "name": name,
+                        "nonfinite": bad_count,
+                        "elements": element_count,
+                    }
+                    for name, bad_count, element_count in self._bad_grad_summaries
+                ]
+            else:
+                debug_record["status"] = "ok"
+            self._write_train_debug_record(debug_record)
+            self._pending_train_debug_record = None
+
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
         # 如果这一轮梯度坏了：不更新参数，只清梯度
         if self._skip_optimizer_step:
@@ -1264,6 +2096,8 @@ class ModelWrapper(LightningModule):
             (batch["context"]["image"] + 1) / 2,
             batch["context"]["index"],
             self.global_step,
+            gt_context_c2w=batch["context"]["extrinsics"],
+            gt_context_intrinsics=batch["context"]["intrinsics"],
         )
 
         # Compute validation metrics over every sample/view in the batch.
@@ -1530,6 +2364,7 @@ class ModelWrapper(LightningModule):
                 or debug_scene_ordinal < debug_max_scenes
             )
         )
+        test_append_masks = None
         if batch_idx % 100 == 0:
             print(f"Test step {batch_idx:0>6}.")
         
@@ -1569,6 +2404,7 @@ class ModelWrapper(LightningModule):
                     name = batch['scene'],
                     target_view_count=target_view_count,
                     return_gir_data=True,
+                    gt_context_c2w=batch["context"]["extrinsics"],
                     # global_rank = self.global_rank
                 )
                 gaussians = self.model._refine_gaussians(
@@ -1591,7 +2427,22 @@ class ModelWrapper(LightningModule):
                     ),
                     return_debug_intermediates=save_gir_debug,
                     debug_view_stride=debug_view_stride,
+                    return_append_masks=bool(self.test_cfg.save_compare),
+                    residual_camera_to_world=(
+                        batch["context"]["extrinsics"][:, :ctx_img_num]
+                        if self.model.encoder.cfg.source_render_camera == "gt"
+                        else pred_all_extrinsic[:, :ctx_img_num]
+                    ),
+                    residual_intrinsics=(
+                        batch["context"]["intrinsics"][:, :ctx_img_num]
+                        if self.model.encoder.cfg.source_render_camera == "gt"
+                        else intrinsic[:, :ctx_img_num]
+                    ),
                 )
+                if encoder_output.infos is not None:
+                    test_append_masks = encoder_output.infos.pop(
+                        "gir_append_masks", None
+                    )
                 if self.test_cfg.save_unfiltered_ply:
                     safe_scene_name = scene_name.replace("/", "_").replace(
                         "\\", "_"
@@ -1650,13 +2501,23 @@ class ModelWrapper(LightningModule):
                 "gir_add_gate",
                 "gir_append_mode_code",
                 "gir_point_append_depth_check_enabled",
+                "gir_point_append_align_depth_scale_enabled",
+                "gir_point_map_follow_mean_updates_enabled",
                 "gir_point_coverage_ratio",
                 "gir_point_append_ratio",
+                "gir_tracker_coverage_ratio",
+                "gir_tracker_point_union_coverage_ratio",
+                "gir_confirmed_current_in_front_ratio",
+                "gir_tracker_visibility_ratio",
+                "gir_tracker_fb_consistency_ratio",
+                "gir_tracker_cycle_error_mean",
                 "gir_point_append_hybrid_enabled",
                 "gir_point_front_conflict_ratio",
                 "gir_point_front_gradient_decay_gate_ratio",
                 "gir_point_front_decay_mass_ratio",
                 "gir_point_depth_scale",
+                "gir_point_depth_scale_min",
+                "gir_point_depth_scale_max",
                 "gir_add_gate_learned",
                 "gir_add_gate_warmup_progress",
                 "gir_add_rate",
@@ -1695,6 +2556,23 @@ class ModelWrapper(LightningModule):
                 "gir_old_decay_hard_pruned_ratio",
                 "gir_old_decay_map_count_before",
                 "gir_old_decay_map_count_after",
+                "gir_split_enabled",
+                "gir_split_eligible_count",
+                "gir_split_count",
+                "gir_split_ratio",
+                "gir_split_selected_radius",
+                "gir_split_selected_gradient_norm",
+                "gir_split_map_count_before",
+                "gir_split_map_count_after",
+                "gir_functional_update_selected_count",
+                "gir_functional_update_selected_ratio",
+                "gir_functional_update_score_mean",
+                "gir_functional_update_mean_gradient_norm",
+                "gir_functional_update_mean_step_norm",
+                "gir_functional_update_opacity_gradient_abs",
+                "gir_functional_update_opacity_logit_step_abs",
+                "gir_functional_update_harmonics_gradient_norm",
+                "gir_functional_update_harmonics_step_norm",
             )
             info_keys += tuple(
                 key
@@ -1868,6 +2746,9 @@ class ModelWrapper(LightningModule):
         num_context_view = ctx_img_num
         pred_all_target_extrinsic = pred_all_extrinsic[:, ctx_img_num:]
         pred_all_target_intrinsic = intrinsic[:, ctx_img_num:]
+        if self.model.encoder.cfg.heldout_test_camera == "gt":
+            pred_all_target_extrinsic = batch["target"]["extrinsics"]
+            pred_all_target_intrinsic = batch["target"]["intrinsics"]
         render_view_count = pred_all_target_extrinsic.shape[1]
         if render_view_count != target_view_count:
             raise RuntimeError(
@@ -1931,13 +2812,37 @@ class ModelWrapper(LightningModule):
             )
             model_depth_pred = vis_depth_map(depth_map.squeeze(-1)[0])
             depth_pred = vis_depth_map(output.depth[0])
-            comparison = hcat(
+            comparison_columns = [
                 add_label(vcat(*context_img), "Context"),
-                add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
-                add_label(vcat(*rgb_pred), "Rendered Target"),
-                add_label(vcat(*model_depth_pred), "GS Depth"),
-                add_label(vcat(*depth_pred), "Rendered Depth"),  
+            ]
+            if test_append_masks is not None:
+                append_masks = test_append_masks[0].float()
+                if append_masks.shape[0] != ctx_img_num:
+                    raise RuntimeError(
+                        "Test append-mask count must match source views: "
+                        f"masks={append_masks.shape[0]}, views={ctx_img_num}."
+                    )
+                append_masks = F.interpolate(
+                    append_masks,
+                    size=(h, w),
+                    mode="nearest",
+                )
+                append_masks = append_masks.repeat(1, 3, 1, 1).to(
+                    device=context_img.device,
+                    dtype=context_img.dtype,
+                )
+                comparison_columns.append(
+                    add_label(vcat(*append_masks), "GS Append Mask")
+                )
+            comparison_columns.extend(
+                (
+                    add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
+                    add_label(vcat(*rgb_pred), "Rendered Target"),
+                    add_label(vcat(*model_depth_pred), "GS Depth"),
+                    add_label(vcat(*depth_pred), "Rendered Depth"),
+                )
             )
+            comparison = hcat(*comparison_columns)
             save_image(comparison, path / f"{psnr}_{scene}.png")
         
 #         if self.test_cfg.save_compare:
@@ -2250,71 +3155,98 @@ class ModelWrapper(LightningModule):
             else self.optimizer_cfg.lr
         )
 
-        pretrained_params, scratch_params, other_params = [], [], []
-        pretrained_names, scratch_names, other_names = [], [], []
-
-        pretrained_keys = (
-            "model.encoder.gaussian_param_head",
-            "model.encoder.gs_head",
-            "model.encoder.camera_head",
-            "model.encoder.depth_head",
+        base_weight_decay = float(self.optimizer_cfg.base_weight_decay)
+        gir_weight_decay = (
+            base_weight_decay
+            if self.optimizer_cfg.gir_weight_decay is None
+            else float(self.optimizer_cfg.gir_weight_decay)
         )
-        scratch_keys = (
-            "model.encoder.depth_refiner",
-            "model.gir_update_head",
-            "model.gir_projected_update_head",
-        )
+        group_specs = {
+            "gaussian_param_head": (
+                self.optimizer_cfg.gaussian_param_head_lr or pretrained_lr,
+                base_weight_decay,
+            ),
+            "gs_head": (
+                self.optimizer_cfg.gs_head_lr or pretrained_lr,
+                base_weight_decay,
+            ),
+            "camera": (
+                self.optimizer_cfg.camera_lr or pretrained_lr,
+                base_weight_decay,
+            ),
+            "depth": (
+                self.optimizer_cfg.depth_lr or pretrained_lr,
+                base_weight_decay,
+            ),
+            "gir": (
+                self.optimizer_cfg.gir_lr or scratch_lr,
+                gir_weight_decay,
+            ),
+            "scratch": (scratch_lr, base_weight_decay),
+            "other": (self.optimizer_cfg.lr, base_weight_decay),
+        }
+        grouped_params = {name: [] for name in group_specs}
+        grouped_names = {name: [] for name in group_specs}
 
         for name, param in self.named_parameters():
             if not param.requires_grad:
                 continue
-            if any(key in name for key in pretrained_keys):
-                pretrained_params.append(param)
-                pretrained_names.append(name)
-            elif any(key in name for key in scratch_keys):
-                scratch_params.append(param)
-                scratch_names.append(name)
+            if "model.gir_" in name:
+                group = "gir"
+            elif "model.encoder.gs_head" in name:
+                group = "gs_head"
+            elif "model.encoder.camera_head" in name:
+                group = "camera"
+            elif "model.encoder.gaussian_param_head.scratch.output_conv2" in name:
+                group = "depth"
+            elif "model.encoder.gaussian_param_head" in name:
+                group = "gaussian_param_head"
+            elif (
+                "model.encoder.depth_head" in name
+            ):
+                group = "depth"
+            elif "model.encoder.depth_refiner" in name:
+                group = "scratch"
             else:
-                other_params.append(param)
-                other_names.append(name)
+                group = "other"
+            grouped_params[group].append(param)
+            grouped_names[group].append(name)
 
         param_dicts = []
-        if pretrained_params:
-            param_dicts.append(
-                {
-                    "params": pretrained_params,
-                    "lr": pretrained_lr,
-                    "name": "pretrained",
-                }
-            )
-        if scratch_params:
-            param_dicts.append(
-                {
-                    "params": scratch_params,
-                    "lr": scratch_lr,
-                    "name": "scratch",
-                }
-            )
-        if other_params:
-            param_dicts.append(
-                {
-                    "params": other_params,
-                    "lr": self.optimizer_cfg.lr,
-                    "name": "other",
-                }
-            )
+        for name, (learning_rate, weight_decay) in group_specs.items():
+            if grouped_params[name]:
+                param_dicts.append(
+                    {
+                        "params": grouped_params[name],
+                        "lr": float(learning_rate),
+                        "weight_decay": float(weight_decay),
+                        "name": name,
+                    }
+                )
+        if not param_dicts:
+            raise RuntimeError("No trainable parameters were selected.")
 
         if self.global_rank == 0:
-            print(
-                "Optimizer parameter groups: "
-                f"pretrained={len(pretrained_names)} params @ {pretrained_lr}, "
-                f"scratch={len(scratch_names)} params @ {scratch_lr}, "
-                f"other={len(other_names)} params @ {self.optimizer_cfg.lr}"
+            summary = ", ".join(
+                f"{group['name']}={len(grouped_names[group['name']])} params "
+                f"@ {group['lr']} wd={group['weight_decay']}"
+                for group in param_dicts
             )
-        
+            print(f"Optimizer parameter groups: {summary}")
+
         optimizer = torch.optim.AdamW(
-            param_dicts, weight_decay=0.1, betas=(0.9, 0.95)
+            param_dicts,
+            betas=(float(self.optimizer_cfg.beta1), float(self.optimizer_cfg.beta2)),
         )
+
+        scheduler_mode = str(self.optimizer_cfg.scheduler_mode).lower()
+        if scheduler_mode == "constant":
+            return optimizer
+        if scheduler_mode != "cosine":
+            raise ValueError(
+                "optimizer.scheduler_mode must be cosine or constant, got "
+                f"{scheduler_mode!r}."
+            )
         
         max_steps = get_cfg()["trainer"]["max_steps"]
         warm_up_steps = self.optimizer_cfg.warm_up_steps

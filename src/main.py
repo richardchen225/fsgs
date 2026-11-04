@@ -25,9 +25,12 @@ def _required_test_checkpoint_prefixes(encoder_cfg) -> list[str]:
     """Return checkpoint prefixes required by the enabled inference paths."""
     prefixes = [
         "encoder.gaussian_param_head.",
-        "encoder.gs_head.",
         "encoder.camera_head.",
     ]
+    if not bool(
+        getattr(encoder_cfg, "gir_new_gs_shared_decoder_enabled", False)
+    ):
+        prefixes.append("encoder.gs_head.")
     if str(getattr(encoder_cfg, "depth_head_source", "native")).lower() == "native":
         prefixes.append("encoder.depth_head.")
     if not bool(getattr(encoder_cfg, "gir_enabled", False)):
@@ -49,6 +52,14 @@ def _required_test_checkpoint_prefixes(encoder_cfg) -> list[str]:
         prefixes.append("gir_projected_update_head.output.")
     if new_residual_enabled:
         prefixes.append("gir_projected_update_head.new_output.")
+    if bool(
+        getattr(
+            encoder_cfg,
+            "gir_symmetric_multiview_update_enabled",
+            False,
+        )
+    ):
+        prefixes.append("gir_symmetric_update_head.")
 
     opacity_gradient_enabled = (
         old_projected_enabled
@@ -110,6 +121,18 @@ def _print_gir_parameter_stats(model, enabled: bool) -> None:
             finite_values = value[finite]
             print(
                 "[GIR DEBUG] init projected_shared."
+                f"{parameter_name}: finite={int(finite.sum().item())}/"
+                f"{value.numel()} absmax="
+                f"{finite_values.abs().max().item() if finite_values.numel() else float('nan'):.6e}"
+            )
+    symmetric_head = getattr(model, "gir_symmetric_update_head", None)
+    if symmetric_head is not None:
+        for parameter_name, parameter in symmetric_head.named_parameters():
+            value = parameter.detach().float()
+            finite = torch.isfinite(value)
+            finite_values = value[finite]
+            print(
+                "[GIR DEBUG] init symmetric_multiview."
                 f"{parameter_name}: finite={int(finite.sum().item())}/"
                 f"{value.numel()} absmax="
                 f"{finite_values.abs().max().item() if finite_values.numel() else float('nan'):.6e}"
@@ -289,6 +312,7 @@ def train(cfg_dict: DictConfig):
                 "encoder.depth_refiner.",
                 "gir_update_head.",
                 "gir_projected_update_head.",
+                "gir_symmetric_update_head.",
             )
             # A WorldMirror checkpoint owns only the GS heads. Backbone-native
             # camera and depth heads were loaded from ZipMap/StreamVGGT above.
@@ -377,6 +401,7 @@ def train(cfg_dict: DictConfig):
             or "depth_refiner" in key
             or "gir_update_head" in key
             or "gir_projected_update_head" in key
+            or "gir_symmetric_update_head" in key
         }
 
         model_state = model.state_dict()

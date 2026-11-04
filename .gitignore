@@ -11,6 +11,7 @@ venv/
 env/
 
 .vscode/
+.DS_Store
 
 datasets/
 weights/

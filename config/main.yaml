@@ -57,6 +57,20 @@ optimizer:
   backbone_lr_multiplier: 0.1
   train_base_heads: true
   train_gir: false
+  train_gaussian_param_head: null
+  train_gs_head: null
+  train_camera_head: null
+  train_depth_head: null
+  gaussian_param_head_lr: null
+  gs_head_lr: null
+  camera_lr: null
+  depth_lr: null
+  gir_lr: null
+  base_weight_decay: 0.1
+  gir_weight_decay: null
+  beta1: 0.9
+  beta2: 0.95
+  scheduler_mode: cosine  # cosine | constant
 
 checkpointing:
   load: null
@@ -75,6 +89,11 @@ train:
   distill_max_steps: 1000000
   max_val_comparisons: 999999
   random_context_views: false
+  # Optional rank-zero JSONL diagnostics for short server smoke tests.
+  debug_metrics_enabled: false
+  debug_metrics_every_n_steps: 10
+  debug_metrics_filename: train_debug_metrics.jsonl
+  debug_metrics_print: true
 
 seed: 111123
 

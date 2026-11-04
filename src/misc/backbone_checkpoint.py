@@ -19,6 +19,10 @@ def validate_backbone_checkpoint(checkpoint, encoder_cfg, *, allow_transfer=Fals
         )) for key in keys):
             actual = {"name": "zipmap"}
         elif any(
+            key.startswith("encoder.aggregator.network.") for key in keys
+        ):
+            actual = {"name": "abot"}
+        elif any(
             key.startswith("encoder.camera_head.trunk.") for key in keys
         ):
             actual = {"name": "streamvggt"}

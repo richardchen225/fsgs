@@ -12,6 +12,7 @@ from .view_sampler import ViewSampler
 class ViewSamplerBoundedCfg:
     name: Literal["bounded"]
     num_context_views: int
+    min_context_views: int
     num_target_views: int
     min_distance_between_context_views: int
     max_distance_between_context_views: int

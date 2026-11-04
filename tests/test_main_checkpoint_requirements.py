@@ -78,3 +78,45 @@ def test_world_mirror_depth_does_not_require_native_depth_checkpoint() -> None:
 
     assert "encoder.gaussian_param_head." in prefixes
     assert "encoder.depth_head." not in prefixes
+
+
+def test_shared_new_decoder_does_not_require_dense_gs_head() -> None:
+    prefixes = REQUIRED_PREFIXES(
+        SimpleNamespace(
+            gir_enabled=True,
+            gir_old_residual_enabled=False,
+            gir_old_update_mode="projected_shared",
+            gir_new_residual_enabled=True,
+            gir_new_gs_shared_decoder_enabled=True,
+            gir_old_opacity_gradient_enabled=False,
+            gir_new_opacity_gradient_enabled=False,
+            gir_mean_gradient_enabled=False,
+            gir_new_mean_gradient_enabled=False,
+        )
+    )
+
+    assert "encoder.gaussian_param_head." in prefixes
+    assert "encoder.gs_head." not in prefixes
+    assert "gir_projected_update_head.decoder." in prefixes
+    assert "gir_projected_update_head.new_output." in prefixes
+
+
+def test_symmetric_update_requires_its_head_and_dense_gs_head() -> None:
+    prefixes = REQUIRED_PREFIXES(
+        SimpleNamespace(
+            gir_enabled=True,
+            gir_old_residual_enabled=False,
+            gir_old_update_mode="projected_shared",
+            gir_new_residual_enabled=False,
+            gir_new_gs_shared_decoder_enabled=False,
+            gir_symmetric_multiview_update_enabled=True,
+            gir_old_opacity_gradient_enabled=False,
+            gir_new_opacity_gradient_enabled=False,
+            gir_mean_gradient_enabled=False,
+            gir_new_mean_gradient_enabled=False,
+        )
+    )
+
+    assert "encoder.gs_head." in prefixes
+    assert "gir_symmetric_update_head." in prefixes
+    assert "gir_projected_update_head.decoder." not in prefixes

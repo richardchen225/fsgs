@@ -1,0 +1,237 @@
+# @package _global_
+
+defaults:
+  - /dataset@_group_.dl3dv: dl3dv
+  - override /model/encoder: anysplat
+  - override /model/encoder/backbone: croco
+  - override /loss: [mse]
+  - _self_
+
+mode: train
+
+model:
+  encoder:
+    mode: train
+    reconstruction_backbone: zipmap
+    depth_head_source: native
+    zipmap_weights_path: "/openbayes/home/AnySplat/pre_zipmap"
+    streamvggt_weights_path: "/openbayes/home/AnySplat/pre_svggt.safetensors"
+    abot_weights_path: "/openbayes/input/input0/abot_recon.safetensors"
+    zipmap_ttt_window_size: 1
+    share_first_frame_intrinsics: true
+    depth_refine_enabled: false
+    gir_enabled: false
+    gir_old_residual_enabled: false
+    gir_new_residual_enabled: false
+    gir_symmetric_multiview_update_enabled: false
+    gir_anchor_child_enabled: false
+    gir_split_enabled: false
+    gir_functional_update_enabled: false
+    gir_old_decay_enabled: false
+    gir_old_delete_enabled: false
+    gir_new_gs_shared_decoder_enabled: false
+
+offline:
+  # incremental_per_frame: causally append one view, backward once, step the
+  # residual MLP immediately, then detach the map before the next view.
+  # incremental_full_graph: causally roll out every source view without
+  # detaching historical state, accumulating intermediate current/replay losses,
+  # then backward once through the complete graph.
+  # incremental_final_map: causally append and predict residuals without any
+  # intermediate RGB loss, then supervise the final map on all source views and
+  # take one optimizer step per complete source-view sweep.
+  # offline_global preserves the original all-views-at-once ablation.
+  training_mode: incremental_final_map  # incremental_per_frame | incremental_full_graph | incremental_final_map | offline_global
+  dataset_type: dl3dv
+  data_root: "/openbayes/input/input0/DL3DV-10K-Benchmark/119fd56d3797e2d349ca64ddcc5851463cd13b5974b5b2e4566ed5cf7e02e6c1/nerfstudio"
+  transforms_path: "/openbayes/input/input0/DL3DV-10K-Benchmark/119fd56d3797e2d349ca64ddcc5851463cd13b5974b5b2e4566ed5cf7e02e6c1/nerfstudio/transforms.json"
+  image_dir: images_8
+  resize_shape: [252, 518]
+  depth_type: z
+
+  # Source images produce camera/depth, GS anchors, and symmetric descriptors.
+  # Heldout-loss views supervise only the scene keep gate by default; heldout
+  # test views remain completely outside optimization.
+  train_frames: [1, 2, 4, 8, 12, 16, 20, 24, 26, 28]
+  heldout_loss_frame: [6, 14, 22]
+  heldout_loss_enabled: true
+  heldout_loss_weight: 1.0
+  # GT test cameras are strict blind NVS. With predicted test cameras, test
+  # RGBs are appended after the sources for the ZipMap or StreamVGGT camera
+  # path; they never produce depth/GS/evidence or enter the RGB loss.
+  heldout_test_frame: [10, 18]
+  # always reproduces the original experiment by putting predicted cameras,
+  # depth, and GS into the GT-aligned gauge even for predicted-camera renders.
+  # auto skips alignment only for a fully predicted-camera experiment; never
+  # is allowed only for that same fully predicted setup.
+  sim3_alignment_mode: always  # auto | always | never
+  source_render_camera: gt       # gt | predicted
+  heldout_test_camera: gt        # gt | predicted
+
+  mixed_precision: true
+  # gs_head: WorldMirror gaussian_param_head features + gs_head parameters.
+  # analytic: RGB SH-DC, isotropic scale, identity rotation, fixed opacity.
+  gaussian_parameter_source: gs_head  # gs_head | analytic
+  gs_head_checkpoint: "/openbayes/home/AnySplat/pre_wm.safetensors"
+  # Optional head fine-tuning. The reconstruction backbone and Gaussian/DPT
+  # feature head remain frozen; trainable heads are rerun from cached backbone
+  # tokens after every optimizer update.
+  train_gs_head: false
+  gs_head_lr: 5.0e-5
+  train_camera_head: true
+  camera_head_lr: 1.0e-5
+  train_depth_head: true
+  depth_head_lr: 1.0e-5
+
+  # Explicit geometry supervision matches replica_old_gs_overfit. DL3DV has
+  # no GT depth, so DAV3 is the supported depth target here.
+  depth_loss_enabled: true
+  depth_loss_target: dav3  # dav3 | gt
+  dav3_weights_path: "/openbayes/home/AnySplat/pre_dav3.safetensors"
+  dav3_align_to_gt_camera_scale: true
+  depth_absolute_log_scale_weight: 0.1
+  loss_depth: 1.0e-2
+  loss_camera: 1.0
+  # Supervise motion between consecutive source cameras instead of measuring
+  # every source pose against the first camera.
+  camera_pose_loss_mode: adjacent_pair  # first_relative | adjacent_pair
+  # Match the original training loss: MSE + 0.05 * LPIPS(VGG). In
+  # incremental_final_map this is evaluated once on all final source renders.
+  lpips_loss_enabled: true
+  loss_lpips: 0.05
+  lpips_apply_after_step: 0
+  # LPIPS uses a frozen VGG. Checkpoint and process one view at a time so its
+  # activations do not overlap the full 1M+ Gaussian rollout in memory.
+  lpips_train_chunk_size: 1
+  lpips_gradient_checkpointing: true
+  camera_translation_weight: 1.0
+  camera_translation_direction_weight: 0.1
+  # Suppress the singular cosine gradient on nearly static adjacent pairs.
+  # Pairs below this fraction of the scene's mean adjacent GT baseline are
+  # excluded; remaining direction terms are weighted by relative baseline.
+  camera_translation_direction_min_baseline_ratio: 0.05
+  camera_translation_direction_baseline_weighting: true
+  # Weak first-frame-relative trajectory supervision prevents coherent local
+  # adjacent-pair errors from accumulating across the complete sequence.
+  camera_global_trajectory_weight: 0.1
+  camera_rotation_weight: 1.0
+  camera_focal_weight: 1.0
+
+  # These only detach RGB/GS geometry gradients. Explicit camera/depth losses
+  # still train their heads when the corresponding train_* switch is enabled.
+  detach_predicted_camera: true
+  detach_predicted_depth: false
+  # Direct opacity for every analytic anchor. Do not divide it across views:
+  # source sheets are not exact duplicates at a heldout camera.
+  analytic_base_opacity: 0.5
+  # Slightly overlap neighboring pixel footprints to avoid grazing-view cracks.
+  analytic_scale_multiplier: 1.3
+  analytic_max_scale: 0.1
+
+  # Shared GIR residual MLP ablation. When false, no gradient/visual evidence
+  # is built and the MLP is excluded from optimization and map updates.
+  residual_enabled: true
+  hidden_dim: 128
+  # Smaller chunks cap transient projection/MLP memory. They do not change the
+  # result, but increase Python/CUDA launch overhead.
+  chunk_size: 16384
+  visual_enabled: true
+  # Restrict expensive visual projection and MLP activation to GSs already
+  # selected by gradient evidence. "all_active" restores the original behavior,
+  # where visibility alone can activate nearly the entire all-append map.
+  visual_candidate_mode: gradient_active  # gradient_active | all_active
+  visual_feature_dim: 24
+  visual_hidden_dim: 32
+  # 252x518 inputs become roughly 63x130 visual feature maps.
+  visual_image_scale: 0.25
+  visual_depth_temperature: 0.10
+  visual_min_alpha: 0.01
+
+  # Scene-specific differentiable pruning upper bound. Every final GS gets a
+  # persistent keep probability and renders with opacity * keep. The sparsity
+  # objective is exactly weight * mean(keep); no GS is physically deleted
+  # during training. Heldout RGB gradients update the keep logits but, with
+  # detach_heldout_map=true, do not update camera/depth/GS/residual parameters.
+  keep_gate_enabled: true
+  keep_gate_lr: 1.0e-2
+  keep_gate_initial_probability: 0.99
+  keep_gate_active_count_weight: 1.0e-3
+  keep_gate_detach_heldout_map: true
+
+  # Incremental map construction. "all" gives camera ablations identical GS
+  # topology; "point_map" uses frozen Sim(3)-aligned predicted geometry to
+  # suppress covered anchors. For incremental_per_frame max_steps counts frame
+  # updates; for incremental_full_graph and incremental_final_map it counts
+  # complete source-view sweeps.
+  append_mode: all  # point_map | all
+  # Periodic keyframes retain normal point-map appends, then add the covered
+  # pixels as lower-opacity, smaller refinement Gaussians. Counting is 1-based,
+  # so interval 5 triggers on source views 5, 10, 15, ...
+  periodic_all_append_enabled: false
+  periodic_all_append_interval: 5
+  periodic_all_append_opacity_scale: 0.35
+  periodic_all_append_scale_multiplier: 0.75
+  # Used by incremental_per_frame and incremental_full_graph only. The
+  # incremental_final_map mode renders all sources once after the rollout.
+  incremental_current_loss_weight: 1.0
+  incremental_replay_loss_weight: 0.5
+  incremental_replay_views: -1  # -1 = every previous source view
+  point_map_follow_mean_updates_enabled: true
+  point_append_depth_check_enabled: false
+  point_append_hybrid_enabled: true
+  point_append_current_in_front_enabled: true
+  point_append_history_in_front_enabled: true
+  point_append_depth_relative_tolerance: 0.15
+  point_append_rgb_bad_threshold: 0.08
+  point_append_old_alpha_threshold: 0.10
+  point_append_min_depth_confidence: 0.0
+  point_append_front_conflict_confirm_views: 1
+  point_append_front_conflict_opacity_decay: 0.70
+  point_append_max_ratio: 1.0
+  point_append_dilation_radius: 2
+  point_append_chunk_size: 65536
+
+  opacity_gradient_scale: 1000.0
+  opacity_gradient_clip: 20.0
+  opacity_gradient_threshold: 1.0e-3
+  mean_gradient_scale: 1.0
+  mean_gradient_clip: 20.0
+  mean_gradient_threshold: 1.0e-6
+  harmonics_gradient_scale: 1.0
+  harmonics_gradient_clip: 20.0
+  harmonics_gradient_threshold: 1.0e-6
+
+  # Directly apply raw MLP residuals. This disables tanh magnitude limits,
+  # per-GS scale bounds, coherence/conflict gates, and learned update gates.
+  # Opacity/scale/rotation still use their required mathematical domains.
+  unbounded_residual_updates: true
+  # These bounds are used only when unbounded_residual_updates is false.
+  max_mean_step_scale: 1.0
+  max_rotation_step: 0.25
+  max_log_scale_step: 0.5
+  # In bounded mode, opacity 0.5 can reach approximately 0.018..0.982.
+  max_opacity_logit_step: 4.0
+  max_harmonics_step: 0.5
+
+  lr: 1.0e-4
+  # A non-positive grad_clip disables global clipping. Camera gradients are
+  # clipped separately because their cosine-direction term can spike on
+  # short-baseline pairs.
+  weight_decay: 0.0
+  grad_clip: 0.0
+  camera_grad_clip: 1.0
+  residual_regularization_weight: 0.0
+  # max_steps counts complete ten-source-view sweeps in this mode.
+  max_steps: 375
+  log_every: 10
+  eval_every: 100
+  eval_lpips_enabled: true
+  # CPU avoids keeping LPIPS-VGG beside the full Gaussian map on the GPU.
+  eval_lpips_device: cpu  # cpu | cuda
+  save_every: 500
+  save_checkpoints: false
+  save_final_ply: true
+
+hydra:
+  run:
+    dir: outputs/offline_gs_mlp_overfit/${now:%Y-%m-%d_%H-%M-%S}

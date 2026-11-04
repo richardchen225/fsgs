@@ -145,7 +145,7 @@ class StreamVGGTBackboneTests(unittest.TestCase):
                     raise AssertionError("Camera features must be float32")
                 return [self.poses]
 
-        for backbone in ("zipmap", "streamvggt"):
+        for backbone in ("zipmap", "streamvggt", "abot"):
             with self.subTest(backbone=backbone):
                 cfg = SimpleNamespace(reconstruction_backbone=backbone, share_first_frame_intrinsics=False)
                 camera = Camera()

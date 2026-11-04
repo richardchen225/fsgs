@@ -57,7 +57,11 @@ class ProjectedGSRasterizationOutput:
 class GSParameterGradientOutput:
     opacity_logit: Tensor
     mean_camera: Tensor | None
+    harmonics: Tensor | None
     losses: Tensor
+    rendered_color: Tensor | None = None
+    rendered_depth: Tensor | None = None
+    rendered_alpha: Tensor | None = None
 
 
 def _invert_rigid_camera_poses(camera_to_world: Tensor) -> Tensor:
@@ -339,8 +343,15 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         image_shape: tuple[int, int],
         active_mask: Tensor | None = None,
         mean_camera_enabled: bool = False,
+        harmonics_enabled: bool = False,
+        loss_reduction: Literal["sum", "mean"] = "sum",
     ) -> GSParameterGradientOutput:
         """Probe detached GS parameters with per-view RGB reconstruction loss."""
+        if loss_reduction not in {"sum", "mean"}:
+            raise ValueError(
+                "GS parameter-gradient loss_reduction must be sum or mean, got "
+                f"{loss_reduction!r}."
+            )
         if extrinsics.ndim == 3:
             extrinsics = extrinsics[:, None]
         if intrinsics.ndim == 3:
@@ -369,7 +380,11 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         height, width = image_shape
         opacity_gradients = []
         mean_gradients = []
+        harmonics_gradients = []
         losses = []
+        rendered_colors = []
+        rendered_depths = []
+        rendered_alphas = []
         with torch.inference_mode(False), torch.enable_grad(), torch.autocast(
             device_type=gaussians.opacities.device.type, enabled=False
         ):
@@ -404,6 +419,7 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
                 opacity_logits = torch.logit(base_opacity).requires_grad_(True)
                 probe_inputs = [opacity_logits]
                 probe_means = fixed_means
+                probe_harmonics = fixed_harmonics
                 if mean_camera_enabled:
                     mean_delta_camera = torch.zeros_like(fixed_means).requires_grad_(
                         True
@@ -413,9 +429,15 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
                     )
                     probe_means = fixed_means + mean_delta_world
                     probe_inputs.append(mean_delta_camera)
+                if harmonics_enabled:
+                    harmonics_delta = torch.zeros_like(
+                        fixed_harmonics
+                    ).requires_grad_(True)
+                    probe_harmonics = fixed_harmonics + harmonics_delta
+                    probe_inputs.append(harmonics_delta)
                 detached_gaussians = Gaussians(
                     means=probe_means,
-                    harmonics=fixed_harmonics,
+                    harmonics=probe_harmonics,
                     opacities=torch.sigmoid(opacity_logits) * active,
                     scales=fixed_scales,
                     rotations=fixed_rotations,
@@ -428,9 +450,31 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
                     far,
                     image_shape,
                 )
-                loss = (
+                rendered_colors.append(rendering.color[:, 0].detach())
+                rendered_depth = rendering.depth
+                rendered_alpha = rendering.alpha
+                if rendered_depth is None or rendered_alpha is None:
+                    raise RuntimeError(
+                        "GS parameter-gradient rendering must return depth and alpha."
+                    )
+                if rendered_depth.ndim == 3:
+                    rendered_depth = rendered_depth[:, None]
+                elif rendered_depth.ndim == 4 and rendered_depth.shape[1] != 1:
+                    rendered_depth = rendered_depth[:, :1]
+                if rendered_alpha.ndim == 3:
+                    rendered_alpha = rendered_alpha[:, None]
+                elif rendered_alpha.ndim == 4 and rendered_alpha.shape[1] != 1:
+                    rendered_alpha = rendered_alpha[:, :1]
+                rendered_depths.append(rendered_depth.detach())
+                rendered_alphas.append(rendered_alpha.detach())
+                squared_error = (
                     rendering.color.float() - target[:, view_idx : view_idx + 1]
-                ).square().sum()
+                ).square()
+                loss = (
+                    squared_error.mean()
+                    if loss_reduction == "mean"
+                    else squared_error.sum()
+                )
                 gradient_values = torch.autograd.grad(
                     loss,
                     probe_inputs,
@@ -442,6 +486,15 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
                     mean_gradients.append(
                         gradient_values[1].detach() * active.unsqueeze(-1)
                     )
+                if harmonics_enabled:
+                    harmonics_index = 1 + int(mean_camera_enabled)
+                    harmonics_active = active
+                    for _ in range(fixed_harmonics.ndim - active.ndim):
+                        harmonics_active = harmonics_active.unsqueeze(-1)
+                    harmonics_gradients.append(
+                        gradient_values[harmonics_index].detach()
+                        * harmonics_active
+                    )
                 losses.append(loss.detach())
         return GSParameterGradientOutput(
             opacity_logit=torch.stack(opacity_gradients, dim=1),
@@ -450,7 +503,15 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
                 if mean_camera_enabled
                 else None
             ),
+            harmonics=(
+                torch.stack(harmonics_gradients, dim=1)
+                if harmonics_enabled
+                else None
+            ),
             losses=torch.stack(losses),
+            rendered_color=torch.stack(rendered_colors, dim=1),
+            rendered_depth=torch.stack(rendered_depths, dim=1),
+            rendered_alpha=torch.stack(rendered_alphas, dim=1),
         )
 
     def render_opacity_logit_gradients(

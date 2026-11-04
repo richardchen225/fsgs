@@ -103,6 +103,8 @@ train:
   pose_loss_alpha: 1.0
   pose_loss_delta: 1.0
   camera_focal_weight: 1.0
+  camera_pose_loss_mode: adjacent_pair
+  camera_translation_direction_weight: 0.1
   cxt_depth_weight: 1.0
   weight_pose: 10.0
   weight_depth: 1.0

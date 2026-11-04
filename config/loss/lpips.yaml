@@ -1,3 +1,6 @@
 lpips:
   weight: 0.05
   apply_after_step: 0
+  view_group: all  # source | heldout | all
+  chunk_size: 0   # 0 processes every selected view together
+  gradient_checkpointing: false

@@ -16,6 +16,9 @@ from src.dataset.shims.normalize_shim import apply_normalize_shim
 from src.dataset.types import BatchedExample, DataShim
 
 from src.model.encoder.heads.vggt_dpt_gs_head import VGGT_DPT_GS_Head
+from src.model.analytic_gaussians import (
+    build_analytic_gaussian_anchors,
+)
 from src.model.encoder.vggt.utils.geometry import (
     batchify_unproject_depth_map_to_point_map,
     closed_form_inverse_se3,
@@ -25,6 +28,8 @@ import matplotlib.pyplot as plt
 from src.model.encoder.vggt.utils.pose_enc import (
     pose_encoding_to_extri_intri,
 )
+from src.model.encoder.vggt.utils.rotation import mat_to_quat, quat_to_mat
+from src.geometry.sim3 import apply_camera_sim3, estimate_camera_sim3
 from torch import nn, Tensor
 from torch_scatter import scatter_add, scatter_max
 from ..types import Gaussians
@@ -88,13 +93,18 @@ class EncoderAnySplatCfg:
     gs_keep_ratio: float = 1.0
     opacity_conf: bool = False
     # Model weights paths
-    reconstruction_backbone: Literal["zipmap", "streamvggt"] = "zipmap"
+    reconstruction_backbone: Literal["zipmap", "streamvggt", "abot"] = "zipmap"
     depth_head_source: Literal["native", "world_mirror"] = "native"
     depth_teacher: Literal["dav3"] = "dav3"
     streamvggt_weights_path: Optional[str] = None
     zipmap_weights_path: Optional[str] = None
     zipmap_use_ema: bool = False
     zipmap_ttt_window_size: int = 1
+    abot_weights_path: Optional[str] = None
+    abot_local_window_frames: int = 12
+    abot_attention_backend: Literal["auto", "sdpa", "paged"] = "sdpa"
+    abot_amp_dtype: Literal["fp32", "fp16", "bf16"] = "bf16"
+    abot_max_frames: int = 4096
     depth_refine_enabled: bool = True
     depth_refine_iters: int = 4
     depth_refine_candidates: int = 9
@@ -109,6 +119,9 @@ class EncoderAnySplatCfg:
     # matrices keeps rasterizer and geometry gradients out of the camera MLP.
     detach_predicted_camera_for_geometry: bool = False
     share_first_frame_intrinsics: bool = False
+    sim3_alignment_mode: Literal["auto", "always", "never"] = "never"
+    source_render_camera: Literal["gt", "predicted"] = "predicted"
+    heldout_test_camera: Literal["gt", "predicted"] = "predicted"
     gir_enabled: bool = False
     gir_render_scale: float = 0.25
     gir_raster_evidence_enabled: bool = False
@@ -142,6 +155,72 @@ class EncoderAnySplatCfg:
     gir_mean_gradient_replay_views: int = 6
     gir_old_mean_gradient_current_weight: float = 1.0
     gir_old_mean_gradient_replay_weight: float = 0.5
+    gir_split_enabled: bool = False
+    gir_split_projected_radius_threshold: float = 4.0
+    gir_split_mean_gradient_threshold: float = 1e-6
+    gir_split_min_observations: int = 2
+    gir_split_max_ratio: float = 0.005
+    gir_split_max_generation: int = 1
+    gir_split_offset_scale: float = 0.4
+    gir_split_scale_divisor: float = 1.6
+    gir_split_min_opacity: float = 0.02
+    gir_split_max_gaussians: int = 0
+    gir_split_warmup_steps: int = 1000
+    gir_functional_update_enabled: bool = False
+    gir_functional_update_replay_views: int = 2
+    gir_functional_update_top_ratio: float = 0.05
+    gir_functional_update_min_observations: int = 1
+    gir_functional_update_mean_enabled: bool = True
+    gir_functional_update_opacity_enabled: bool = True
+    gir_functional_update_harmonics_enabled: bool = True
+    gir_functional_update_mean_learning_rate: float = 1e-3
+    gir_functional_update_opacity_learning_rate: float = 5e-3
+    gir_functional_update_harmonics_learning_rate: float = 1e-3
+    gir_functional_update_harmonics_gradient_scale: float = 1.0
+    gir_functional_update_harmonics_gradient_clip: float = 20.0
+    gir_functional_update_harmonics_gradient_threshold: float = 1e-6
+    gir_functional_update_current_weight: float = 1.0
+    gir_functional_update_replay_weight: float = 0.5
+    gir_functional_update_max_mean_step_scale: float = 0.25
+    gir_functional_update_max_opacity_logit_step: float = 0.10
+    gir_functional_update_max_harmonics_step: float = 0.05
+    gir_symmetric_multiview_update_enabled: bool = False
+    gir_symmetric_multiview_hidden_dim: int = 128
+    gir_symmetric_multiview_chunk_size: int = 65536
+    gir_symmetric_multiview_visual_enabled: bool = False
+    gir_symmetric_multiview_visual_feature_dim: int = 24
+    gir_symmetric_multiview_visual_hidden_dim: int = 32
+    gir_symmetric_multiview_visual_image_scale: float = 0.5
+    gir_symmetric_multiview_visual_depth_temperature: float = 0.10
+    gir_symmetric_multiview_visual_min_alpha: float = 0.01
+    gir_symmetric_multiview_opacity_gradient_scale: float = 1000.0
+    gir_symmetric_multiview_opacity_gradient_clip: float = 20.0
+    gir_symmetric_multiview_opacity_gradient_threshold: float = 1e-3
+    gir_symmetric_multiview_mean_gradient_scale: float = 1.0
+    gir_symmetric_multiview_mean_gradient_clip: float = 20.0
+    gir_symmetric_multiview_mean_gradient_threshold: float = 1e-6
+    gir_symmetric_multiview_harmonics_gradient_scale: float = 1.0
+    gir_symmetric_multiview_harmonics_gradient_clip: float = 20.0
+    gir_symmetric_multiview_harmonics_gradient_threshold: float = 1e-6
+    gir_symmetric_multiview_max_mean_step_scale: float = 0.10
+    gir_symmetric_multiview_max_rotation_step: float = 0.01
+    gir_symmetric_multiview_max_log_scale_step: float = 0.02
+    gir_symmetric_multiview_max_opacity_logit_step: float = 0.10
+    gir_symmetric_multiview_max_harmonics_step: float = 0.05
+    gir_symmetric_multiview_unbounded_updates: bool = False
+    gir_anchor_child_enabled: bool = False
+    gir_anchor_child_max_count: int = 8
+    gir_anchor_child_add_count: int = 1
+    gir_anchor_child_min_observations: int = 2
+    gir_anchor_child_gradient_threshold: float = 0.05
+    gir_anchor_child_coherence_threshold: float = 0.5
+    gir_anchor_child_max_conflict_ratio: float = 0.25
+    gir_anchor_child_cooldown_views: int = 2
+    gir_anchor_child_max_ratio: float = 0.05
+    gir_anchor_child_offset_scale: float = 0.4
+    gir_anchor_child_scale_divisor: float = 1.6
+    gir_anchor_child_min_opacity: float = 0.02
+    gir_anchor_child_max_gaussians: int = 500000
     gir_new_mean_gradient_enabled: bool = False
     gir_new_mean_gradient_replay_views: int = 0
     gir_new_mean_gradient_current_weight: float = 1.0
@@ -169,6 +248,9 @@ class EncoderAnySplatCfg:
     gir_rotation_scale: float = 0.05
     gir_harmonics_scale: float = 0.10
     gir_hidden_dim: int = 64
+    gir_training_mode: Literal["streaming_aux", "incremental_final_map"] = (
+        "streaming_aux"
+    )
     gir_tbptt_chunk: int = 2
     gir_replay_views: int = 1
     gir_aux_loss_weight: float = 1.0
@@ -181,8 +263,24 @@ class EncoderAnySplatCfg:
     gir_history_loss_interval: int = 4
     gir_history_preserve_margin: float = 0.002
     gir_history_replay_views: int = 1
-    gir_append_mode: Literal["all", "point_map", "learned"] = "all"
+    gir_append_mode: Literal[
+        "all", "point_map", "tracker", "tracker_point_map", "learned"
+    ] = "all"
+    gir_tracker_backend: Literal["spot", "alltracker"] = "spot"
+    gir_tracker_repo_path: str = "third_party/SPOT"
+    gir_tracker_weights_path: str = "third_party/SPOT/ckpts/spot.pth"
+    gir_tracker_mixed_precision: bool = True
+    gir_tracker_iterations: int = 4
+    gir_tracker_window_length: int = 16
+    gir_tracker_visibility_threshold: float = 0.8
+    gir_tracker_coverage_threshold: float = 0.05
+    gir_tracker_dilation_radius: int = 1
+    gir_tracker_forward_backward_enabled: bool = False
+    gir_tracker_cycle_absolute_threshold: float = 1.5
+    gir_tracker_cycle_relative_threshold: float = 0.05
     gir_point_append_depth_check_enabled: bool = True
+    gir_point_append_align_depth_scale_enabled: bool = False
+    gir_point_map_follow_mean_updates_enabled: bool = False
     gir_point_append_hybrid_enabled: bool = False
     gir_point_append_current_in_front_enabled: bool = True
     gir_point_append_history_in_front_enabled: bool = True
@@ -205,8 +303,12 @@ class EncoderAnySplatCfg:
     # each new view.  "means" matches the selected overfit setup: historical
     # positions are detached while appearance parameters keep their graph.
     gir_historical_detach_mode: Literal["all", "means", "none"] = "means"
-    # Refine only append-selected DPT anchors with the shared projected-GS MLP.
+    # Refine append-selected anchors with the shared projected-GS MLP. The
+    # optional shared decoder also replaces dense gs_head parameter anchors.
     gir_new_residual_enabled: bool = False
+    gir_new_gs_shared_decoder_enabled: bool = False
+    gir_new_gs_shared_decoder_base_opacity: float = 0.5
+    gir_new_gs_shared_decoder_scale_multiplier: float = 1.0
     gir_residual_alpha_threshold: float = 0.02
     gir_residual_depth_relative_tolerance: float = 0.08
     gir_residual_rgb_bad_threshold: float = 0.08
@@ -774,6 +876,57 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             f"from {checkpoint_path}"
         )
 
+    def _init_abot(self, cfg: EncoderAnySplatCfg) -> None:
+        try:
+            from abot_recon.config import InferenceConfig
+            from abot_recon.model import ReleasedABotReconModel
+        except ImportError as exc:
+            raise ImportError(
+                "ABot-Recon is not installed. Install the downloaded repository "
+                "with `pip install -e /path/to/ABot-Recon-main --no-deps`."
+            ) from exc
+        from src.model.encoder.abot_adapter import (
+            ABotBackboneAdapter,
+            ABotCameraHeadAdapter,
+            ABotDepthHeadAdapter,
+        )
+
+        if cfg.abot_weights_path is None:
+            raise ValueError("ABot requires abot_weights_path.")
+        checkpoint_path = Path(cfg.abot_weights_path).expanduser()
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"ABot weights not found: {checkpoint_path}")
+        if cfg.abot_local_window_frames != 12:
+            raise ValueError(
+                "The released ABot checkpoint requires "
+                "abot_local_window_frames=12."
+            )
+
+        runtime_cfg = InferenceConfig(
+            checkpoint=checkpoint_path,
+            device="cpu",
+            amp_dtype=cfg.abot_amp_dtype,
+            local_window_frames=cfg.abot_local_window_frames,
+            max_frames=cfg.abot_max_frames,
+            attention_backend=cfg.abot_attention_backend,
+            output_local_points=True,
+            output_world_points=False,
+            output_confidence=True,
+            loop_closure=False,
+        )
+        runtime = ReleasedABotReconModel(runtime_cfg)
+        self.aggregator = ABotBackboneAdapter(
+            runtime.network,
+            input_mean=cfg.input_mean,
+            input_std=cfg.input_std,
+        )
+        self.camera_head = ABotCameraHeadAdapter(self.aggregator)
+        self.depth_head = ABotDepthHeadAdapter(self.aggregator)
+        print(
+            "Loaded frozen ABot backbone, camera poses, and native point-map "
+            f"depth from {checkpoint_path}"
+        )
+
     def _init_zipmap(self, cfg: EncoderAnySplatCfg) -> None:
         from src.model.encoder.zipmap.models.ZipMap_AR import ZipMap
 
@@ -882,12 +1035,21 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
 
     def __init__(self, cfg: EncoderAnySplatCfg) -> None:
         super().__init__(cfg)
+        if cfg.gir_new_gs_shared_decoder_enabled and (
+            not cfg.gir_enabled or not cfg.gir_new_residual_enabled
+        ):
+            raise ValueError(
+                "gir_new_gs_shared_decoder_enabled=true requires both "
+                "gir_enabled=true and gir_new_residual_enabled=true."
+            )
         if cfg.depth_teacher != "dav3":
             raise ValueError(f"Unknown depth teacher: {cfg.depth_teacher}")
         if cfg.reconstruction_backbone == "zipmap":
             self._init_zipmap(cfg)
         elif cfg.reconstruction_backbone == "streamvggt":
             self._init_streamvggt(cfg)
+        elif cfg.reconstruction_backbone == "abot":
+            self._init_abot(cfg)
         else:
             raise ValueError(
                 f"Unknown reconstruction_backbone: {cfg.reconstruction_backbone!r}."
@@ -958,6 +1120,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         name: str = None,
         target_view_count: Optional[int] = None,
         return_gir_data: bool = False,
+        gt_context_c2w: Optional[torch.Tensor] = None,
     ) -> Gaussians:
 
         b, v, _, h, w = image.shape
@@ -976,11 +1139,25 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         distill_infos = {}
         infos = {}
         pred_all_extrinsic = None
+        abot_local_points = None
         
         with torch.no_grad():
-            with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
+            backbone_amp_dtype = torch.float16
+            backbone_amp_enabled = True
+            if self.cfg.reconstruction_backbone == "abot":
+                backbone_amp_dtype = {
+                    "fp16": torch.float16,
+                    "bf16": torch.bfloat16,
+                    "fp32": torch.float32,
+                }[self.cfg.abot_amp_dtype]
+                backbone_amp_enabled = backbone_amp_dtype != torch.float32
+            with torch.amp.autocast(
+                "cuda",
+                enabled=backbone_amp_enabled,
+                dtype=backbone_amp_dtype,
+            ):
                 aggregated_tokens_list, patch_start_idx = self.aggregator(
-                    image.to(torch.float16)
+                    image.to(backbone_amp_dtype)
                 )
 
         with torch.amp.autocast("cuda", enabled=False):
@@ -1057,10 +1234,85 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 4,
                 4,
             )
-            infos["pred_context_c2w"] = pred_all_extrinsic
-            # This remains attached even when derived geometry is detached, so
-            # the explicit pose/FOV objective still trains the camera head.
-            infos["pred_context_pose_encoding"] = safe_pose_enc
+            raw_pred_all_extrinsic = pred_all_extrinsic
+            sim3_mode = str(self.cfg.sim3_alignment_mode).lower()
+            if sim3_mode not in {"auto", "always", "never"}:
+                raise ValueError(
+                    "sim3_alignment_mode must be auto, always, or never, got "
+                    f"{sim3_mode!r}."
+                )
+            sim3_enabled = sim3_mode == "always" or (
+                sim3_mode == "auto"
+                and (
+                    self.cfg.source_render_camera == "gt"
+                    or self.cfg.heldout_test_camera == "gt"
+                )
+            )
+            if sim3_enabled:
+                if ctx_img_num < 3:
+                    raise ValueError(
+                        "Sim(3) alignment requires at least three source "
+                        "cameras after the source/heldout split; got "
+                        f"source={ctx_img_num} from total={v}. Configure "
+                        "view_sampler.min_context_views >= 6 for training."
+                    )
+                if gt_context_c2w is None:
+                    raise RuntimeError(
+                        "Sim(3) alignment requires GT context camera poses."
+                    )
+                if gt_context_c2w.shape[:2] != (b, image.shape[1]):
+                    raise RuntimeError(
+                        "GT camera sequence does not match the image sequence: "
+                        f"cameras={tuple(gt_context_c2w.shape)}, "
+                        f"images={tuple(image.shape)}."
+                    )
+                sim3_rotation, sim3_translation, sim3_scale = (
+                    estimate_camera_sim3(
+                        raw_pred_all_extrinsic[:, :ctx_img_num],
+                        gt_context_c2w[:, :ctx_img_num].to(
+                            device=raw_pred_all_extrinsic.device,
+                            dtype=raw_pred_all_extrinsic.dtype,
+                        ),
+                    )
+                )
+                pred_all_extrinsic = apply_camera_sim3(
+                    raw_pred_all_extrinsic,
+                    sim3_rotation,
+                    sim3_translation,
+                    sim3_scale,
+                )
+            else:
+                sim3_rotation = torch.eye(
+                    3,
+                    device=pred_all_extrinsic.device,
+                    dtype=pred_all_extrinsic.dtype,
+                ).unsqueeze(0).expand(b, -1, -1)
+                sim3_translation = torch.zeros(
+                    b,
+                    3,
+                    device=pred_all_extrinsic.device,
+                    dtype=pred_all_extrinsic.dtype,
+                )
+                sim3_scale = torch.ones(
+                    b,
+                    device=pred_all_extrinsic.device,
+                    dtype=pred_all_extrinsic.dtype,
+                )
+            infos["pred_context_c2w"] = raw_pred_all_extrinsic
+            infos["sim3_rotation"] = sim3_rotation
+            infos["sim3_translation"] = sim3_translation
+            infos["sim3_scale"] = sim3_scale
+            infos["sim3_alignment_enabled"] = torch.tensor(
+                float(sim3_enabled), device=pred_all_extrinsic.device
+            )
+            # Geometry is generated directly in the aligned gauge. Scaling
+            # depth below and using these aligned source poses is equivalent
+            # to applying the same Sim(3) to native predicted points.
+            gt_ex = pred_all_extrinsic[:, :ctx_img_num].flatten(0, 1)
+            # Keep the raw FOV and pre-normalized quaternion for the explicit
+            # camera objective, exactly as offline_gs_mlp_overfit does. The
+            # safe encoding above is only used to construct render matrices.
+            infos["pred_context_pose_encoding"] = last_pred_pose_enc
 
             ctx_agg_token_list = [
                 token[:, :ctx_img_num, ...] for token in aggregated_tokens_list
@@ -1116,6 +1368,10 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                         "Native depth confidence must have one channel, got "
                         f"{tuple(native_depth_conf.shape)}."
                     )
+                if self.cfg.reconstruction_backbone == "abot":
+                    _, abot_local_points, _, _ = (
+                        self.aggregator.cached_geometry(ctx_img_num)
+                    )
             depth_for_loss = torch.nan_to_num(
                 depth_map.float(),
                 nan=1e-4,
@@ -1141,24 +1397,49 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                     neginf=1e-4,
                 ).clamp(1e-4, 100.0).to(depth_map.dtype)
 
+            if sim3_enabled:
+                depth_for_geometry = (
+                    depth_for_geometry * sim3_scale[:, None, None, None, None]
+                )
+
         del aggregated_tokens_list, patch_start_idx
         torch.cuda.empty_cache()
         # ====================================================================
         v = ctx_img_num
         image = image[:, :ctx_img_num, ...]
         from . import act_gs, sh_utils
-        gs_feats_reshape = rearrange(out, "b s c h w -> (b s) c h w")
-        with torch.amp.autocast("cuda", enabled=False):
-            gs_raw = self.gs_head(gs_feats_reshape)
-    
-        gs_params = rearrange(gs_raw, "(b s) c h w -> b s h w c", b=b, s=v)
-        quats, scales, opacities, res_sh, weights = torch.split(
-            gs_params, [4, 3, 1, self.nums_sh * 3, 1], dim=-1
+        use_shared_new_decoder = bool(
+            self.cfg.gir_new_gs_shared_decoder_enabled
         )
+        if not use_shared_new_decoder:
+            gs_feats_reshape = rearrange(out, "b s c h w -> (b s) c h w")
+            with torch.amp.autocast("cuda", enabled=False):
+                gs_raw = self.gs_head(gs_feats_reshape)
+            gs_params = rearrange(
+                gs_raw, "(b s) c h w -> b s h w c", b=b, s=v
+            )
+            quats, scales, opacities, res_sh, _ = torch.split(
+                gs_params, [4, 3, 1, self.nums_sh * 3, 1], dim=-1
+            )
         
-        means = batchify_unproject_depth_map_to_point_map(
-            depth_for_geometry, gt_ex, gt_ix
-        )
+        if abot_local_points is not None:
+            from src.model.encoder.abot_adapter import (
+                rescale_local_points_to_depth,
+                transform_local_points_to_world,
+            )
+
+            abot_camera_points = rescale_local_points_to_depth(
+                abot_local_points,
+                depth_for_geometry,
+            )
+            means = transform_local_points_to_world(
+                abot_camera_points,
+                gt_ex.reshape(b, v, 4, 4).float(),
+            )
+        else:
+            means = batchify_unproject_depth_map_to_point_map(
+                depth_for_geometry, gt_ex, gt_ix
+            )
         # means = means.reshape(b, v , h * w, 3).squeeze(0)
         # quats = quats.reshape(b, v , h * w, 4).squeeze(0)
         # scales = scales.reshape(b, v , h * w, 3).squeeze(0)
@@ -1166,10 +1447,34 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         # res_sh = res_sh.reshape(b, v , h * w, self.nums_sh* 3).squeeze(0)
         
         means_raw = means.reshape(b, v, h * w, 3)
-        quats_raw = quats.reshape(b, v, h * w, 4)
-        scales_raw = scales.reshape(b, v, h * w, 3)
-        opacities_raw = opacities.reshape(b, v, h * w, 1)
-        res_sh_raw = res_sh.reshape(b, v, h * w, self.nums_sh * 3)
+        if use_shared_new_decoder:
+            analytic = build_analytic_gaussian_anchors(
+                means_raw.reshape(b * v, h, w, 3),
+                image.reshape(b * v, 3, h, w),
+                depth_for_geometry.reshape(b * v, h, w),
+                gt_ix.reshape(b * v, 3, 3),
+                base_opacity=self.cfg.gir_new_gs_shared_decoder_base_opacity,
+                scale_multiplier=(
+                    self.cfg.gir_new_gs_shared_decoder_scale_multiplier
+                ),
+            )
+            quats_raw = analytic.rotations.reshape(b, v, h * w, 4)
+            scales_raw = analytic.scales.clamp_min(1e-8).log().reshape(
+                b, v, h * w, 3
+            )
+            opacities_raw = torch.logit(
+                analytic.opacities.clamp(1e-6, 1.0 - 1e-6)
+            ).reshape(b, v, h * w, 1)
+            res_sh_raw = torch.zeros(
+                (b, v, h * w, self.nums_sh * 3),
+                device=out.device,
+                dtype=torch.float32,
+            )
+        else:
+            quats_raw = quats.reshape(b, v, h * w, 4)
+            scales_raw = scales.reshape(b, v, h * w, 3)
+            opacities_raw = opacities.reshape(b, v, h * w, 1)
+            res_sh_raw = res_sh.reshape(b, v, h * w, self.nums_sh * 3)
 
         means = means_raw.reshape(b, v * h * w, 3)
         quats = quats_raw.reshape(b, v * h * w, 4)
@@ -1201,6 +1506,22 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         key_mapping = {"quats": "rotations", "sh": "harmonics"}        
         gaussians = {key_mapping.get(k, k): v for k, v in splats.items()}
         gaussians = Gaussians(**gaussians)
+        if sim3_enabled:
+            gaussian_rotations = quat_to_mat(gaussians.rotations.float())
+            aligned_rotations = torch.einsum(
+                "bij,bnjk->bnik", sim3_rotation.float(), gaussian_rotations
+            )
+            gaussians = Gaussians(
+                means=gaussians.means,
+                harmonics=gaussians.harmonics,
+                opacities=gaussians.opacities,
+                scales=(
+                    gaussians.scales * sim3_scale[:, None, None]
+                ),
+                rotations=mat_to_quat(aligned_rotations).to(
+                    gaussians.rotations.dtype
+                ),
+            )
 
         if self.cfg.gir_enabled:
             infos["gir"] = {

@@ -3,22 +3,406 @@ from dataclasses import replace
 import torch
 
 from src.model.streaming_gir import (
+    HarmonicsGradientEvidence,
+    MeanGradientEvidence,
+    OpacityGradientEvidence,
     ProjectedGSEvidence,
     ProjectedNewGSResidualPrediction,
     ProjectedGSResidualHead,
     ProjectedGSResidualPrediction,
+    SymmetricGSResidualHead,
+    SymmetricGSResidualPrediction,
     StreamingGaussianState,
+    align_gaussians_to_camera_depth_scale,
     apply_projected_new_gaussian_residual,
+    apply_symmetric_multiview_residual,
+    attach_symmetric_multiview_visual_evidence,
     build_mean_gradient_evidence,
     build_opacity_gradient_evidence,
     build_point_map_append_mask,
     build_projected_gaussian_evidence,
     build_projected_new_gaussian_evidence,
     build_provisional_gaussians,
+    build_symmetric_multiview_gradient_evidence,
+    build_symmetric_multiview_visual_evidence,
     gate_front_conflict_decay,
     select_current_and_recent_replay_gradients,
 )
 from src.model.types import Gaussians
+
+
+def _make_symmetric_state() -> StreamingGaussianState:
+    means = torch.tensor([[[0.0, 0.0, 2.0], [0.2, 0.0, 2.0]]])
+    rotations = torch.zeros(1, 2, 4)
+    rotations[..., 3] = 1.0
+    return StreamingGaussianState(
+        gaussians=Gaussians(
+            means=means,
+            harmonics=torch.zeros(1, 2, 1, 3),
+            opacities=torch.full((1, 2), 0.5),
+            scales=torch.full((1, 2, 3), 0.02),
+            rotations=rotations,
+        ),
+        stable_ids=torch.tensor([[0, 1]]),
+        observation_count=torch.ones(1, 2),
+        point_map=means.clone(),
+    )
+
+
+def _make_symmetric_gradients():
+    opacity = torch.tensor([[[1.0, 0.5], [-1.0, 0.5], [1.0, 0.5]]])
+    mean = torch.zeros(1, 3, 2, 3)
+    mean[0, :, 0, 0] = torch.tensor([1.0, -1.0, 1.0])
+    mean[0, :, 1, 1] = 0.5
+    harmonics = torch.zeros(1, 3, 2, 1, 3)
+    harmonics[0, :, 0, 0, 0] = torch.tensor([1.0, -1.0, 1.0])
+    harmonics[0, :, 1, 0, 1] = 0.5
+    return opacity, mean, harmonics
+
+
+def test_symmetric_multiview_evidence_is_view_permutation_invariant() -> None:
+    gradients = _make_symmetric_gradients()
+    evidence = build_symmetric_multiview_gradient_evidence(
+        *gradients,
+        active_mask=torch.ones(1, 2, dtype=torch.bool),
+        opacity_gradient_scale=1.0,
+        mean_gradient_scale=1.0,
+        harmonics_gradient_scale=1.0,
+        opacity_gradient_threshold=0.0,
+        mean_gradient_threshold=0.0,
+        harmonics_gradient_threshold=0.0,
+    )
+    order = torch.tensor([2, 0, 1])
+    permuted = build_symmetric_multiview_gradient_evidence(
+        *(value[:, order] for value in gradients),
+        active_mask=torch.ones(1, 2, dtype=torch.bool),
+        opacity_gradient_scale=1.0,
+        mean_gradient_scale=1.0,
+        harmonics_gradient_scale=1.0,
+        opacity_gradient_threshold=0.0,
+        mean_gradient_threshold=0.0,
+        harmonics_gradient_threshold=0.0,
+    )
+    assert torch.allclose(evidence.features, permuted.features)
+    assert torch.allclose(evidence.mean_signal, permuted.mean_signal)
+    assert evidence.mean_conflict_ratio[0, 0] > 0
+    assert evidence.mean_coherence[0, 0] < 1
+
+
+def test_symmetric_visual_evidence_is_view_permutation_invariant_and_trainable() -> None:
+    torch.manual_seed(7)
+    state = _make_symmetric_state()
+    head = SymmetricGSResidualHead(
+        harmonic_dim=3,
+        hidden_dim=16,
+        visual_enabled=True,
+        visual_feature_dim=8,
+        visual_hidden_dim=8,
+    )
+    batch, views, height, width = 1, 2, 8, 8
+    target = torch.rand(batch, views, 3, height, width)
+    rendered = target * 0.75
+    alpha = torch.full((batch, views, 1, height, width), 0.8)
+    # The decoder supplies accumulated depth in RGB+D mode.
+    depth = torch.full((batch, views, 1, height, width), 2.0) * alpha
+    cameras = torch.eye(4).reshape(1, 1, 4, 4).repeat(1, views, 1, 1)
+    intrinsics = torch.tensor(
+        [[[[0.8, 0.0, 0.5], [0.0, 0.8, 0.5], [0.0, 0.0, 1.0]]]]
+    ).repeat(1, views, 1, 1)
+
+    def build(order: torch.Tensor):
+        return build_symmetric_multiview_visual_evidence(
+            state.gaussians,
+            target[:, order],
+            rendered[:, order],
+            depth[:, order],
+            alpha[:, order],
+            cameras[:, order],
+            intrinsics[:, order],
+            head.visual_encoder,
+            active_mask=torch.ones(1, 2, dtype=torch.bool),
+            chunk_size=1,
+        )
+
+    visual = build(torch.tensor([0, 1]))
+    permuted = build(torch.tensor([1, 0]))
+    for value, permuted_value in zip(visual, permuted):
+        assert torch.allclose(value, permuted_value, atol=1e-5, rtol=1e-5)
+    assert visual[0].shape == (1, 2, 11)
+    assert torch.equal(visual[1], torch.full((1, 2), 2.0))
+    visual[0].sum().backward()
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in head.visual_encoder.parameters()
+    )
+
+
+def test_visual_evidence_activates_visible_gaussians() -> None:
+    state = _make_symmetric_state()
+    gradients = _make_symmetric_gradients()
+    evidence = build_symmetric_multiview_gradient_evidence(
+        *gradients,
+        active_mask=torch.zeros(1, 2, dtype=torch.bool),
+    )
+    visual_features = torch.ones(1, 2, 7)
+    attached = attach_symmetric_multiview_visual_evidence(
+        evidence,
+        visual_features,
+        torch.tensor([[1.0, 0.0]]),
+        torch.tensor([[0.5, 0.0]]),
+    )
+    assert torch.equal(attached.active_mask, torch.tensor([[True, False]]))
+    assert torch.equal(attached.visible_view_count, torch.tensor([[1.0, 0.0]]))
+
+
+def test_visual_evidence_skips_inactive_gaussians_without_losing_gradients() -> None:
+    torch.manual_seed(11)
+    state = _make_symmetric_state()
+    head = SymmetricGSResidualHead(
+        harmonic_dim=3,
+        hidden_dim=16,
+        visual_enabled=True,
+        visual_feature_dim=4,
+        visual_hidden_dim=8,
+    )
+    target = torch.rand(1, 1, 3, 8, 8)
+    rendered = torch.rand_like(target)
+    depth = torch.ones(1, 1, 1, 8, 8)
+    alpha = torch.ones_like(depth)
+    cameras = torch.eye(4).reshape(1, 1, 4, 4)
+    intrinsics = torch.tensor(
+        [[[[0.8, 0.0, 0.5], [0.0, 0.8, 0.5], [0.0, 0.0, 1.0]]]]
+    )
+    features, view_count, weight_sum = build_symmetric_multiview_visual_evidence(
+        state.gaussians,
+        target,
+        rendered,
+        depth,
+        alpha,
+        cameras,
+        intrinsics,
+        head.visual_encoder,
+        active_mask=torch.tensor([[True, False]]),
+        chunk_size=1,
+        image_scale=1.0,
+    )
+
+    assert torch.count_nonzero(features[:, 1]) == 0
+    assert view_count[0, 1] == 0
+    assert weight_sum[0, 1] == 0
+    features[:, 0].sum().backward()
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in head.visual_encoder.parameters()
+    )
+
+
+def test_zero_initialized_symmetric_head_preserves_map_and_stays_trainable() -> None:
+    state = _make_symmetric_state()
+    gradients = _make_symmetric_gradients()
+    evidence = build_symmetric_multiview_gradient_evidence(
+        *gradients,
+        active_mask=torch.ones(1, 2, dtype=torch.bool),
+        opacity_gradient_scale=1.0,
+        mean_gradient_scale=1.0,
+        harmonics_gradient_scale=1.0,
+        opacity_gradient_threshold=0.0,
+        mean_gradient_threshold=0.0,
+        harmonics_gradient_threshold=0.0,
+    )
+    head = SymmetricGSResidualHead(harmonic_dim=3, hidden_dim=16, chunk_size=1)
+    prediction = head(
+        state.gaussians,
+        state.observation_count,
+        state.split_generation,
+        evidence,
+        torch.tensor([[False, True]]),
+    )
+    updated, stats = apply_symmetric_multiview_residual(
+        state,
+        evidence,
+        prediction,
+        torch.eye(4).unsqueeze(0),
+    )
+    assert torch.equal(updated.gaussians.means, state.gaussians.means)
+    assert torch.equal(updated.gaussians.scales, state.gaussians.scales)
+    assert torch.equal(updated.gaussians.rotations, state.gaussians.rotations)
+    assert torch.equal(updated.gaussians.opacities, state.gaussians.opacities)
+    assert torch.equal(updated.gaussians.harmonics, state.gaussians.harmonics)
+    assert torch.equal(
+        updated.observation_count,
+        evidence.visible_view_count.to(updated.observation_count.dtype),
+    )
+    assert stats["active_count"].item() == 2
+    loss = (
+        updated.gaussians.means.sum()
+        + updated.gaussians.rotations.sum()
+        + updated.gaussians.scales.sum()
+        + updated.gaussians.opacities.sum()
+        + updated.gaussians.harmonics.sum()
+    )
+    loss.backward()
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in head.parameters()
+    )
+
+
+def test_empty_symmetric_candidates_keep_all_decoders_in_final_map_graph() -> None:
+    state = _make_symmetric_state()
+    evidence = build_symmetric_multiview_gradient_evidence(
+        *_make_symmetric_gradients(),
+        active_mask=torch.zeros(1, 2, dtype=torch.bool),
+        opacity_gradient_scale=1.0,
+        mean_gradient_scale=1.0,
+        harmonics_gradient_scale=1.0,
+    )
+    head = SymmetricGSResidualHead(harmonic_dim=3, hidden_dim=16, chunk_size=1)
+    prediction = head(
+        state.gaussians,
+        state.observation_count,
+        state.split_generation,
+        evidence,
+        torch.zeros_like(state.stable_ids, dtype=torch.bool),
+    )
+    updated, stats = apply_symmetric_multiview_residual(
+        state,
+        evidence,
+        prediction,
+        torch.eye(4).unsqueeze(0),
+    )
+
+    assert stats["active_count"].item() == 0
+    final_map_loss = sum(
+        value.sum()
+        for value in (
+            updated.gaussians.means,
+            updated.gaussians.harmonics,
+            updated.gaussians.opacities,
+            updated.gaussians.scales,
+            updated.gaussians.rotations,
+        )
+    )
+    final_map_loss.backward()
+    assert all(
+        parameter.grad is not None
+        and torch.isfinite(parameter.grad).all()
+        and torch.count_nonzero(parameter.grad) == 0
+        for parameter in head.parameters()
+    )
+
+
+def test_unbounded_symmetric_update_uses_raw_mlp_residuals() -> None:
+    state = _make_symmetric_state()
+    evidence = build_symmetric_multiview_gradient_evidence(
+        *_make_symmetric_gradients(),
+        active_mask=torch.ones(1, 2, dtype=torch.bool),
+        opacity_gradient_scale=1.0,
+        mean_gradient_scale=1.0,
+        harmonics_gradient_scale=1.0,
+        opacity_gradient_threshold=0.0,
+        mean_gradient_threshold=0.0,
+        harmonics_gradient_threshold=0.0,
+    )
+    prediction = SymmetricGSResidualPrediction(
+        delta_mean_reference=torch.tensor([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]]),
+        delta_rotation=torch.zeros(2, 3),
+        delta_log_scale=torch.zeros(2, 3),
+        delta_opacity_logit=torch.zeros(2),
+        delta_harmonics=torch.zeros(2, 3),
+        update_gate_logits=torch.full((2, 5), -100.0),
+    )
+
+    updated, stats = apply_symmetric_multiview_residual(
+        state,
+        evidence,
+        prediction,
+        torch.eye(4).unsqueeze(0),
+        unbounded_updates=True,
+    )
+
+    expected_means = state.gaussians.means + torch.tensor(
+        [[[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]]]
+    )
+    torch.testing.assert_close(updated.gaussians.means, expected_means)
+    assert stats["gate_mean"].item() == 1.0
+
+
+def _coherent_symmetric_evidence(count: int):
+    opacity = torch.ones(1, 3, count)
+    mean = torch.zeros(1, 3, count, 3)
+    mean[..., 0] = 1.0
+    harmonics = torch.ones(1, 3, count, 1, 3)
+    return build_symmetric_multiview_gradient_evidence(
+        opacity,
+        mean,
+        harmonics,
+        active_mask=torch.ones(1, count, dtype=torch.bool),
+        opacity_gradient_scale=1.0,
+        mean_gradient_scale=1.0,
+        harmonics_gradient_scale=1.0,
+        opacity_gradient_threshold=0.0,
+        mean_gradient_threshold=0.0,
+        harmonics_gradient_threshold=0.0,
+    )
+
+
+def _expand_anchor_children_once(state: StreamingGaussianState):
+    return state.expand_anchor_children(
+        _coherent_symmetric_evidence(state.num_gaussians),
+        max_child_count=3,
+        add_child_count=1,
+        min_observations=2,
+        gradient_threshold=0.0,
+        coherence_threshold=0.5,
+        max_conflict_ratio=0.25,
+        cooldown_views=1,
+        max_ratio=1.0,
+        offset_scale=0.4,
+        scale_divisor=1.6,
+        min_opacity=0.0,
+        max_gaussians=0,
+    )
+
+
+def test_anchor_children_expand_progressively_without_recursion() -> None:
+    state = _make_symmetric_state()
+    state.observation_count.fill_(3.0)
+    initial_opacity = state.gaussians.opacities.clone()
+
+    first, first_stats = _expand_anchor_children_once(state)
+    assert first.num_gaussians == 4
+    assert torch.equal(first.split_generation[:, :2], torch.ones(1, 2, dtype=torch.uint8))
+    assert torch.equal(
+        first.split_generation[:, 2:],
+        torch.full((1, 2), 255, dtype=torch.uint8),
+    )
+    assert first_stats["expanded_anchor_count"] == 2
+    assert first_stats["spawned_child_count"] == 2
+    combined_transmittance = (
+        1.0 - first.gaussians.opacities[:, :2]
+    ) * (1.0 - first.gaussians.opacities[:, 2:])
+    assert torch.allclose(
+        combined_transmittance,
+        1.0 - initial_opacity,
+        atol=1e-6,
+    )
+
+    second, second_stats = _expand_anchor_children_once(first)
+    assert second.num_gaussians == 6
+    assert torch.equal(
+        second.split_generation[:, :2],
+        torch.full((1, 2), 2, dtype=torch.uint8),
+    )
+    assert torch.equal(
+        second.split_generation[:, 2:],
+        torch.full((1, 4), 255, dtype=torch.uint8),
+    )
+    assert second_stats["spawned_child_count"] == 2
+
+    third, third_stats = _expand_anchor_children_once(second)
+    assert third.num_gaussians == second.num_gaussians
+    assert third_stats["spawned_child_count"] == 0
 
 
 def _make_state() -> StreamingGaussianState:
@@ -48,6 +432,113 @@ def _make_state() -> StreamingGaussianState:
         ),
         point_map=means.detach().clone(),
     )
+
+
+def test_point_map_can_follow_residual_updated_means() -> None:
+    state = _make_state()
+    updated_means = (state.gaussians.means + 0.25).requires_grad_()
+    updated_state = StreamingGaussianState(
+        gaussians=Gaussians(
+            means=updated_means,
+            harmonics=state.gaussians.harmonics,
+            opacities=state.gaussians.opacities,
+            scales=state.gaussians.scales,
+            rotations=state.gaussians.rotations,
+        ),
+        stable_ids=state.stable_ids,
+        observation_count=state.observation_count,
+        point_map=state.point_map,
+        front_conflict_count=state.front_conflict_count,
+        split_generation=state.split_generation,
+    )
+
+    synced = updated_state.sync_point_map_to_means()
+
+    assert torch.equal(synced.point_map, updated_means.detach())
+    assert not synced.point_map.requires_grad
+    assert synced.gaussians.means is updated_means
+    assert synced.gaussians.means.requires_grad
+
+
+def test_functional_gradient_step_updates_only_top_surface_consistent_gs() -> None:
+    state = _make_state()
+    means = state.gaussians.means.clone().requires_grad_()
+    harmonics = state.gaussians.harmonics.clone().requires_grad_()
+    opacities = state.gaussians.opacities.clone().requires_grad_()
+    state = StreamingGaussianState(
+        gaussians=Gaussians(
+            means=means,
+            harmonics=harmonics,
+            opacities=opacities,
+            scales=state.gaussians.scales,
+            rotations=state.gaussians.rotations,
+        ),
+        stable_ids=state.stable_ids,
+        observation_count=torch.ones_like(state.observation_count),
+        point_map=state.point_map,
+    )
+    batch, count = opacities.shape
+    evidence = ProjectedGSEvidence(
+        descriptor=torch.empty(batch * count, 30),
+        flat_candidate_indices=torch.arange(batch * count),
+        candidate_mask=torch.ones(batch, count, dtype=torch.bool),
+        surface_consistent=torch.ones(batch, count, dtype=torch.bool),
+        old_in_front=torch.zeros(batch, count, dtype=torch.bool),
+        projected_radius=torch.ones(batch, count),
+        relative_depth=torch.zeros(batch, count),
+        camera_depth=torch.ones(batch, count),
+    )
+    score = torch.tensor([1.0, 2.0, 3.0]).expand(batch, -1)
+    harmonic_signal = score[..., None, None].expand_as(harmonics)
+    mean_signal = torch.ones(batch, count, 3)
+    opacity_signal = torch.ones(batch, count)
+    updated, stats = state.functional_gradient_step(
+        evidence,
+        torch.eye(4).expand(batch, -1, -1),
+        opacity_gradient_evidence=OpacityGradientEvidence(
+            features=torch.zeros(batch, count, 8),
+            signal=opacity_signal,
+            current_signal=opacity_signal,
+            replay_signal=torch.zeros_like(opacity_signal),
+        ),
+        mean_gradient_evidence=MeanGradientEvidence(
+            features=torch.zeros(batch, count, 10),
+            signal=mean_signal,
+            current_signal=mean_signal,
+            replay_signal=torch.zeros_like(mean_signal),
+        ),
+        harmonics_gradient_evidence=HarmonicsGradientEvidence(
+            signal=harmonic_signal,
+            current_signal=harmonic_signal,
+            replay_signal=torch.zeros_like(harmonic_signal),
+        ),
+        top_ratio=0.5,
+        min_observations=1,
+        mean_learning_rate=1e-3,
+        opacity_learning_rate=1e-2,
+        harmonics_learning_rate=1e-2,
+        max_mean_step_scale=0.25,
+        max_opacity_logit_step=0.1,
+        max_harmonics_step=0.05,
+    )
+
+    assert stats["selected_count"].item() == 4
+    assert torch.equal(updated.gaussians.means[:, 0], means[:, 0])
+    assert torch.equal(updated.gaussians.opacities[:, 0], opacities[:, 0])
+    assert torch.equal(updated.gaussians.harmonics[:, 0], harmonics[:, 0])
+    assert torch.all(updated.gaussians.means[:, 1:] < means[:, 1:])
+    assert torch.all(updated.gaussians.opacities[:, 1:] < opacities[:, 1:])
+    assert torch.all(updated.gaussians.harmonics[:, 1:] < harmonics[:, 1:])
+
+    loss = (
+        updated.gaussians.means.sum()
+        + updated.gaussians.opacities.sum()
+        + updated.gaussians.harmonics.sum()
+    )
+    loss.backward()
+    assert means.grad is not None and torch.isfinite(means.grad).all()
+    assert opacities.grad is not None and torch.isfinite(opacities.grad).all()
+    assert harmonics.grad is not None and torch.isfinite(harmonics.grad).all()
 
 
 def test_projected_shared_update_is_batch_safe() -> None:
@@ -179,6 +670,97 @@ def test_projected_shared_head_stays_in_graph_without_candidates() -> None:
             *head.output.parameters(),
         ]
     )
+
+
+def test_projected_split_is_budgeted_batch_safe_and_differentiable() -> None:
+    state = _make_state()
+    state = replace(
+        state,
+        gaussians=Gaussians(
+            means=state.gaussians.means.clone().requires_grad_(),
+            harmonics=state.gaussians.harmonics.clone().requires_grad_(),
+            opacities=state.gaussians.opacities.clone().requires_grad_(),
+            scales=state.gaussians.scales.clone().requires_grad_(),
+            rotations=state.gaussians.rotations.clone().requires_grad_(),
+        ),
+        observation_count=torch.full_like(state.observation_count, 4),
+    )
+    evidence = ProjectedGSEvidence(
+        descriptor=torch.zeros(6, 34),
+        flat_candidate_indices=torch.arange(6),
+        candidate_mask=torch.tensor(
+            [[True, True, False], [True, False, False]]
+        ),
+        surface_consistent=torch.tensor(
+            [[True, True, False], [True, False, False]]
+        ),
+        old_in_front=torch.zeros(2, 3, dtype=torch.bool),
+        projected_radius=torch.tensor(
+            [[6.0, 8.0, 1.0], [7.0, 1.0, 1.0]]
+        ),
+        relative_depth=torch.zeros(2, 3),
+        camera_depth=torch.ones(2, 3),
+        mean_gradient_signal=torch.tensor(
+            [
+                [2.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ]
+        ),
+    )
+
+    split, stats = state.split_projected_historical(
+        evidence,
+        projected_radius_threshold=4.0,
+        mean_gradient_threshold=1e-6,
+        min_observations=2,
+        max_ratio=1.0,
+        max_generation=1,
+        offset_scale=0.4,
+        scale_divisor=1.6,
+        min_opacity=0.02,
+    )
+
+    assert split.num_gaussians == 5
+    assert torch.equal(
+        (split.stable_ids >= 0).sum(dim=1), torch.tensor([5, 4])
+    )
+    assert stats["eligible_count"] == 3
+    assert stats["split_count"] == 3
+    assert torch.all(split.split_generation[0, [0, 1, 3, 4]] == 1)
+    assert torch.all(split.split_generation[1, [0, 3]] == 1)
+    assert split.stable_ids[1, 4] == -1
+    assert split.gaussians.opacities[1, 4] == 0
+    assert torch.allclose(
+        split.gaussians.scales[0, 0],
+        state.gaussians.scales[0, 0] / 1.6,
+    )
+    child_opacity = split.gaussians.opacities[0, 0]
+    combined_opacity = 1.0 - (1.0 - child_opacity).square()
+    assert torch.allclose(combined_opacity, state.gaussians.opacities[0, 0])
+    assert split.gaussians.means[0, 0, 0] < state.gaussians.means[0, 0, 0]
+    assert split.gaussians.means[0, 3, 0] > state.gaussians.means[0, 0, 0]
+
+    loss = (
+        split.gaussians.means.square().sum()
+        + split.gaussians.scales.sum()
+        + split.gaussians.opacities.sum()
+        + split.gaussians.harmonics.sum()
+        + split.gaussians.rotations.sum()
+    )
+    loss.backward()
+    for value in (
+        state.gaussians.means,
+        state.gaussians.scales,
+        state.gaussians.opacities,
+        state.gaussians.harmonics,
+        state.gaussians.rotations,
+    ):
+        assert value.grad is not None
+        assert torch.isfinite(value.grad).all()
 
 
 def test_projected_shared_update_policy_and_bounds() -> None:
@@ -557,6 +1139,43 @@ def test_hybrid_append_aligns_depth_scale_per_batch() -> None:
     assert torch.allclose(scales, torch.tensor([0.5, 2.0]))
     assert coverage[0].any() and coverage[1].any()
     assert not conflicts.any()
+
+
+def test_gaussian_depth_scale_alignment_uses_each_camera_center() -> None:
+    state = _make_state()
+    means = state.gaussians.means.clone().requires_grad_()
+    scales = state.gaussians.scales.clone().requires_grad_()
+    gaussians = replace(state.gaussians, means=means, scales=scales)
+    point_map = means.detach().clone()
+    camera_to_world = torch.eye(4).expand(2, -1, -1).clone()
+    camera_to_world[0, :3, 3] = torch.tensor([1.0, 2.0, 3.0])
+    camera_to_world[1, :3, 3] = torch.tensor([-1.0, 0.5, -2.0])
+    depth_scale = torch.tensor([0.5, 2.0])
+
+    aligned, aligned_point_map = align_gaussians_to_camera_depth_scale(
+        gaussians,
+        camera_to_world,
+        depth_scale,
+        point_map,
+    )
+
+    camera_center = camera_to_world[:, None, :3, 3]
+    expected_means = camera_center + (
+        means - camera_center
+    ) * depth_scale[:, None, None]
+    assert torch.allclose(aligned.means, expected_means)
+    assert torch.allclose(aligned_point_map, expected_means.detach())
+    assert torch.allclose(
+        aligned.scales,
+        scales * depth_scale[:, None, None],
+    )
+    assert aligned.harmonics is gaussians.harmonics
+    assert aligned.opacities is gaussians.opacities
+    assert aligned.rotations is gaussians.rotations
+
+    (aligned.means.sum() + aligned.scales.sum()).backward()
+    assert means.grad is not None and torch.isfinite(means.grad).all()
+    assert scales.grad is not None and torch.isfinite(scales.grad).all()
 
 
 def test_point_map_append_is_safe_under_mixed_precision() -> None:

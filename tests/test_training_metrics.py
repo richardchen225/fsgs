@@ -46,6 +46,9 @@ def experiment(**overrides):
         gir_new_opacity_gradient_enabled=True,
         gir_opacity_gradient_front_decay_gate_enabled=True,
         gir_mean_gradient_enabled=False,
+        gir_split_enabled=False,
+        gir_functional_update_enabled=False,
+        gir_symmetric_multiview_update_enabled=False,
         gir_new_mean_gradient_enabled=False,
         gir_add_gate_enabled=False,
         gir_old_delete_enabled=False,
@@ -106,6 +109,74 @@ class TrainingMetricTests(unittest.TestCase):
         self.assertIn("gir_add_gate_learned", names)
         self.assertNotIn("gir_top1_confidence_mean", names)
         self.assertFalse(any(name.startswith(("gir_projected_", "gir_new_residual_", "gir_point_")) for name in names))
+
+    def test_tracker_path_keeps_only_tracker_coverage_diagnostics(self):
+        names = SELECT(experiment(gir_append_mode="tracker"))
+        self.assertIn("gir_point_coverage_ratio", names)
+        self.assertIn("gir_point_append_ratio", names)
+        self.assertIn("gir_tracker_visibility_ratio", names)
+        self.assertIn("gir_tracker_fb_consistency_ratio", names)
+        self.assertIn("gir_tracker_cycle_error_mean", names)
+        self.assertNotIn("gir_point_depth_scale", names)
+        self.assertNotIn("gir_point_front_conflict_ratio", names)
+
+    def test_tracker_point_map_path_keeps_both_coverage_diagnostics(self):
+        names = SELECT(experiment(gir_append_mode="tracker_point_map"))
+        for name in (
+            "gir_point_coverage_ratio",
+            "gir_point_append_ratio",
+            "gir_point_front_conflict_ratio",
+            "gir_point_depth_scale",
+            "gir_tracker_coverage_ratio",
+            "gir_tracker_visibility_ratio",
+            "gir_tracker_fb_consistency_ratio",
+            "gir_tracker_cycle_error_mean",
+            "gir_tracker_point_union_coverage_ratio",
+            "gir_confirmed_current_in_front_ratio",
+        ):
+            self.assertIn(name, names)
+
+    def test_split_path_keeps_only_actionable_diagnostics(self):
+        names = SELECT(experiment(
+            gir_mean_gradient_enabled=True,
+            gir_split_enabled=True,
+        ))
+        self.assertIn("gir_split_count", names)
+        self.assertIn("gir_split_ratio", names)
+        self.assertIn("gir_split_selected_radius", names)
+        self.assertIn("gir_split_selected_gradient_norm", names)
+        self.assertIn("gir_split_map_count_after", names)
+        self.assertNotIn("gir_split_eligible_count", names)
+        self.assertNotIn("gir_split_selected_score", names)
+
+    def test_functional_update_keeps_only_actionable_diagnostics(self):
+        names = SELECT(experiment(gir_functional_update_enabled=True))
+        self.assertIn("gir_functional_update_selected_count", names)
+        self.assertIn("gir_functional_update_selected_ratio", names)
+        self.assertIn("gir_functional_update_mean_step_norm", names)
+        self.assertIn("gir_functional_update_opacity_logit_step_abs", names)
+        self.assertIn("gir_functional_update_harmonics_step_norm", names)
+        self.assertNotIn("gir_functional_update_score_mean", names)
+        self.assertNotIn("gir_functional_update_mean_gradient_norm", names)
+
+    def test_symmetric_update_keeps_view_balance_and_update_diagnostics(self):
+        names = SELECT(experiment(
+            gir_old_residual_enabled=False,
+            gir_new_residual_enabled=False,
+            gir_symmetric_multiview_update_enabled=True,
+        ))
+        for name in (
+            "gir_symmetric_multiview_active_ratio",
+            "gir_symmetric_multiview_visible_views_mean",
+            "gir_symmetric_multiview_mean_coherence",
+            "gir_symmetric_multiview_mean_conflict_ratio",
+            "gir_symmetric_multiview_mean_shift_mean",
+            "gir_symmetric_multiview_opacity_shift_mean",
+            "gir_symmetric_multiview_harmonics_shift_mean",
+        ):
+            self.assertIn(name, names)
+        self.assertNotIn("gir_symmetric_multiview_active_count", names)
+        self.assertNotIn("gir_symmetric_multiview_regularization", names)
 
     def test_disabled_gir_has_no_gir_metrics(self):
         self.assertEqual(SELECT(experiment(gir_enabled=False)), ())

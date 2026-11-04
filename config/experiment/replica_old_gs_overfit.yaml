@@ -5,6 +5,7 @@ defaults:
   - override /model/encoder: anysplat
   - override /model/encoder/backbone: croco
   - override /loss: [mse]
+  - _self_
 
 mode: train
 
@@ -22,7 +23,7 @@ model:
     gir_raster_evidence_enabled: true
     gir_dominant_id_enabled: true
     gir_dominant_min_weight: 1.0e-4
-    gir_old_residual_enabled: true
+    gir_old_residual_enabled: false
     gir_old_update_mode: projected_shared
     gir_projected_hidden_dim: 128
     gir_projected_chunk_size: 65536
@@ -34,7 +35,7 @@ model:
     gir_projected_warmup_steps: 1000
     # Keep opacity-gradient conditioning and decay gating for historical GS,
     # while ablating the same input for newly appended GS.
-    gir_old_opacity_gradient_enabled: true
+    gir_old_opacity_gradient_enabled: false
     gir_new_opacity_gradient_enabled: false
     gir_opacity_gradient_replay_views: 6
     gir_opacity_gradient_scale: 1000.0
@@ -43,9 +44,9 @@ model:
     # Match loss_updated_current=1.0 and loss_replay_history=0.5 below.
     gir_opacity_gradient_current_weight: 1.0
     gir_opacity_gradient_replay_weight: 0.5
-    gir_opacity_gradient_front_decay_gate_enabled: true
+    gir_opacity_gradient_front_decay_gate_enabled: false
     gir_opacity_gradient_front_decay_threshold: 0.0
-    gir_mean_gradient_enabled: true
+    gir_mean_gradient_enabled: false
     gir_mean_gradient_scale: 1.0
     gir_mean_gradient_clip: 20.0
     gir_mean_gradient_threshold: 1.0e-6
@@ -53,7 +54,73 @@ model:
     gir_mean_gradient_replay_views: -1
     gir_old_mean_gradient_current_weight: 1.0
     gir_old_mean_gradient_replay_weight: 0.5
-    gir_new_mean_gradient_enabled: true
+    gir_split_enabled: false
+    gir_split_projected_radius_threshold: 4.0
+    gir_split_mean_gradient_threshold: 1.0e-6
+    gir_split_min_observations: 2
+    gir_split_max_ratio: 0.005
+    gir_split_max_generation: 1
+    gir_split_offset_scale: 0.4
+    gir_split_scale_divisor: 1.6
+    gir_split_min_opacity: 0.02
+    gir_split_max_gaussians: 0
+    gir_split_warmup_steps: 1000
+    gir_functional_update_enabled: false
+    gir_functional_update_replay_views: 2
+    gir_functional_update_top_ratio: 0.05
+    gir_functional_update_min_observations: 1
+    gir_functional_update_mean_enabled: true
+    gir_functional_update_opacity_enabled: true
+    gir_functional_update_harmonics_enabled: true
+    gir_functional_update_mean_learning_rate: 1.0e-3
+    gir_functional_update_opacity_learning_rate: 5.0e-3
+    gir_functional_update_harmonics_learning_rate: 1.0e-3
+    gir_functional_update_harmonics_gradient_scale: 1.0
+    gir_functional_update_harmonics_gradient_clip: 20.0
+    gir_functional_update_harmonics_gradient_threshold: 1.0e-6
+    gir_functional_update_current_weight: 1.0
+    gir_functional_update_replay_weight: 0.5
+    gir_functional_update_max_mean_step_scale: 0.25
+    gir_functional_update_max_opacity_logit_step: 0.10
+    gir_functional_update_max_harmonics_step: 0.05
+    gir_symmetric_multiview_update_enabled: true
+    gir_symmetric_multiview_hidden_dim: 128
+    gir_symmetric_multiview_chunk_size: 65536
+    gir_symmetric_multiview_visual_enabled: true
+    gir_symmetric_multiview_visual_feature_dim: 24
+    gir_symmetric_multiview_visual_hidden_dim: 32
+    gir_symmetric_multiview_visual_image_scale: 0.5
+    gir_symmetric_multiview_visual_depth_temperature: 0.10
+    gir_symmetric_multiview_visual_min_alpha: 0.01
+    gir_symmetric_multiview_opacity_gradient_scale: 1000.0
+    gir_symmetric_multiview_opacity_gradient_clip: 20.0
+    gir_symmetric_multiview_opacity_gradient_threshold: 1.0e-3
+    gir_symmetric_multiview_mean_gradient_scale: 1.0
+    gir_symmetric_multiview_mean_gradient_clip: 20.0
+    gir_symmetric_multiview_mean_gradient_threshold: 1.0e-6
+    gir_symmetric_multiview_harmonics_gradient_scale: 1.0
+    gir_symmetric_multiview_harmonics_gradient_clip: 20.0
+    gir_symmetric_multiview_harmonics_gradient_threshold: 1.0e-6
+    gir_symmetric_multiview_max_mean_step_scale: 0.10
+    gir_symmetric_multiview_max_rotation_step: 0.01
+    gir_symmetric_multiview_max_log_scale_step: 0.02
+    gir_symmetric_multiview_max_opacity_logit_step: 0.10
+    gir_symmetric_multiview_max_harmonics_step: 0.05
+    # Point-map anchors progressively add persistent, non-recursive children.
+    gir_anchor_child_enabled: true
+    gir_anchor_child_max_count: 8
+    gir_anchor_child_add_count: 1
+    gir_anchor_child_min_observations: 2
+    gir_anchor_child_gradient_threshold: 0.05
+    gir_anchor_child_coherence_threshold: 0.5
+    gir_anchor_child_max_conflict_ratio: 0.25
+    gir_anchor_child_cooldown_views: 2
+    gir_anchor_child_max_ratio: 0.05
+    gir_anchor_child_offset_scale: 0.4
+    gir_anchor_child_scale_divisor: 1.6
+    gir_anchor_child_min_opacity: 0.02
+    gir_anchor_child_max_gaussians: 500000
+    gir_new_mean_gradient_enabled: false
     # New anchors are introduced by the current observation. Condition only
     # their mean residual on the current-view RGB gradient.
     gir_new_mean_gradient_replay_views: 0
@@ -65,7 +132,27 @@ model:
     gir_old_decay_strength: 0.02
     gir_old_decay_prune_threshold: 0.005
     gir_add_gate_enabled: false
-    gir_new_residual_enabled: true
+    gir_new_residual_enabled: false
+    gir_new_gs_shared_decoder_enabled: false
+    gir_point_append_align_depth_scale_enabled: false
+    gir_point_map_follow_mean_updates_enabled: true
+    gir_append_mode: point_map
+    gir_tracker_backend: alltracker
+    gir_tracker_repo_path: third_party/AllTracker
+    gir_tracker_weights_path: third_party/AllTracker/ckpts/alltracker.pth
+    # Match the official AllTracker demo inference path (FP32).
+    gir_tracker_mixed_precision: false
+    gir_tracker_iterations: 4
+    gir_tracker_window_length: 16
+    # Coverage is intentionally more permissive than AllTracker's official
+    # tracking evaluation threshold (0.6): uncertain correspondences should
+    # suppress duplicate GS unless they also fail the relaxed FB cycle check.
+    gir_tracker_visibility_threshold: 0.3
+    gir_tracker_coverage_threshold: 0.05
+    gir_tracker_dilation_radius: 2
+    gir_tracker_forward_backward_enabled: true
+    gir_tracker_cycle_absolute_threshold: 3.0
+    gir_tracker_cycle_relative_threshold: 0.10
 
 toy:
   # replica: RGB+EXR depth toy scene; dl3dv: RGB-only transforms.json scene.
@@ -73,8 +160,9 @@ toy:
   data_root: ${oc.env:REPLICA_TOY_ROOT,.}
   transforms_path: null
   image_dir: images_8
-  # DL3DV resize shape [height, width]. Both dimensions must be divisible by 14.
-  resize_shape: [252, 518]
+  # DL3DV output shape after aspect-preserving resize and center crop.
+  # Both dimensions must be divisible by the backbone patch size 14.
+  resize_shape: [224, 224]
   # WorldMirror initializes GS heads only; native backbone/camera/depth stay intact.
   # An overfit checkpoint restores its trained heads and optimizer instead.
   checkpoint: weights/pre_wm.safetensors
@@ -91,9 +179,10 @@ toy:
   save_every: 500
   save_checkpoints: false
   mixed_precision: true
-  residual_enabled: true
+  residual_enabled: ${model.encoder.gir_old_residual_enabled}
   # Refine append-selected anchors with the same parameterization as old GS.
   new_residual_enabled: ${model.encoder.gir_new_residual_enabled}
+  new_gs_shared_decoder_enabled: ${model.encoder.gir_new_gs_shared_decoder_enabled}
   # Keep head construction and the overfit rollout on the same implementation.
   residual_mode: ${model.encoder.gir_old_update_mode}  # pixel_topk | projected_shared
   projected_hidden_dim: 128
@@ -120,6 +209,69 @@ toy:
   mean_gradient_replay_views: ${model.encoder.gir_mean_gradient_replay_views}
   old_mean_gradient_current_weight: ${model.encoder.gir_old_mean_gradient_current_weight}
   old_mean_gradient_replay_weight: ${model.encoder.gir_old_mean_gradient_replay_weight}
+  split_enabled: ${model.encoder.gir_split_enabled}
+  split_projected_radius_threshold: ${model.encoder.gir_split_projected_radius_threshold}
+  split_mean_gradient_threshold: ${model.encoder.gir_split_mean_gradient_threshold}
+  split_min_observations: ${model.encoder.gir_split_min_observations}
+  split_max_ratio: ${model.encoder.gir_split_max_ratio}
+  split_max_generation: ${model.encoder.gir_split_max_generation}
+  split_offset_scale: ${model.encoder.gir_split_offset_scale}
+  split_scale_divisor: ${model.encoder.gir_split_scale_divisor}
+  split_min_opacity: ${model.encoder.gir_split_min_opacity}
+  split_max_gaussians: ${model.encoder.gir_split_max_gaussians}
+  split_warmup_steps: ${model.encoder.gir_split_warmup_steps}
+  functional_update_enabled: ${model.encoder.gir_functional_update_enabled}
+  functional_update_replay_views: ${model.encoder.gir_functional_update_replay_views}
+  functional_update_top_ratio: ${model.encoder.gir_functional_update_top_ratio}
+  functional_update_min_observations: ${model.encoder.gir_functional_update_min_observations}
+  functional_update_mean_enabled: ${model.encoder.gir_functional_update_mean_enabled}
+  functional_update_opacity_enabled: ${model.encoder.gir_functional_update_opacity_enabled}
+  functional_update_harmonics_enabled: ${model.encoder.gir_functional_update_harmonics_enabled}
+  functional_update_mean_learning_rate: ${model.encoder.gir_functional_update_mean_learning_rate}
+  functional_update_opacity_learning_rate: ${model.encoder.gir_functional_update_opacity_learning_rate}
+  functional_update_harmonics_learning_rate: ${model.encoder.gir_functional_update_harmonics_learning_rate}
+  functional_update_harmonics_gradient_scale: ${model.encoder.gir_functional_update_harmonics_gradient_scale}
+  functional_update_harmonics_gradient_clip: ${model.encoder.gir_functional_update_harmonics_gradient_clip}
+  functional_update_harmonics_gradient_threshold: ${model.encoder.gir_functional_update_harmonics_gradient_threshold}
+  functional_update_current_weight: ${model.encoder.gir_functional_update_current_weight}
+  functional_update_replay_weight: ${model.encoder.gir_functional_update_replay_weight}
+  functional_update_max_mean_step_scale: ${model.encoder.gir_functional_update_max_mean_step_scale}
+  functional_update_max_opacity_logit_step: ${model.encoder.gir_functional_update_max_opacity_logit_step}
+  functional_update_max_harmonics_step: ${model.encoder.gir_functional_update_max_harmonics_step}
+  symmetric_multiview_update_enabled: ${model.encoder.gir_symmetric_multiview_update_enabled}
+  symmetric_multiview_visual_enabled: ${model.encoder.gir_symmetric_multiview_visual_enabled}
+  symmetric_multiview_visual_feature_dim: ${model.encoder.gir_symmetric_multiview_visual_feature_dim}
+  symmetric_multiview_visual_hidden_dim: ${model.encoder.gir_symmetric_multiview_visual_hidden_dim}
+  symmetric_multiview_visual_image_scale: ${model.encoder.gir_symmetric_multiview_visual_image_scale}
+  symmetric_multiview_visual_depth_temperature: ${model.encoder.gir_symmetric_multiview_visual_depth_temperature}
+  symmetric_multiview_visual_min_alpha: ${model.encoder.gir_symmetric_multiview_visual_min_alpha}
+  symmetric_multiview_opacity_gradient_scale: ${model.encoder.gir_symmetric_multiview_opacity_gradient_scale}
+  symmetric_multiview_opacity_gradient_clip: ${model.encoder.gir_symmetric_multiview_opacity_gradient_clip}
+  symmetric_multiview_opacity_gradient_threshold: ${model.encoder.gir_symmetric_multiview_opacity_gradient_threshold}
+  symmetric_multiview_mean_gradient_scale: ${model.encoder.gir_symmetric_multiview_mean_gradient_scale}
+  symmetric_multiview_mean_gradient_clip: ${model.encoder.gir_symmetric_multiview_mean_gradient_clip}
+  symmetric_multiview_mean_gradient_threshold: ${model.encoder.gir_symmetric_multiview_mean_gradient_threshold}
+  symmetric_multiview_harmonics_gradient_scale: ${model.encoder.gir_symmetric_multiview_harmonics_gradient_scale}
+  symmetric_multiview_harmonics_gradient_clip: ${model.encoder.gir_symmetric_multiview_harmonics_gradient_clip}
+  symmetric_multiview_harmonics_gradient_threshold: ${model.encoder.gir_symmetric_multiview_harmonics_gradient_threshold}
+  symmetric_multiview_max_mean_step_scale: ${model.encoder.gir_symmetric_multiview_max_mean_step_scale}
+  symmetric_multiview_max_rotation_step: ${model.encoder.gir_symmetric_multiview_max_rotation_step}
+  symmetric_multiview_max_log_scale_step: ${model.encoder.gir_symmetric_multiview_max_log_scale_step}
+  symmetric_multiview_max_opacity_logit_step: ${model.encoder.gir_symmetric_multiview_max_opacity_logit_step}
+  symmetric_multiview_max_harmonics_step: ${model.encoder.gir_symmetric_multiview_max_harmonics_step}
+  anchor_child_enabled: ${model.encoder.gir_anchor_child_enabled}
+  anchor_child_max_count: ${model.encoder.gir_anchor_child_max_count}
+  anchor_child_add_count: ${model.encoder.gir_anchor_child_add_count}
+  anchor_child_min_observations: ${model.encoder.gir_anchor_child_min_observations}
+  anchor_child_gradient_threshold: ${model.encoder.gir_anchor_child_gradient_threshold}
+  anchor_child_coherence_threshold: ${model.encoder.gir_anchor_child_coherence_threshold}
+  anchor_child_max_conflict_ratio: ${model.encoder.gir_anchor_child_max_conflict_ratio}
+  anchor_child_cooldown_views: ${model.encoder.gir_anchor_child_cooldown_views}
+  anchor_child_max_ratio: ${model.encoder.gir_anchor_child_max_ratio}
+  anchor_child_offset_scale: ${model.encoder.gir_anchor_child_offset_scale}
+  anchor_child_scale_divisor: ${model.encoder.gir_anchor_child_scale_divisor}
+  anchor_child_min_opacity: ${model.encoder.gir_anchor_child_min_opacity}
+  anchor_child_max_gaussians: ${model.encoder.gir_anchor_child_max_gaussians}
   new_mean_gradient_enabled: ${model.encoder.gir_new_mean_gradient_enabled}
   new_mean_gradient_replay_views: ${model.encoder.gir_new_mean_gradient_replay_views}
   new_mean_gradient_current_weight: ${model.encoder.gir_new_mean_gradient_current_weight}
@@ -143,6 +295,7 @@ toy:
   # These switches control optimization. The source switches below independently
   # choose which geometry is used to build and update the streaming GS map.
   train_gaussian_param_head: true
+  # Automatically forced off while new_gs_shared_decoder_enabled is true.
   train_gs_head: true
   train_camera_head: true
   # Fine-tune the selected ZipMap/StreamVGGT native DPT depth head.
@@ -165,10 +318,18 @@ toy:
   # none: preserve the complete cross-view graph. Current residual updates are
   # applied after this boundary and remain differentiable for the current step.
   historical_detach_mode: none  # all | means | none
-  # Immediate layered fusion mirrors the main training path.
+  # Match the main path: global point-map coverage selects new pixels.
   append_new_gs_enabled: true
-  append_mode: point_map  # point_map | all
+  append_mode: point_map  # tracker_point_map | tracker | point_map | all
+  tracker_visibility_threshold: ${model.encoder.gir_tracker_visibility_threshold}
+  tracker_coverage_threshold: ${model.encoder.gir_tracker_coverage_threshold}
+  tracker_dilation_radius: ${model.encoder.gir_tracker_dilation_radius}
+  tracker_forward_backward_enabled: ${model.encoder.gir_tracker_forward_backward_enabled}
+  tracker_cycle_absolute_threshold: ${model.encoder.gir_tracker_cycle_absolute_threshold}
+  tracker_cycle_relative_threshold: ${model.encoder.gir_tracker_cycle_relative_threshold}
   point_append_depth_check_enabled: false
+  point_append_align_depth_scale_enabled: false
+  point_map_follow_mean_updates_enabled: ${model.encoder.gir_point_map_follow_mean_updates_enabled}
   point_append_hybrid_enabled: true
   # Ablation: do not treat a closer current surface as automatic new geometry.
   point_append_current_in_front_enabled: true
@@ -220,7 +381,9 @@ toy:
   # Weight for either absolute GT depth or DAV3 structure + absolute log-scale.
   loss_depth: 1.0e-2
   loss_camera: 1.0
+  camera_pose_loss_mode: adjacent_pair  # first_relative | adjacent_pair
   camera_translation_weight: 1.0
+  camera_translation_direction_weight: 0.1
   camera_rotation_weight: 1.0
   camera_focal_weight: 1.0
   loss_heldout: 1.0

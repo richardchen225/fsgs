@@ -26,20 +26,38 @@ from safetensors.torch import load_file
 from src.config import load_typed_root_config
 from src.misc.backbone_checkpoint import backbone_signature, validate_backbone_checkpoint
 from src.model.encoder import act_gs, sh_utils
+from src.model.encoder.abot_adapter import rescale_local_points_to_depth
+from src.model.analytic_gaussians import (
+    build_analytic_gaussian_anchors,
+)
 from src.model.encoder.vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from src.model.model import get_model
 from src.model.ply_export import export_ply
+from src.model.tracking import (
+    forward_backward_tracker_consistency,
+    forward_splat_tracker_coverage,
+)
 from src.model.streaming_gir import (
+    ANCHOR_CHILD_STAT_KEYS,
+    align_gaussians_to_camera_depth_scale,
     apply_projected_new_gaussian_residual,
+    apply_symmetric_multiview_residual,
+    attach_symmetric_multiview_visual_evidence,
+    build_confirmed_current_in_front_mask,
+    build_harmonics_gradient_evidence,
     build_mean_gradient_evidence,
     build_opacity_gradient_evidence,
     build_point_map_append_mask,
+    combine_tracker_point_map_append_mask,
     build_projected_gaussian_evidence,
     build_projected_new_gaussian_evidence,
     build_provisional_gaussians,
+    build_symmetric_multiview_gradient_evidence,
+    build_symmetric_multiview_visual_evidence,
     compute_old_opacity_gradient_effective_stats,
     DominantGIR,
     gate_front_conflict_decay,
+    FUNCTIONAL_GS_UPDATE_STAT_KEYS,
     MEAN_GRADIENT_STAT_KEYS,
     MeanGradientEvidence,
     OLD_OPACITY_GRADIENT_EFFECTIVE_STAT_KEYS,
@@ -47,6 +65,8 @@ from src.model.streaming_gir import (
     OpacityGradientEvidence,
     select_current_and_recent_replay_gradients,
     StreamingGaussianState,
+    SymmetricGSResidualHead,
+    SYMMETRIC_GS_UPDATE_STAT_KEYS,
 )
 from src.model.types import Gaussians
 from src.experiments.plot_replica_overfit_metrics import (
@@ -112,6 +132,30 @@ OLD_OPACITY_GRADIENT_LOG_KEYS = tuple(
 OLD_MEAN_GRADIENT_LOG_KEYS = tuple(
     f"old_{key}" for key in MEAN_GRADIENT_STAT_KEYS
 )
+SPLIT_LOG_KEYS = (
+    "split_eligible_count",
+    "split_count",
+    "split_ratio",
+    "split_selected_radius",
+    "split_selected_gradient_norm",
+    "split_map_count_before",
+    "split_map_count_after",
+)
+SYMMETRIC_UPDATE_LOG_KEYS = (
+    "active_ratio",
+    "visible_views_mean",
+    "mean_coherence",
+    "mean_conflict_ratio",
+    "mean_shift_mean",
+    "opacity_shift_mean",
+    "harmonics_shift_mean",
+    "visual_visible_views_mean",
+    "visual_weight_mean",
+    "visual_feature_norm",
+)
+ANCHOR_CHILD_LOG_KEYS = tuple(
+    f"anchor_child_{key}" for key in ANCHOR_CHILD_STAT_KEYS
+)
 
 
 TRAIN_CSV_FIELDS = [
@@ -126,6 +170,9 @@ TRAIN_CSV_FIELDS = [
     "loss_depth_absolute_log_scale",
     "loss_camera",
     "loss_camera_translation",
+    "loss_camera_translation_shape",
+    "loss_camera_translation_direction",
+    "camera_translation_alignment_scale",
     "loss_camera_rotation",
     "loss_camera_focal",
     "loss_heldout",
@@ -139,6 +186,13 @@ TRAIN_CSV_FIELDS = [
     "old_in_front_ratio",
     "bad_ratio",
     "append_ratio",
+    "point_coverage_ratio",
+    "tracker_coverage_ratio",
+    "tracker_point_union_coverage_ratio",
+    "confirmed_append_current_in_front_ratio",
+    "tracker_visibility_ratio",
+    "tracker_fb_consistency_ratio",
+    "tracker_cycle_error_mean",
     "appended_gs",
     "unique_updated_gs",
     "opacity_decay_candidate_probability",
@@ -148,6 +202,8 @@ TRAIN_CSV_FIELDS = [
     "point_front_gradient_decay_gate_ratio",
     "point_front_decay_mass_ratio",
     "point_append_depth_scale",
+    "point_append_depth_scale_min",
+    "point_append_depth_scale_max",
     *[
         f"rank{rank_idx}_{key}"
         for rank_idx in range(1, MAX_LOGGED_RESIDUAL_RANKS + 1)
@@ -156,6 +212,10 @@ TRAIN_CSV_FIELDS = [
     *MAP_UPDATE_LOG_KEYS,
     *OLD_OPACITY_GRADIENT_LOG_KEYS,
     *OLD_MEAN_GRADIENT_LOG_KEYS,
+    *SPLIT_LOG_KEYS,
+    *[f"functional_update_{key}" for key in FUNCTIONAL_GS_UPDATE_STAT_KEYS],
+    *[f"symmetric_multiview_{key}" for key in SYMMETRIC_UPDATE_LOG_KEYS],
+    *ANCHOR_CHILD_LOG_KEYS,
     *[f"new_residual_{key}" for key in NEW_RESIDUAL_LOG_KEYS],
 ]
 
@@ -218,6 +278,45 @@ def _normalized_intrinsic(intrinsic: torch.Tensor, height: int, width: int) -> t
     result[..., 0, :] /= width
     result[..., 1, :] /= height
     return result
+
+
+def _resize_and_center_crop(
+    image: torch.Tensor,
+    intrinsic: torch.Tensor,
+    shape: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match the main dataset's aspect-preserving resize-and-crop path."""
+    if image.ndim != 3:
+        raise ValueError(f"Expected a [C,H,W] image, got {tuple(image.shape)}.")
+    if intrinsic.shape != (3, 3):
+        raise ValueError(
+            f"Expected a 3x3 pixel intrinsic matrix, got {tuple(intrinsic.shape)}."
+        )
+
+    target_height, target_width = shape
+    _, height, width = image.shape
+    scale = max(target_height / height, target_width / width)
+    scaled_height = round(height * scale)
+    scaled_width = round(width * scale)
+    image = F.interpolate(
+        image.unsqueeze(0),
+        size=(scaled_height, scaled_width),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0)
+
+    row = (scaled_height - target_height) // 2
+    col = (scaled_width - target_width) // 2
+    image = image[:, row : row + target_height, col : col + target_width]
+
+    intrinsic = intrinsic.clone()
+    scale_x = scaled_width / width
+    scale_y = scaled_height / height
+    intrinsic[0, 0] *= scale_x
+    intrinsic[1, 1] *= scale_y
+    intrinsic[0, 2] = intrinsic[0, 2] * scale_x - col
+    intrinsic[1, 2] = intrinsic[1, 2] * scale_y - row
+    return image, intrinsic
 
 
 def _find_camera_json(data_root: Path) -> Path:
@@ -346,7 +445,7 @@ def _load_dl3dv_data(cfg: DictConfig, device: torch.device) -> dict[str, Any]:
 
     train_ids = _frame_id_list(cfg.train_frames, "toy.train_frames", minimum=2)
     heldout_loss_ids = _frame_id_list(
-        cfg.heldout_loss_frame, "toy.heldout_loss_frame"
+        cfg.heldout_loss_frame, "toy.heldout_loss_frame", minimum=0
     )
     heldout_test_ids = _frame_id_list(
         cfg.heldout_test_frame, "toy.heldout_test_frame"
@@ -399,17 +498,11 @@ def _load_dl3dv_data(cfg: DictConfig, device: torch.device) -> dict[str, Any]:
         intrinsic[0, 2] = float(metadata["cx"]) * width / meta_w
         intrinsic[1, 2] = float(metadata["cy"]) * height / meta_h
         if resize_shape is not None and (height, width) != resize_shape:
-            target_height, target_width = resize_shape
-            image = F.interpolate(
-                image.unsqueeze(0),
-                size=resize_shape,
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(0)
-            intrinsic[0, 0] *= target_width / width
-            intrinsic[0, 2] *= target_width / width
-            intrinsic[1, 1] *= target_height / height
-            intrinsic[1, 2] *= target_height / height
+            image, intrinsic = _resize_and_center_crop(
+                image,
+                intrinsic,
+                resize_shape,
+            )
         c2w_nerf = torch.tensor(
             frame["transform_matrix"], device=device, dtype=torch.float32
         )
@@ -441,7 +534,17 @@ def _load_dl3dv_data(cfg: DictConfig, device: torch.device) -> dict[str, Any]:
         }
 
     train = stack_views(train_ids, "training")
-    heldout_loss = stack_views(heldout_loss_ids, "held-out loss")
+    heldout_loss = (
+        stack_views(heldout_loss_ids, "held-out loss")
+        if heldout_loss_ids
+        else {
+            "ids": [],
+            "rgb": train["rgb"][:, :0],
+            "c2w": train["c2w"][:, :0],
+            "intrinsic_px": train["intrinsic_px"][:, :0],
+            "intrinsic": train["intrinsic"][:, :0],
+        }
+    )
     heldout_test = stack_views(heldout_test_ids, "held-out test")
     images = train["rgb"]
     if heldout_loss["rgb"].shape[-2:] != images.shape[-2:]:
@@ -726,6 +829,7 @@ def _load_checkpoint(model: torch.nn.Module, checkpoint: str | None) -> dict[str
         "encoder.depth_refiner.",
         "gir_update_head.",
         "gir_projected_update_head.",
+        "gir_symmetric_update_head.",
     )
     # WM initializes only the GS heads. Its non-causal transformer and camera
     # share names/shapes with StreamVGGT, but must not replace streaming weights.
@@ -745,6 +849,20 @@ def _load_checkpoint(model: torch.nn.Module, checkpoint: str | None) -> dict[str
                 "gir_projected_update_head.new_output."
             ):
                 optimizer_compatible = False
+    if resume_state is not None and bool(
+        getattr(
+            model.encoder.cfg,
+            "gir_symmetric_multiview_update_enabled",
+            False,
+        )
+    ):
+        symmetric_keys = {
+            key
+            for key in model_state
+            if key.startswith("gir_symmetric_update_head.")
+        }
+        if not symmetric_keys.issubset(compatible):
+            optimizer_compatible = False
     if not compatible:
         raise RuntimeError(
             f"No compatible GS/GIR or camera head weights found in {path}. "
@@ -843,6 +961,13 @@ def _configure_trainable_modules(
         residual_enabled and residual_mode == "projected_shared"
     )
     projected_trainable = projected_old_trainable or new_residual_enabled
+    symmetric_trainable = bool(
+        getattr(
+            model.encoder.cfg,
+            "gir_symmetric_multiview_update_enabled",
+            False,
+        )
+    )
     pixel_residual_trainable = residual_enabled and residual_mode == "pixel_topk"
     gir_trainable = pixel_residual_trainable or opacity_decay_enabled
     model.gir_update_head.encoder.requires_grad_(gir_trainable)
@@ -875,6 +1000,13 @@ def _configure_trainable_modules(
         )
         projected_head.output.requires_grad_(projected_old_trainable)
         projected_head.new_output.requires_grad_(new_residual_enabled)
+    symmetric_head = getattr(model, "gir_symmetric_update_head", None)
+    if symmetric_trainable and symmetric_head is None:
+        raise RuntimeError(
+            "Symmetric multiview updates require gir_symmetric_update_head."
+        )
+    if symmetric_head is not None:
+        symmetric_head.requires_grad_(symmetric_trainable)
 
     groups = []
     wm_depth_parameter_ids = {
@@ -943,6 +1075,17 @@ def _configure_trainable_modules(
                 ],
             }
         )
+    if symmetric_trainable:
+        groups.append(
+            {
+                "name": "symmetric_residual_head",
+                "params": [
+                    parameter
+                    for parameter in symmetric_head.parameters()
+                    if parameter.requires_grad
+                ],
+            }
+        )
     if train_camera_head:
         groups.append(
             {
@@ -961,8 +1104,17 @@ def _configure_trainable_modules(
 @torch.no_grad()
 def _cache_backbone_tokens(model: torch.nn.Module, images: torch.Tensor, use_amp: bool):
     model.encoder.aggregator.eval()
-    with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-        tokens, patch_start_idx = model.encoder.aggregator(images.to(torch.float16 if use_amp else torch.float32))
+    amp_dtype = torch.float16
+    if model.encoder.cfg.reconstruction_backbone == "abot":
+        amp_dtype = {
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+            "fp32": torch.float32,
+        }[str(model.encoder.cfg.abot_amp_dtype).lower()]
+    amp_enabled = use_amp and amp_dtype != torch.float32
+    input_dtype = amp_dtype if amp_enabled else torch.float32
+    with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
+        tokens, patch_start_idx = model.encoder.aggregator(images.to(input_dtype))
     # The trainable DPT/GS path runs in float32 below. Cache float32 tokens once
     # so every optimization step does not repeat a half-to-float allocation.
     tokens = [token.detach().float() for token in tokens]
@@ -976,32 +1128,59 @@ def _build_base_gaussians(
     depth: torch.Tensor,
     c2w: torch.Tensor,
     intrinsic_px: torch.Tensor,
+    camera_points: torch.Tensor | None = None,
 ) -> Gaussians:
     batch, _, height, width = feature.shape
+    if camera_points is None:
+        yy, xx = torch.meshgrid(
+            torch.arange(height, device=depth.device, dtype=depth.dtype),
+            torch.arange(width, device=depth.device, dtype=depth.dtype),
+            indexing="ij",
+        )
+        xx = xx.unsqueeze(0).expand(batch, -1, -1)
+        yy = yy.unsqueeze(0).expand(batch, -1, -1)
+        x_camera = (
+            (xx - intrinsic_px[:, 0, 2, None, None])
+            * depth
+            / intrinsic_px[:, 0, 0, None, None]
+        )
+        y_camera = (
+            (yy - intrinsic_px[:, 1, 2, None, None])
+            * depth
+            / intrinsic_px[:, 1, 1, None, None]
+        )
+        camera_points = torch.stack([x_camera, y_camera, depth], dim=-1)
+    elif camera_points.shape != (batch, height, width, 3):
+        raise ValueError(
+            "Camera points must have shape [B,H,W,3], got "
+            f"{tuple(camera_points.shape)}."
+        )
+    homogeneous = torch.cat(
+        [camera_points, torch.ones_like(camera_points[..., :1])], dim=-1
+    ).reshape(batch, height * width, 4)
+    means = torch.bmm(homogeneous, c2w.transpose(1, 2))[..., :3]
+    if bool(model.encoder.cfg.gir_new_gs_shared_decoder_enabled):
+        return build_analytic_gaussian_anchors(
+            means,
+            rgb,
+            depth,
+            intrinsic_px,
+            base_opacity=(
+                model.encoder.cfg.gir_new_gs_shared_decoder_base_opacity
+            ),
+            scale_multiplier=(
+                model.encoder.cfg.gir_new_gs_shared_decoder_scale_multiplier
+            ),
+        )
+
     # Keep parameter activation in float32. In fp16, exp(raw_scale) can become
     # inf before clamp; its backward then evaluates 0 * inf and produces NaN.
     with torch.autocast("cuda", enabled=False):
         raw = model.encoder.gs_head(feature.float())
     raw = raw.permute(0, 2, 3, 1)
-    quats, scales, opacities, residual_sh, _ = torch.split(raw, [4, 3, 1, 3, 1], dim=-1)
-    yy, xx = torch.meshgrid(
-        torch.arange(height, device=depth.device, dtype=depth.dtype),
-        torch.arange(width, device=depth.device, dtype=depth.dtype),
-        indexing="ij",
+    quats, scales, opacities, residual_sh, _ = torch.split(
+        raw, [4, 3, 1, 3, 1], dim=-1
     )
-    xx = xx.unsqueeze(0).expand(batch, -1, -1)
-    yy = yy.unsqueeze(0).expand(batch, -1, -1)
-    x_camera = (xx - intrinsic_px[:, 0, 2, None, None]) * depth / intrinsic_px[
-        :, 0, 0, None, None
-    ]
-    y_camera = (yy - intrinsic_px[:, 1, 2, None, None]) * depth / intrinsic_px[
-        :, 1, 1, None, None
-    ]
-    camera_points = torch.stack([x_camera, y_camera, depth], dim=-1)
-    homogeneous = torch.cat(
-        [camera_points, torch.ones_like(camera_points[..., :1])], dim=-1
-    ).reshape(batch, height * width, 4)
-    means = torch.bmm(homogeneous, c2w.transpose(1, 2))[..., :3]
     rgb_flat = rgb.flatten(2).transpose(1, 2)
     base_sh = sh_utils.RGB2SH(rgb_flat)
     valid = (depth > 0).reshape(batch, height * width)
@@ -1022,6 +1201,69 @@ def _build_base_gaussians(
         .reshape(batch, height * width, 3),
         rotations=rotations,
     )
+
+
+def _apply_first_frame_shared_new_decoder(
+    model: torch.nn.Module,
+    cfg: DictConfig,
+    current: Gaussians,
+    feature: torch.Tensor,
+    rgb: torch.Tensor,
+    depth: torch.Tensor,
+    c2w: torch.Tensor,
+    intrinsic: torch.Tensor,
+) -> tuple[Gaussians, dict[str, torch.Tensor]]:
+    if not bool(cfg.get("new_residual_enabled", False)):
+        raise ValueError(
+            "toy.new_gs_shared_decoder_enabled=true requires "
+            "toy.new_residual_enabled=true."
+        )
+    if model.gir_projected_update_head is None:
+        raise RuntimeError("Shared new-GS decoding requires the projected GIR head.")
+    current_depth = depth[:, None]
+    candidate_mask = torch.isfinite(current_depth) & (current_depth > 0)
+    old_rgb = torch.zeros_like(rgb)
+    old_depth = torch.zeros_like(current_depth)
+    old_alpha = torch.zeros_like(current_depth)
+    evidence = build_projected_new_gaussian_evidence(
+        current=current,
+        append_mask=candidate_mask,
+        current_feature=feature,
+        current_rgb=rgb,
+        current_depth=current_depth,
+        current_depth_confidence=torch.ones_like(current_depth),
+        old_rgb=old_rgb,
+        old_depth=old_depth,
+        old_alpha=old_alpha,
+        camera_to_world=c2w,
+        intrinsics=intrinsic,
+        alpha_threshold=float(cfg.get("point_append_old_alpha_threshold", 0.10)),
+        depth_relative_tolerance=float(
+            cfg.get("point_append_depth_relative_tolerance", 0.15)
+        ),
+        covariance_extent_sigma=float(
+            cfg.get("projected_covariance_sigma", 3.0)
+        ),
+    )
+    with torch.autocast("cuda", enabled=False):
+        prediction = model.gir_projected_update_head.forward_new(evidence)
+        return apply_projected_new_gaussian_residual(
+            current,
+            evidence,
+            prediction,
+            c2w,
+            opacity_logit_scale=float(
+                cfg.get("projected_opacity_logit_scale", 1.0)
+            ),
+            mean_update_mode=str(cfg.get("mean_update_mode", "relative_depth")),
+            raw_scale_residual=bool(cfg.get("raw_scale_residual", False)),
+            raw_opacity_residual=bool(cfg.get("raw_opacity_residual", False)),
+            raw_rotation_residual=bool(cfg.get("raw_rotation_residual", False)),
+            raw_harmonics_residual=bool(cfg.get("raw_harmonics_residual", False)),
+            mean_relative_scale=float(cfg.get("mean_relative_scale", 0.02)),
+            rotation_scale=float(cfg.get("rotation_scale", 0.05)),
+            harmonics_scale=float(cfg.get("harmonics_scale", 0.10)),
+        )
 
 
 def _make_state(gaussians: Gaussians) -> StreamingGaussianState:
@@ -1167,6 +1409,357 @@ def _build_render_gradient_evidence(
             active_mask=active_mask,
         )
     return opacity_evidence, mean_evidence
+
+
+def _apply_functional_gs_update(
+    model,
+    cfg: DictConfig,
+    state: StreamingGaussianState,
+    features: torch.Tensor,
+    images: torch.Tensor,
+    depth: torch.Tensor,
+    c2w: torch.Tensor,
+    intrinsic: torch.Tensor,
+    image_shape: tuple[int, int],
+    view_idx: int,
+) -> tuple[StreamingGaussianState, dict[str, torch.Tensor]]:
+    zero = state.gaussians.means.new_zeros((), dtype=torch.float32)
+    empty = {key: zero for key in FUNCTIONAL_GS_UPDATE_STAT_KEYS}
+    if not bool(cfg.get("functional_update_enabled", False)):
+        return state, empty
+
+    replay_views = int(cfg.get("functional_update_replay_views", 2))
+    if replay_views < -1:
+        raise ValueError(
+            "toy.functional_update_replay_views must be -1, 0, or positive; "
+            f"got {replay_views}."
+        )
+    replay_start = 0 if replay_views == -1 else max(0, view_idx - replay_views)
+    replay_indices = [] if replay_views == 0 else list(
+        range(replay_start, view_idx)
+    )
+    view_indices = [view_idx, *replay_indices]
+    mean_enabled = bool(cfg.get("functional_update_mean_enabled", True))
+    opacity_enabled = bool(cfg.get("functional_update_opacity_enabled", True))
+    harmonics_enabled = bool(
+        cfg.get("functional_update_harmonics_enabled", True)
+    )
+    if not any((mean_enabled, opacity_enabled, harmonics_enabled)):
+        raise ValueError(
+            "Functional GS update requires at least one enabled parameter."
+        )
+    active = (state.stable_ids >= 0) & (
+        state.gaussians.opacities.detach() > 0
+    )
+    gradients = model.decoder.render_parameter_gradients(
+        state.gaussians,
+        c2w[:, view_indices],
+        intrinsic[:, view_indices],
+        images[:, view_indices],
+        image_shape,
+        active_mask=active,
+        mean_camera_enabled=mean_enabled,
+        harmonics_enabled=harmonics_enabled,
+    )
+    current_weight = float(cfg.get("functional_update_current_weight", 1.0))
+    replay_weight = float(cfg.get("functional_update_replay_weight", 0.5))
+    opacity_evidence = (
+        build_opacity_gradient_evidence(
+            gradients.opacity_logit,
+            gradient_scale=float(cfg.get("opacity_gradient_scale", 1000.0)),
+            gradient_clip=float(cfg.get("opacity_gradient_clip", 20.0)),
+            gradient_threshold=float(
+                cfg.get("opacity_gradient_threshold", 1e-3)
+            ),
+            current_weight=current_weight,
+            replay_weight=replay_weight,
+            active_mask=active,
+        )
+        if opacity_enabled
+        else None
+    )
+    mean_evidence = None
+    if mean_enabled:
+        if gradients.mean_camera is None:
+            raise RuntimeError(
+                "Functional update requested mean gradients, but none were returned."
+            )
+        mean_evidence = build_mean_gradient_evidence(
+            gradients.mean_camera,
+            gradient_scale=float(cfg.get("mean_gradient_scale", 1.0)),
+            gradient_clip=float(cfg.get("mean_gradient_clip", 20.0)),
+            gradient_threshold=float(cfg.get("mean_gradient_threshold", 1e-6)),
+            current_weight=current_weight,
+            replay_weight=replay_weight,
+            active_mask=active,
+        )
+    harmonics_evidence = None
+    if harmonics_enabled:
+        if gradients.harmonics is None:
+            raise RuntimeError(
+                "Functional update requested harmonics gradients, but none were "
+                "returned."
+            )
+        harmonics_evidence = build_harmonics_gradient_evidence(
+            gradients.harmonics,
+            gradient_scale=float(
+                cfg.get("functional_update_harmonics_gradient_scale", 1.0)
+            ),
+            gradient_clip=float(
+                cfg.get("functional_update_harmonics_gradient_clip", 20.0)
+            ),
+            gradient_threshold=float(
+                cfg.get("functional_update_harmonics_gradient_threshold", 1e-6)
+            ),
+            current_weight=current_weight,
+            replay_weight=replay_weight,
+            active_mask=active,
+        )
+
+    raster = model.decoder.render_projected_gs_evidence(
+        state.gaussians,
+        c2w[:, view_idx],
+        intrinsic[:, view_idx],
+        image_shape,
+    )
+    current_depth = depth[:, view_idx, None]
+    evidence = build_projected_gaussian_evidence(
+        state=state,
+        current_feature=features[:, view_idx],
+        current_rgb=images[:, view_idx],
+        current_depth=current_depth,
+        current_depth_confidence=torch.ones_like(current_depth),
+        old_rgb=raster.color,
+        old_depth=raster.expected_depth,
+        old_alpha=raster.alpha,
+        camera_to_world=c2w[:, view_idx],
+        intrinsics=intrinsic[:, view_idx],
+        alpha_threshold=float(cfg.alpha_threshold),
+        depth_relative_tolerance=float(cfg.depth_relative_tolerance),
+        rgb_bad_threshold=float(cfg.rgb_bad_threshold),
+        min_projected_radius=float(cfg.get("projected_min_radius", 0.1)),
+        covariance_extent_sigma=float(
+            cfg.get("projected_covariance_sigma", 3.0)
+        ),
+        chunk_size=int(cfg.get("projected_chunk_size", 65536)),
+        opacity_gradient_evidence=opacity_evidence,
+        mean_gradient_evidence=mean_evidence,
+    )
+    return state.functional_gradient_step(
+        evidence,
+        c2w[:, view_idx],
+        opacity_gradient_evidence=opacity_evidence,
+        mean_gradient_evidence=mean_evidence,
+        harmonics_gradient_evidence=harmonics_evidence,
+        top_ratio=float(cfg.get("functional_update_top_ratio", 0.05)),
+        min_observations=int(
+            cfg.get("functional_update_min_observations", 1)
+        ),
+        mean_learning_rate=float(
+            cfg.get("functional_update_mean_learning_rate", 1e-3)
+        ),
+        opacity_learning_rate=float(
+            cfg.get("functional_update_opacity_learning_rate", 5e-3)
+        ),
+        harmonics_learning_rate=float(
+            cfg.get("functional_update_harmonics_learning_rate", 1e-3)
+        ),
+        max_mean_step_scale=float(
+            cfg.get("functional_update_max_mean_step_scale", 0.25)
+        ),
+        max_opacity_logit_step=float(
+            cfg.get("functional_update_max_opacity_logit_step", 0.10)
+        ),
+        max_harmonics_step=float(
+            cfg.get("functional_update_max_harmonics_step", 0.05)
+        ),
+    )
+
+
+def _apply_symmetric_multiview_update(
+    model,
+    cfg: DictConfig,
+    state: StreamingGaussianState,
+    images: torch.Tensor,
+    c2w: torch.Tensor,
+    intrinsic: torch.Tensor,
+    image_shape: tuple[int, int],
+    view_idx: int,
+    old_map_count: int,
+) -> tuple[
+    StreamingGaussianState,
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+]:
+    zero = state.gaussians.means.new_zeros((), dtype=torch.float32)
+    empty = {key: zero for key in SYMMETRIC_GS_UPDATE_STAT_KEYS}
+    empty_anchor = {key: zero for key in ANCHOR_CHILD_STAT_KEYS}
+    if not bool(cfg.get("symmetric_multiview_update_enabled", False)):
+        return state, empty, empty_anchor
+    head = getattr(model, "gir_symmetric_update_head", None)
+    if head is None:
+        raise RuntimeError(
+            "Symmetric multiview toy updates require gir_symmetric_update_head."
+        )
+    active = (state.stable_ids >= 0) & (
+        state.gaussians.opacities.detach() > 0
+    )
+    gradients = model.decoder.render_parameter_gradients(
+        state.gaussians,
+        c2w[:, : view_idx + 1],
+        intrinsic[:, : view_idx + 1],
+        images[:, : view_idx + 1],
+        image_shape,
+        active_mask=active,
+        mean_camera_enabled=True,
+        harmonics_enabled=True,
+        loss_reduction="mean",
+    )
+    if gradients.mean_camera is None or gradients.harmonics is None:
+        raise RuntimeError(
+            "Symmetric multiview toy updates require mean and harmonics gradients."
+        )
+    evidence = build_symmetric_multiview_gradient_evidence(
+        gradients.opacity_logit,
+        gradients.mean_camera,
+        gradients.harmonics,
+        active_mask=active,
+        opacity_gradient_scale=float(
+            cfg.get("symmetric_multiview_opacity_gradient_scale", 1000.0)
+        ),
+        opacity_gradient_clip=float(
+            cfg.get("symmetric_multiview_opacity_gradient_clip", 20.0)
+        ),
+        opacity_gradient_threshold=float(
+            cfg.get("symmetric_multiview_opacity_gradient_threshold", 1e-3)
+        ),
+        mean_gradient_scale=float(
+            cfg.get("symmetric_multiview_mean_gradient_scale", 1.0)
+        ),
+        mean_gradient_clip=float(
+            cfg.get("symmetric_multiview_mean_gradient_clip", 20.0)
+        ),
+        mean_gradient_threshold=float(
+            cfg.get("symmetric_multiview_mean_gradient_threshold", 1e-6)
+        ),
+        harmonics_gradient_scale=float(
+            cfg.get("symmetric_multiview_harmonics_gradient_scale", 1.0)
+        ),
+        harmonics_gradient_clip=float(
+            cfg.get("symmetric_multiview_harmonics_gradient_clip", 20.0)
+        ),
+        harmonics_gradient_threshold=float(
+            cfg.get("symmetric_multiview_harmonics_gradient_threshold", 1e-6)
+        ),
+    )
+    if bool(cfg.get("symmetric_multiview_visual_enabled", False)):
+        visual_encoder = head.visual_encoder
+        if visual_encoder is None:
+            raise RuntimeError("Symmetric visual evidence encoder is missing.")
+        if (
+            gradients.rendered_color is None
+            or gradients.rendered_depth is None
+            or gradients.rendered_alpha is None
+        ):
+            raise RuntimeError(
+                "Symmetric visual evidence requires rendered RGB, depth, and alpha."
+            )
+        visual_features, visual_view_count, visual_weight_sum = (
+            build_symmetric_multiview_visual_evidence(
+                state.gaussians,
+                images[:, : view_idx + 1],
+                gradients.rendered_color,
+                gradients.rendered_depth,
+                gradients.rendered_alpha,
+                c2w[:, : view_idx + 1],
+                intrinsic[:, : view_idx + 1],
+                visual_encoder,
+                active_mask=active,
+                chunk_size=int(
+                    cfg.get("symmetric_multiview_chunk_size", 65536)
+                ),
+                image_scale=float(
+                    cfg.get("symmetric_multiview_visual_image_scale", 0.5)
+                ),
+                depth_temperature=float(
+                    cfg.get(
+                        "symmetric_multiview_visual_depth_temperature",
+                        0.10,
+                    )
+                ),
+                min_alpha=float(
+                    cfg.get("symmetric_multiview_visual_min_alpha", 0.01)
+                ),
+            )
+        )
+        evidence = attach_symmetric_multiview_visual_evidence(
+            evidence,
+            visual_features,
+            visual_view_count,
+            visual_weight_sum,
+        )
+    positions = torch.arange(
+        state.num_gaussians, device=state.stable_ids.device
+    ).unsqueeze(0)
+    is_new = (positions >= int(old_map_count)) & (state.stable_ids >= 0)
+    prediction = head(
+        state.gaussians,
+        state.observation_count,
+        state.split_generation,
+        evidence,
+        is_new,
+    )
+    state, update_stats = apply_symmetric_multiview_residual(
+        state,
+        evidence,
+        prediction,
+        c2w[:, 0],
+        max_mean_step_scale=float(
+            cfg.get("symmetric_multiview_max_mean_step_scale", 0.10)
+        ),
+        max_rotation_step=float(
+            cfg.get("symmetric_multiview_max_rotation_step", 0.01)
+        ),
+        max_log_scale_step=float(
+            cfg.get("symmetric_multiview_max_log_scale_step", 0.02)
+        ),
+        max_opacity_logit_step=float(
+            cfg.get("symmetric_multiview_max_opacity_logit_step", 0.10)
+        ),
+        max_harmonics_step=float(
+            cfg.get("symmetric_multiview_max_harmonics_step", 0.05)
+        ),
+    )
+    anchor_stats = empty_anchor
+    if bool(cfg.get("anchor_child_enabled", False)):
+        state, anchor_stats = state.expand_anchor_children(
+            evidence,
+            max_child_count=int(cfg.get("anchor_child_max_count", 8)),
+            add_child_count=int(cfg.get("anchor_child_add_count", 1)),
+            min_observations=int(
+                cfg.get("anchor_child_min_observations", 2)
+            ),
+            gradient_threshold=float(
+                cfg.get("anchor_child_gradient_threshold", 0.05)
+            ),
+            coherence_threshold=float(
+                cfg.get("anchor_child_coherence_threshold", 0.5)
+            ),
+            max_conflict_ratio=float(
+                cfg.get("anchor_child_max_conflict_ratio", 0.25)
+            ),
+            cooldown_views=int(cfg.get("anchor_child_cooldown_views", 2)),
+            max_ratio=float(cfg.get("anchor_child_max_ratio", 0.05)),
+            offset_scale=float(cfg.get("anchor_child_offset_scale", 0.4)),
+            scale_divisor=float(
+                cfg.get("anchor_child_scale_divisor", 1.6)
+            ),
+            min_opacity=float(cfg.get("anchor_child_min_opacity", 0.02)),
+            max_gaussians=int(
+                cfg.get("anchor_child_max_gaussians", 500000)
+            ),
+        )
+    return state, update_stats, anchor_stats
 
 
 def _bound_tanh_input(value: torch.Tensor, scale: float) -> torch.Tensor:
@@ -1376,6 +1969,9 @@ def _predict_projected_updated_state(
     global_step: int,
     opacity_gradient_evidence: OpacityGradientEvidence | None = None,
     mean_gradient_evidence: MeanGradientEvidence | None = None,
+    tracker_append_mask: torch.Tensor | None = None,
+    tracker_coverage: torch.Tensor | None = None,
+    tracker_visibility_ratio: torch.Tensor | None = None,
 ):
     batch, height, width = current_rgb.shape[0], *image_shape
     raster = model.decoder.render_projected_gs_evidence(
@@ -1399,7 +1995,9 @@ def _predict_projected_updated_state(
         torch.zeros_like(old_depth),
     )
     with torch.no_grad():
-        valid_depth = current_depth[:, None] > 0
+        valid_depth = torch.isfinite(current_depth[:, None]) & (
+            current_depth[:, None] > 0
+        )
         old_coverage = old_alpha >= float(cfg.alpha_threshold)
         relative_depth_delta = (
             old_depth - current_depth[:, None]
@@ -1427,12 +2025,21 @@ def _predict_projected_updated_state(
         front_conflict_gaussians = torch.zeros_like(
             state.gaussians.opacities, dtype=torch.bool
         )
-        if append_mode == "all":
+        point_coverage = None
+        confirmed_append_front = torch.zeros_like(valid_depth)
+        if append_mode == "tracker":
+            if tracker_append_mask is None or tracker_coverage is None:
+                raise RuntimeError(
+                    "Tracker append mode requires a rolling coverage mask."
+                )
+            append_mask = tracker_append_mask
+            point_depth_scale = current_depth.new_ones((batch,))
+        elif append_mode == "all":
             append_mask = valid_depth
-        elif append_mode in {"logic", "point_map"}:
+        elif append_mode in {"logic", "point_map", "tracker_point_map"}:
             (
                 append_mask,
-                _,
+                point_coverage,
                 front_conflict_gaussians,
                 next_front_conflict_count,
                 point_depth_scale,
@@ -1471,8 +2078,9 @@ def _predict_projected_updated_state(
                 depth_check_enabled=bool(
                     cfg.get("point_append_depth_check_enabled", True)
                 ),
-                hybrid_enabled=bool(
-                    cfg.get("point_append_hybrid_enabled", False)
+                hybrid_enabled=(
+                    bool(cfg.get("point_append_hybrid_enabled", False))
+                    or append_mode == "tracker_point_map"
                 ),
                 append_current_in_front_enabled=bool(
                     cfg.get(
@@ -1496,9 +2104,45 @@ def _predict_projected_updated_state(
             state = state.with_front_conflict_count(
                 next_front_conflict_count
             )
+            if append_mode == "tracker_point_map":
+                if tracker_coverage is None:
+                    raise RuntimeError(
+                        "Combined tracker/point-map append requires rolling "
+                        "tracker coverage."
+                    )
+                confirmed_append_front = (
+                    build_confirmed_current_in_front_mask(
+                        current_depth[:, None],
+                        old_depth,
+                        old_alpha,
+                        depth_scale=point_depth_scale,
+                        depth_relative_tolerance=float(
+                            cfg.get(
+                                "point_append_depth_relative_tolerance",
+                                cfg.depth_relative_tolerance,
+                            )
+                        ),
+                        old_alpha_threshold=float(
+                            cfg.get("point_append_old_alpha_threshold", 0.10)
+                        ),
+                        current_depth_confidence=torch.ones_like(
+                            current_depth[:, None]
+                        ),
+                        min_depth_confidence=float(
+                            cfg.get("point_append_min_depth_confidence", 0.0)
+                        ),
+                    )
+                )
+                append_mask, _ = combine_tracker_point_map_append_mask(
+                    valid_depth,
+                    tracker_coverage,
+                    point_coverage,
+                    confirmed_append_front,
+                )
         else:
             raise ValueError(
-                "toy.append_mode must be point_map or all; "
+                "toy.append_mode must be tracker_point_map, tracker, "
+                "point_map, or all; "
                 f"got {append_mode!r}."
             )
         if append_mode == "all":
@@ -1709,6 +2353,29 @@ def _predict_projected_updated_state(
         "current_in_front_ratio": current_in_front.float().mean(),
         "old_in_front_ratio": old_in_front.float().mean(),
         "append_mask": append_mask,
+        "tracker_coverage_ratio": (
+            tracker_coverage.float().mean()
+            if tracker_coverage is not None
+            else current_feature.new_zeros(())
+        ),
+        "tracker_visibility_ratio": (
+            tracker_visibility_ratio
+            if tracker_visibility_ratio is not None
+            else current_feature.new_zeros(())
+        ),
+        "point_coverage_ratio": (
+            point_coverage.float().mean()
+            if point_coverage is not None
+            else current_feature.new_zeros(())
+        ),
+        "tracker_point_union_coverage_ratio": (
+            (tracker_coverage | point_coverage).float().mean()
+            if tracker_coverage is not None and point_coverage is not None
+            else current_feature.new_zeros(())
+        ),
+        "confirmed_append_current_in_front_ratio": (
+            confirmed_append_front.float().mean()
+        ),
         "unique_gs": torch.unique(updated_indices).numel(),
         "updated_indices": updated_indices.detach(),
         "residual_regularization": projected_stats["regularization"],
@@ -1721,6 +2388,7 @@ def _predict_projected_updated_state(
         "point_front_gradient_decay_gate_ratio": fixed_decay_gate_ratio,
         "point_front_decay_mass_ratio": fixed_decay_mass_ratio,
         "point_append_depth_scale": point_depth_scale.mean(),
+        "_point_append_depth_scale": point_depth_scale,
         **{
             f"old_{key}": projected_stats[key]
             for key in (
@@ -1738,6 +2406,43 @@ def _predict_projected_updated_state(
         },
         **update_stats,
     }
+    split_zero = current_feature.new_zeros(())
+    split_log_stats = {key: split_zero for key in SPLIT_LOG_KEYS}
+    split_warmup_steps = max(0, int(cfg.get("split_warmup_steps", 1000)))
+    split_active = bool(cfg.get("split_enabled", False)) and (
+        not torch.is_grad_enabled()
+        or split_warmup_steps == 0
+        or global_step >= split_warmup_steps
+    )
+    if split_active:
+        updated, split_stats = updated.split_projected_historical(
+            evidence,
+            projected_radius_threshold=float(
+                cfg.get("split_projected_radius_threshold", 4.0)
+            ),
+            mean_gradient_threshold=float(
+                cfg.get("split_mean_gradient_threshold", 1e-6)
+            ),
+            min_observations=int(cfg.get("split_min_observations", 2)),
+            max_ratio=float(cfg.get("split_max_ratio", 0.005)),
+            max_generation=int(cfg.get("split_max_generation", 1)),
+            offset_scale=float(cfg.get("split_offset_scale", 0.4)),
+            scale_divisor=float(cfg.get("split_scale_divisor", 1.6)),
+            min_opacity=float(cfg.get("split_min_opacity", 0.02)),
+            max_gaussians=int(cfg.get("split_max_gaussians", 0)),
+        )
+        split_log_stats = {
+            "split_eligible_count": split_stats["eligible_count"],
+            "split_count": split_stats["split_count"],
+            "split_ratio": split_stats["split_ratio"],
+            "split_selected_radius": split_stats["selected_radius_mean"],
+            "split_selected_gradient_norm": split_stats[
+                "selected_gradient_norm_mean"
+            ],
+            "split_map_count_before": split_stats["map_count_before"],
+            "split_map_count_after": split_stats["map_count_after"],
+        }
+    stats.update(split_log_stats)
     if bool(cfg.get("new_residual_enabled", False)):
         stats["_new_history_evidence"] = (old_rgb, old_depth, old_alpha)
     return updated, stats
@@ -1756,6 +2461,9 @@ def _predict_updated_state(
     global_step: int,
     opacity_gradient_evidence: OpacityGradientEvidence | None = None,
     mean_gradient_evidence: MeanGradientEvidence | None = None,
+    tracker_append_mask: torch.Tensor | None = None,
+    tracker_coverage: torch.Tensor | None = None,
+    tracker_visibility_ratio: torch.Tensor | None = None,
 ):
     residual_mode = str(cfg.get("residual_mode", "pixel_topk")).lower()
     if residual_mode == "projected_shared":
@@ -1772,6 +2480,9 @@ def _predict_updated_state(
             global_step,
             opacity_gradient_evidence,
             mean_gradient_evidence,
+            tracker_append_mask,
+            tracker_coverage,
+            tracker_visibility_ratio,
         )
     if residual_mode != "pixel_topk":
         raise ValueError(
@@ -1795,9 +2506,16 @@ def _predict_updated_state(
             f"got {mean_update_mode!r}."
         )
     append_mode = str(cfg.get("append_mode", "point_map")).lower()
-    if append_mode not in {"logic", "point_map", "all"}:
+    if append_mode not in {
+        "logic",
+        "point_map",
+        "tracker",
+        "tracker_point_map",
+        "all",
+    }:
         raise ValueError(
-            "toy.append_mode must be 'point_map' or 'all', "
+            "toy.append_mode must be 'tracker_point_map', 'tracker', "
+            "'point_map', or 'all', "
             f"got {append_mode!r}."
         )
     gir = DominantGIR.empty(batch, height, width, current_feature.device, current_feature.dtype)
@@ -1815,7 +2533,9 @@ def _predict_updated_state(
         ),
     )
     with torch.no_grad():
-        valid_depth = current_depth[:, None] > 0
+        valid_depth = torch.isfinite(current_depth[:, None]) & (
+            current_depth[:, None] > 0
+        )
         old_coverage = gir.valid & (
             gir.raster_alpha.float() >= float(cfg.alpha_threshold)
         )
@@ -1844,12 +2564,21 @@ def _predict_updated_state(
         front_conflict_gaussians = torch.zeros_like(
             state.gaussians.opacities, dtype=torch.bool
         )
-        if append_mode == "all":
+        point_coverage = None
+        confirmed_append_front = torch.zeros_like(valid_depth)
+        if append_mode == "tracker":
+            if tracker_append_mask is None or tracker_coverage is None:
+                raise RuntimeError(
+                    "Tracker append mode requires a rolling coverage mask."
+                )
+            append_mask = tracker_append_mask
+            point_depth_scale = current_depth.new_ones((batch,))
+        elif append_mode == "all":
             append_mask = valid_depth
         else:
             (
                 append_mask,
-                _,
+                point_coverage,
                 front_conflict_gaussians,
                 next_front_conflict_count,
                 point_depth_scale,
@@ -1888,8 +2617,9 @@ def _predict_updated_state(
                 depth_check_enabled=bool(
                     cfg.get("point_append_depth_check_enabled", True)
                 ),
-                hybrid_enabled=bool(
-                    cfg.get("point_append_hybrid_enabled", False)
+                hybrid_enabled=(
+                    bool(cfg.get("point_append_hybrid_enabled", False))
+                    or append_mode == "tracker_point_map"
                 ),
                 append_current_in_front_enabled=bool(
                     cfg.get(
@@ -1913,6 +2643,41 @@ def _predict_updated_state(
             state = state.with_front_conflict_count(
                 next_front_conflict_count
             )
+            if append_mode == "tracker_point_map":
+                if tracker_coverage is None:
+                    raise RuntimeError(
+                        "Combined tracker/point-map append requires rolling "
+                        "tracker coverage."
+                    )
+                confirmed_append_front = (
+                    build_confirmed_current_in_front_mask(
+                        current_depth[:, None],
+                        gir.raster_depth,
+                        gir.raster_alpha,
+                        depth_scale=point_depth_scale,
+                        depth_relative_tolerance=float(
+                            cfg.get(
+                                "point_append_depth_relative_tolerance",
+                                cfg.depth_relative_tolerance,
+                            )
+                        ),
+                        old_alpha_threshold=float(
+                            cfg.get("point_append_old_alpha_threshold", 0.10)
+                        ),
+                        current_depth_confidence=torch.ones_like(
+                            current_depth[:, None]
+                        ),
+                        min_depth_confidence=float(
+                            cfg.get("point_append_min_depth_confidence", 0.0)
+                        ),
+                    )
+                )
+                append_mask, _ = combine_tracker_point_map_append_mask(
+                    valid_depth,
+                    tracker_coverage,
+                    point_coverage,
+                    confirmed_append_front,
+                )
         if append_mode == "all":
             point_depth_scale = current_depth.new_ones((batch,))
         rgb_error = (gir.rgb.float() - current_rgb.float()).abs().mean(dim=1, keepdim=True)
@@ -1956,6 +2721,29 @@ def _predict_updated_state(
             "current_in_front_ratio": current_in_front.float().mean(),
             "old_in_front_ratio": old_in_front.float().mean(),
             "append_mask": append_mask,
+            "tracker_coverage_ratio": (
+                tracker_coverage.float().mean()
+                if tracker_coverage is not None
+                else current_feature.new_zeros(())
+            ),
+            "tracker_visibility_ratio": (
+                tracker_visibility_ratio
+                if tracker_visibility_ratio is not None
+                else current_feature.new_zeros(())
+            ),
+            "point_coverage_ratio": (
+                point_coverage.float().mean()
+                if point_coverage is not None
+                else current_feature.new_zeros(())
+            ),
+            "tracker_point_union_coverage_ratio": (
+                (tracker_coverage | point_coverage).float().mean()
+                if tracker_coverage is not None and point_coverage is not None
+                else current_feature.new_zeros(())
+            ),
+            "confirmed_append_current_in_front_ratio": (
+                confirmed_append_front.float().mean()
+            ),
             "unique_gs": 0,
             "updated_indices": torch.empty(
                 0, device=current_feature.device, dtype=torch.long
@@ -1970,6 +2758,7 @@ def _predict_updated_state(
             "point_front_gradient_decay_gate_ratio": fixed_decay_gate_ratio,
             "point_front_decay_mass_ratio": fixed_decay_mass_ratio,
             "point_append_depth_scale": point_depth_scale.mean(),
+            "_point_append_depth_scale": point_depth_scale,
             **_empty_residual_update_stats(current_feature, residual_topk),
         }
         return fixed_decay_state, stats
@@ -2194,6 +2983,29 @@ def _predict_updated_state(
         "current_in_front_ratio": current_in_front.float().mean(),
         "old_in_front_ratio": old_in_front.float().mean(),
         "append_mask": append_mask,
+        "tracker_coverage_ratio": (
+            tracker_coverage.float().mean()
+            if tracker_coverage is not None
+            else current_feature.new_zeros(())
+        ),
+        "tracker_visibility_ratio": (
+            tracker_visibility_ratio
+            if tracker_visibility_ratio is not None
+            else current_feature.new_zeros(())
+        ),
+        "point_coverage_ratio": (
+            point_coverage.float().mean()
+            if point_coverage is not None
+            else current_feature.new_zeros(())
+        ),
+        "tracker_point_union_coverage_ratio": (
+            (tracker_coverage | point_coverage).float().mean()
+            if tracker_coverage is not None and point_coverage is not None
+            else current_feature.new_zeros(())
+        ),
+        "confirmed_append_current_in_front_ratio": (
+            confirmed_append_front.float().mean()
+        ),
         "unique_gs": torch.unique(updated_indices).numel(),
         "updated_indices": updated_indices,
         "residual_regularization": residual_regularization,
@@ -2208,6 +3020,7 @@ def _predict_updated_state(
         "point_front_gradient_decay_gate_ratio": fixed_decay_gate_ratio,
         "point_front_decay_mass_ratio": fixed_decay_mass_ratio,
         "point_append_depth_scale": point_depth_scale.mean(),
+        "_point_append_depth_scale": point_depth_scale,
         **update_stats,
     }
     return updated, stats
@@ -2651,11 +3464,90 @@ def _camera_supervision_losses(
 ) -> dict[str, torch.Tensor]:
     predicted_relative = camera_prediction["relative_c2w"]
     gt_relative = camera_prediction["gt_relative_c2w"]
-    translation = F.smooth_l1_loss(
-        predicted_relative[..., :3, 3], gt_relative[..., :3, 3]
-    )
+    pose_loss_mode = str(
+        cfg.get("camera_pose_loss_mode", "first_relative")
+    ).lower()
+    if pose_loss_mode == "adjacent_pair":
+        if predicted_relative.shape[1] < 2:
+            raise ValueError(
+                "camera_pose_loss_mode=adjacent_pair requires at least two "
+                "camera views."
+            )
+        predicted_for_loss = (
+            torch.linalg.inv(predicted_relative[:, :-1])
+            @ predicted_relative[:, 1:]
+        )
+        gt_for_loss = (
+            torch.linalg.inv(gt_relative[:, :-1]) @ gt_relative[:, 1:]
+        )
+    elif pose_loss_mode == "first_relative":
+        predicted_for_loss = predicted_relative
+        gt_for_loss = gt_relative
+    else:
+        raise ValueError(
+            "camera_pose_loss_mode must be first_relative or adjacent_pair, "
+            f"got {pose_loss_mode!r}."
+        )
+    predicted_translation = predicted_for_loss[..., :3, 3]
+    gt_translation = gt_for_loss[..., :3, 3]
+    if pose_loss_mode == "adjacent_pair":
+        direction_weight = float(
+            cfg.get("camera_translation_direction_weight", 0.1)
+        )
+        if not math.isfinite(direction_weight) or direction_weight < 0.0:
+            raise ValueError(
+                "camera_translation_direction_weight must be finite and "
+                f"non-negative, got {direction_weight}."
+            )
+        # A single detached least-squares scale preserves the native camera /
+        # depth gauge while supervising relative motion shape. By the envelope
+        # theorem, detaching the optimum keeps the intended scale-invariant
+        # gradient without introducing a second-order path through the fit.
+        predicted_flat = predicted_translation.reshape(
+            predicted_translation.shape[0], -1
+        )
+        gt_flat = gt_translation.reshape(gt_translation.shape[0], -1)
+        denominator = predicted_flat.square().sum(dim=-1)
+        alignment_scale = (
+            (predicted_flat * gt_flat).sum(dim=-1)
+            / denominator.clamp_min(1e-8)
+        )
+        alignment_scale = torch.where(
+            denominator > 1e-8,
+            alignment_scale.clamp(1e-3, 1e3),
+            torch.ones_like(alignment_scale),
+        ).detach()
+        aligned_prediction = (
+            predicted_translation * alignment_scale[:, None, None]
+        )
+        translation_shape = F.smooth_l1_loss(
+            aligned_prediction, gt_translation
+        )
+
+        predicted_norm = predicted_translation.norm(dim=-1)
+        gt_norm = gt_translation.norm(dim=-1)
+        valid_direction = (predicted_norm > 1e-6) & (gt_norm > 1e-6)
+        direction_error = 1.0 - F.cosine_similarity(
+            predicted_translation, gt_translation, dim=-1, eps=1e-6
+        )
+        if valid_direction.any():
+            translation_direction = direction_error[valid_direction].mean()
+        else:
+            translation_direction = predicted_translation.sum() * 0.0
+        translation = translation_shape + direction_weight * translation_direction
+    else:
+        translation_shape = F.smooth_l1_loss(
+            predicted_translation, gt_translation
+        )
+        translation_direction = predicted_translation.sum() * 0.0
+        alignment_scale = torch.ones(
+            predicted_translation.shape[0],
+            device=predicted_translation.device,
+            dtype=predicted_translation.dtype,
+        )
+        translation = translation_shape
     rotation = F.mse_loss(
-        predicted_relative[..., :3, :3], gt_relative[..., :3, :3]
+        predicted_for_loss[..., :3, :3], gt_for_loss[..., :3, :3]
     )
     height, width = image_shape
     gt_fov_h = 2.0 * torch.atan(
@@ -2679,6 +3571,9 @@ def _camera_supervision_losses(
     return {
         "total": total,
         "translation": translation,
+        "translation_shape": translation_shape,
+        "translation_direction": translation_direction,
+        "translation_alignment_scale": alignment_scale.mean(),
         "rotation": rotation,
         "focal": focal,
     }
@@ -2795,6 +3690,20 @@ def _forward_experiment(
             depth = depth.detach()
     else:
         depth = gt_depth
+    abot_camera_points = None
+    if (
+        str(model.encoder.cfg.reconstruction_backbone).lower() == "abot"
+        and str(model.encoder.cfg.depth_head_source).lower() == "native"
+        and camera_source == "predicted"
+        and depth_source == "predicted"
+    ):
+        _, local_points, _, _ = model.encoder.aggregator.cached_geometry(
+            source_view_count
+        )
+        abot_camera_points = rescale_local_points_to_depth(
+            local_points,
+            depth.unsqueeze(-1),
+        )
     geometry_valid_depth = torch.isfinite(depth) & (depth > 0)
     base = _build_base_gaussians(
         model,
@@ -2803,15 +3712,63 @@ def _forward_experiment(
         depth[:, 0],
         c2w[:, 0],
         intrinsic_px[:, 0],
+        camera_points=(
+            None if abot_camera_points is None else abot_camera_points[:, 0]
+        ),
     )
+    base_residual_regularization = features.new_zeros(())
+    if bool(cfg.get("new_gs_shared_decoder_enabled", False)):
+        base, base_new_stats = _apply_first_frame_shared_new_decoder(
+            model,
+            cfg,
+            base,
+            features[:, 0],
+            images[:, 0],
+            depth[:, 0],
+            c2w[:, 0],
+            intrinsic[:, 0],
+        )
+        base_residual_regularization = base_new_stats["regularization"]
     state = _make_state(base)
-    base_render = _render(model, base, c2w[:, :1], intrinsic[:, :1], image_shape)
+    state, base_symmetric_stats, _ = _apply_symmetric_multiview_update(
+        model,
+        cfg,
+        state,
+        images,
+        c2w,
+        intrinsic,
+        image_shape,
+        view_idx=0,
+        old_map_count=0,
+    )
+    if bool(cfg.get("point_map_follow_mean_updates_enabled", False)):
+        state = state.sync_point_map_to_means()
+    base_residual_regularization = (
+        base_residual_regularization
+        + base_symmetric_stats["regularization"]
+    )
+    base_render = _render(
+        model, state.gaussians, c2w[:, :1], intrinsic[:, :1], image_shape
+    )
     max_replay_views = int(cfg.max_replay_views)
     if max_replay_views == 0 or max_replay_views < -1:
         raise ValueError(
             f"toy.max_replay_views must be -1 or a positive integer, got {max_replay_views}."
         )
     historical_detach_mode = _historical_detach_mode(cfg)
+    append_mode = str(cfg.get("append_mode", "point_map")).lower()
+    tracker_previous_rgb = None
+    tracker_previous_support = None
+    tracker_pair_cache = None
+    if append_mode in {"tracker", "tracker_point_map"}:
+        if getattr(model, "gir_append_tracker", None) is None:
+            raise RuntimeError(
+                "Tracker-based toy append requires the model encoder's "
+                "gir_append_mode to initialize a tracker."
+            )
+        tracker_previous_rgb = images[:, 0].detach()
+        tracker_previous_support = geometry_valid_depth[:, 0, None].detach()
+        tracker_pair_cache = data.setdefault("_tracker_pair_cache", {})
 
     steps = []
     for view_idx in range(1, images.shape[1]):
@@ -2833,10 +3790,119 @@ def _forward_experiment(
                 depth[:, view_idx],
                 c2w[:, view_idx],
                 intrinsic_px[:, view_idx],
+                camera_points=(
+                    None
+                    if abot_camera_points is None
+                    else abot_camera_points[:, view_idx]
+                ),
             )
             anchor_point_map = current_gaussians.means
         old_gradient_evidence = None
         old_mean_gradient_evidence = None
+        tracker_append_mask = None
+        tracker_coverage = None
+        tracker_visibility_ratio = None
+        tracker_fb_consistency_ratio = None
+        tracker_cycle_error_mean = None
+        if append_mode in {"tracker", "tracker_point_map"}:
+            if tracker_previous_rgb is None or tracker_previous_support is None:
+                raise RuntimeError(
+                    "Rolling tracker lost its previous-frame state."
+                )
+            if tracker_pair_cache is None:
+                raise RuntimeError("Tracker pair cache was not initialized.")
+            cached_pair = tracker_pair_cache.get(view_idx)
+            if cached_pair is None:
+                tracker_flow, tracker_visibility = (
+                    model.gir_append_tracker.predict_pair(
+                        tracker_previous_rgb,
+                        images[:, view_idx],
+                    )
+                )
+                cached_pair = (tracker_flow, tracker_visibility)
+                if bool(cfg.get("tracker_forward_backward_enabled", True)):
+                    tracker_backward = model.gir_append_tracker.predict_pair(
+                        images[:, view_idx],
+                        tracker_previous_rgb,
+                    )
+                    cached_pair = (*cached_pair, *tracker_backward)
+                tracker_pair_cache[view_idx] = tuple(
+                    value.detach() for value in cached_pair
+                )
+            tracker_flow, tracker_visibility = cached_pair[:2]
+            if bool(cfg.get("tracker_forward_backward_enabled", True)):
+                if len(cached_pair) != 4:
+                    raise RuntimeError(
+                        "Cached tracker pair lacks backward predictions."
+                    )
+                tracker_consistent, tracker_cycle_error = (
+                    forward_backward_tracker_consistency(
+                        tracker_flow,
+                        tracker_visibility,
+                        cached_pair[2],
+                        cached_pair[3],
+                        visibility_threshold=float(
+                            cfg.get("tracker_visibility_threshold", 0.8)
+                        ),
+                        absolute_threshold=float(
+                            cfg.get(
+                                "tracker_cycle_absolute_threshold",
+                                1.5,
+                            )
+                        ),
+                        relative_threshold=float(
+                            cfg.get(
+                                "tracker_cycle_relative_threshold",
+                                0.05,
+                            )
+                        ),
+                    )
+                )
+            else:
+                tracker_consistent = torch.ones_like(
+                    tracker_previous_support
+                )
+                tracker_cycle_error = torch.zeros_like(
+                    tracker_previous_support,
+                    dtype=tracker_flow.dtype,
+                )
+            consistent_support = (
+                tracker_previous_support & tracker_consistent
+            )
+            visibility_threshold = float(
+                cfg.get("tracker_visibility_threshold", 0.8)
+            )
+            tracker_coverage = forward_splat_tracker_coverage(
+                tracker_flow,
+                tracker_visibility,
+                consistent_support,
+                visibility_threshold=visibility_threshold,
+                coverage_threshold=float(
+                    cfg.get("tracker_coverage_threshold", 0.05)
+                ),
+                dilation_radius=int(cfg.get("tracker_dilation_radius", 1)),
+            )
+            valid_current_depth = geometry_valid_depth[:, view_idx, None]
+            tracker_append_mask = valid_current_depth & ~tracker_coverage
+            supported_count = (
+                tracker_previous_support.float().sum().clamp_min(1.0)
+            )
+            tracker_visibility_ratio = (
+                (
+                    (tracker_visibility[:, None] >= visibility_threshold)
+                    & tracker_previous_support
+                )
+                .float()
+                .sum()
+                / supported_count
+            )
+            consistent_count = consistent_support.float().sum()
+            tracker_fb_consistency_ratio = (
+                consistent_count / supported_count
+            )
+            tracker_cycle_error_mean = (
+                tracker_cycle_error.float() * consistent_support.float()
+            ).sum() / consistent_count.clamp_min(1.0)
         if (
             (
                 bool(cfg.get("old_opacity_gradient_enabled", False))
@@ -2873,13 +3939,68 @@ def _forward_experiment(
             global_step,
             old_gradient_evidence,
             old_mean_gradient_evidence,
+            tracker_append_mask,
+            tracker_coverage,
+            tracker_visibility_ratio,
         )
+        stats["tracker_fb_consistency_ratio"] = (
+            tracker_fb_consistency_ratio
+            if tracker_fb_consistency_ratio is not None
+            else features.new_zeros(())
+        )
+        stats["tracker_cycle_error_mean"] = (
+            tracker_cycle_error_mean
+            if tracker_cycle_error_mean is not None
+            else features.new_zeros(())
+        )
+        state, functional_stats = _apply_functional_gs_update(
+            model,
+            cfg,
+            state,
+            features,
+            images,
+            depth,
+            c2w,
+            intrinsic,
+            image_shape,
+            view_idx,
+        )
+        for key, value in functional_stats.items():
+            stats[f"functional_update_{key}"] = value
+        append_current_depth = depth[:, view_idx]
+        point_append_depth_scale = stats.get(
+            "_point_append_depth_scale",
+            append_current_depth.new_ones((append_current_depth.shape[0],)),
+        )
+        if append_enabled and bool(
+            cfg.get("point_append_align_depth_scale_enabled", False)
+        ):
+            if current_gaussians is None or anchor_point_map is None:
+                raise RuntimeError("Current DPT anchors were not constructed.")
+            current_gaussians, aligned_point_map = (
+                align_gaussians_to_camera_depth_scale(
+                    current_gaussians,
+                    c2w[:, view_idx],
+                    point_append_depth_scale,
+                    anchor_point_map,
+                )
+            )
+            if aligned_point_map is None:
+                raise RuntimeError(
+                    "Depth-scale alignment did not return a point map."
+                )
+            anchor_point_map = aligned_point_map
+            append_current_depth = append_current_depth * (
+                point_append_depth_scale[:, None, None].to(
+                    append_current_depth.dtype
+                )
+            )
         for key in OLD_OPACITY_GRADIENT_LOG_KEYS:
             stats.setdefault(key, features.new_zeros(()))
         for key in OLD_MEAN_GRADIENT_LOG_KEYS:
             stats.setdefault(key, features.new_zeros(()))
+        previous_gs_count = state.num_gaussians
         if append_enabled:
-            previous_gs_count = state.num_gaussians
             if current_gaussians is None or anchor_point_map is None:
                 raise RuntimeError("Current DPT anchors were not constructed.")
             if bool(cfg.get("new_residual_enabled", False)):
@@ -3004,7 +4125,7 @@ def _forward_experiment(
                     append_mask=stats["append_mask"],
                     current_feature=features[:, view_idx],
                     current_rgb=images[:, view_idx],
-                    current_depth=depth[:, view_idx, None],
+                    current_depth=append_current_depth[:, None],
                     current_depth_confidence=torch.ones_like(
                         depth[:, view_idx, None]
                     ),
@@ -3080,6 +4201,43 @@ def _forward_experiment(
             appended_gs = state.num_gaussians - previous_gs_count
         else:
             appended_gs = 0
+        state, symmetric_stats, anchor_child_stats = (
+            _apply_symmetric_multiview_update(
+            model,
+            cfg,
+            state,
+            images,
+            c2w,
+            intrinsic,
+            image_shape,
+            view_idx,
+            previous_gs_count,
+            )
+        )
+        if bool(cfg.get("point_map_follow_mean_updates_enabled", False)):
+            state = state.sync_point_map_to_means()
+        for key, value in symmetric_stats.items():
+            stats[f"symmetric_multiview_{key}"] = value
+        for key, value in anchor_child_stats.items():
+            stats[f"anchor_child_{key}"] = value
+        stats["residual_regularization"] = (
+            stats["residual_regularization"]
+            + symmetric_stats["regularization"]
+        )
+        if append_mode in {"tracker", "tracker_point_map"}:
+            if tracker_coverage is None or tracker_append_mask is None:
+                raise RuntimeError("Tracker append state is missing.")
+            tracker_previous_support = (
+                geometry_valid_depth[:, view_idx, None]
+                if append_mode == "tracker_point_map"
+                else tracker_coverage
+                | (
+                    tracker_append_mask
+                    if append_enabled
+                    else torch.zeros_like(tracker_append_mask)
+                )
+            ).detach()
+            tracker_previous_rgb = images[:, view_idx].detach()
         stats["appended_gs"] = appended_gs
         stats["append_ratio"] = stats["append_mask"].float().mean()
         current_render = _render(
@@ -3126,6 +4284,7 @@ def _forward_experiment(
         "base": base,
         "final_state": state,
         "base_render": base_render,
+        "base_residual_regularization": base_residual_regularization,
         "steps": steps,
         "final_input_render": final_input_render,
         "heldout_loss_render": heldout_loss_render,
@@ -3152,6 +4311,12 @@ def _summarize_step_stats(steps: list[dict[str, Any]]) -> dict[str, Any]:
     unique_gs = (
         int(torch.unique(torch.cat(updated_indices)).numel()) if updated_indices else 0
     )
+    point_depth_scales = torch.cat(
+        [
+            item["_point_append_depth_scale"].detach().float().reshape(-1)
+            for item in stats
+        ]
+    )
     summary = {
         "overlap_ratio": torch.stack([item["overlap_ratio"] for item in stats]).mean(),
         "old_coverage_ratio": torch.stack(
@@ -3168,6 +4333,27 @@ def _summarize_step_stats(steps: list[dict[str, Any]]) -> dict[str, Any]:
         ).mean(),
         "bad_ratio": torch.stack([item["bad_ratio"] for item in stats]).mean(),
         "append_ratio": torch.stack([item["append_ratio"] for item in stats]).mean(),
+        "point_coverage_ratio": torch.stack(
+            [item["point_coverage_ratio"] for item in stats]
+        ).mean(),
+        "tracker_coverage_ratio": torch.stack(
+            [item["tracker_coverage_ratio"] for item in stats]
+        ).mean(),
+        "tracker_point_union_coverage_ratio": torch.stack(
+            [item["tracker_point_union_coverage_ratio"] for item in stats]
+        ).mean(),
+        "confirmed_append_current_in_front_ratio": torch.stack(
+            [item["confirmed_append_current_in_front_ratio"] for item in stats]
+        ).mean(),
+        "tracker_visibility_ratio": torch.stack(
+            [item["tracker_visibility_ratio"] for item in stats]
+        ).mean(),
+        "tracker_fb_consistency_ratio": torch.stack(
+            [item["tracker_fb_consistency_ratio"] for item in stats]
+        ).mean(),
+        "tracker_cycle_error_mean": torch.stack(
+            [item["tracker_cycle_error_mean"] for item in stats]
+        ).mean(),
         "appended_gs": sum(int(item["appended_gs"]) for item in stats),
         "unique_gs": unique_gs,
         "residual_regularization": torch.stack(
@@ -3191,6 +4377,9 @@ def _summarize_step_stats(steps: list[dict[str, Any]]) -> dict[str, Any]:
         "point_front_decay_mass_ratio": torch.stack(
             [item["point_front_decay_mass_ratio"] for item in stats]
         ).mean(),
+        "point_append_depth_scale": point_depth_scales.mean(),
+        "point_append_depth_scale_min": point_depth_scales.min(),
+        "point_append_depth_scale_max": point_depth_scales.max(),
     }
     for key in RANK_UPDATE_LOG_KEYS:
         tensor_key = f"rank_{key}"
@@ -3203,6 +4392,27 @@ def _summarize_step_stats(steps: list[dict[str, Any]]) -> dict[str, Any]:
         summary[key] = torch.stack([item[key] for item in stats]).mean()
     for key in OLD_MEAN_GRADIENT_LOG_KEYS:
         summary[key] = torch.stack([item[key] for item in stats]).mean()
+    split_zero = summary["overlap_ratio"].new_zeros(())
+    for key in SPLIT_LOG_KEYS:
+        summary[key] = torch.stack(
+            [item.get(key, split_zero) for item in stats]
+        ).mean()
+    for key in FUNCTIONAL_GS_UPDATE_STAT_KEYS:
+        summary[f"functional_update_{key}"] = torch.stack(
+            [
+                item.get(f"functional_update_{key}", split_zero)
+                for item in stats
+            ]
+        ).mean()
+    for key in SYMMETRIC_GS_UPDATE_STAT_KEYS:
+        tensor_key = f"symmetric_multiview_{key}"
+        summary[tensor_key] = torch.stack(
+            [item.get(tensor_key, split_zero) for item in stats]
+        ).mean()
+    for tensor_key in ANCHOR_CHILD_LOG_KEYS:
+        summary[tensor_key] = torch.stack(
+            [item.get(tensor_key, split_zero) for item in stats]
+        ).mean()
     for key in NEW_RESIDUAL_LOG_KEYS:
         tensor_key = f"new_residual_{key}"
         summary[tensor_key] = torch.stack(
@@ -3228,6 +4438,16 @@ def _flatten_residual_update_stats(summary: dict[str, Any]) -> dict[str, float]:
         values[key] = float(summary[key].item())
     for key in OLD_MEAN_GRADIENT_LOG_KEYS:
         values[key] = float(summary[key].item())
+    for key in SPLIT_LOG_KEYS:
+        values[key] = float(summary[key].item())
+    for key in FUNCTIONAL_GS_UPDATE_STAT_KEYS:
+        tensor_key = f"functional_update_{key}"
+        values[tensor_key] = float(summary[tensor_key].item())
+    for key in SYMMETRIC_UPDATE_LOG_KEYS:
+        tensor_key = f"symmetric_multiview_{key}"
+        values[tensor_key] = float(summary[tensor_key].item())
+    for tensor_key in ANCHOR_CHILD_LOG_KEYS:
+        values[tensor_key] = float(summary[tensor_key].item())
     for key in NEW_RESIDUAL_LOG_KEYS:
         tensor_key = f"new_residual_{key}"
         values[tensor_key] = float(summary[tensor_key].item())
@@ -3328,6 +4548,24 @@ def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_d
         "old_mean_gradient_replay_weight": float(
             cfg.get("old_mean_gradient_replay_weight", 0.5)
         ),
+        "split_enabled": bool(cfg.get("split_enabled", False)),
+        "split_projected_radius_threshold": float(
+            cfg.get("split_projected_radius_threshold", 4.0)
+        ),
+        "split_mean_gradient_threshold": float(
+            cfg.get("split_mean_gradient_threshold", 1e-6)
+        ),
+        "split_max_ratio": float(cfg.get("split_max_ratio", 0.005)),
+        "split_max_generation": int(cfg.get("split_max_generation", 1)),
+        "anchor_child_enabled": bool(
+            cfg.get("anchor_child_enabled", False)
+        ),
+        "anchor_child_max_count": int(
+            cfg.get("anchor_child_max_count", 8)
+        ),
+        "anchor_child_max_gaussians": int(
+            cfg.get("anchor_child_max_gaussians", 500000)
+        ),
         "new_mean_gradient_enabled": bool(
             cfg.get("new_mean_gradient_enabled", False)
         ),
@@ -3341,6 +4579,22 @@ def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_d
             cfg.get("new_mean_gradient_replay_weight", 0.0)
         ),
         "append_mode": str(cfg.get("append_mode", "point_map")).lower(),
+        "tracker_visibility_threshold": float(
+            cfg.get("tracker_visibility_threshold", 0.8)
+        ),
+        "tracker_coverage_threshold": float(
+            cfg.get("tracker_coverage_threshold", 0.05)
+        ),
+        "tracker_dilation_radius": int(cfg.get("tracker_dilation_radius", 1)),
+        "tracker_forward_backward_enabled": bool(
+            cfg.get("tracker_forward_backward_enabled", True)
+        ),
+        "tracker_cycle_absolute_threshold": float(
+            cfg.get("tracker_cycle_absolute_threshold", 1.5)
+        ),
+        "tracker_cycle_relative_threshold": float(
+            cfg.get("tracker_cycle_relative_threshold", 0.05)
+        ),
         "point_append_depth_check_enabled": bool(
             cfg.get("point_append_depth_check_enabled", True)
         ),
@@ -3388,7 +4642,43 @@ def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_d
         "point_front_decay_mass_ratio": float(
             summary["point_front_decay_mass_ratio"].item()
         ),
+        "point_append_align_depth_scale_enabled": bool(
+            cfg.get("point_append_align_depth_scale_enabled", False)
+        ),
+        "point_map_follow_mean_updates_enabled": bool(
+            cfg.get("point_map_follow_mean_updates_enabled", False)
+        ),
+        "point_append_depth_scale": float(
+            summary["point_append_depth_scale"].item()
+        ),
+        "point_append_depth_scale_min": float(
+            summary["point_append_depth_scale_min"].item()
+        ),
+        "point_append_depth_scale_max": float(
+            summary["point_append_depth_scale_max"].item()
+        ),
         "append_ratio": float(summary["append_ratio"].item()),
+        "point_coverage_ratio": float(
+            summary["point_coverage_ratio"].item()
+        ),
+        "tracker_coverage_ratio": float(
+            summary["tracker_coverage_ratio"].item()
+        ),
+        "tracker_point_union_coverage_ratio": float(
+            summary["tracker_point_union_coverage_ratio"].item()
+        ),
+        "confirmed_append_current_in_front_ratio": float(
+            summary["confirmed_append_current_in_front_ratio"].item()
+        ),
+        "tracker_visibility_ratio": float(
+            summary["tracker_visibility_ratio"].item()
+        ),
+        "tracker_fb_consistency_ratio": float(
+            summary["tracker_fb_consistency_ratio"].item()
+        ),
+        "tracker_cycle_error_mean": float(
+            summary["tracker_cycle_error_mean"].item()
+        ),
         "appended_gs": int(summary["appended_gs"]),
         "final_gs_count": int(updated.means.shape[1]),
         "unique_updated_gs": int(summary["unique_gs"]),
@@ -3467,6 +4757,15 @@ def _evaluate(model, cfg, data, tokens, patch_start_idx, use_amp, step, output_d
     metrics["camera_loss"] = float(camera_losses["total"].item())
     metrics["camera_translation_loss"] = float(
         camera_losses["translation"].item()
+    )
+    metrics["camera_translation_shape_loss"] = float(
+        camera_losses["translation_shape"].item()
+    )
+    metrics["camera_translation_direction_loss"] = float(
+        camera_losses["translation_direction"].item()
+    )
+    metrics["camera_translation_alignment_scale"] = float(
+        camera_losses["translation_alignment_scale"].item()
     )
     metrics["camera_rotation_loss"] = float(camera_losses["rotation"].item())
     metrics["camera_focal_loss"] = float(camera_losses["focal"].item())
@@ -3771,6 +5070,47 @@ def main(cfg_dict: DictConfig) -> None:
     np.random.seed(int(cfg_dict.seed))
     device = torch.device("cuda:0")
     toy_cfg = cfg_dict.toy
+    if bool(toy_cfg.get("symmetric_multiview_update_enabled", False)):
+        OmegaConf.update(
+            cfg_dict,
+            "model.encoder.gir_symmetric_multiview_update_enabled",
+            True,
+            merge=False,
+        )
+        incompatible_paths = {
+            "toy.residual_enabled": False,
+            "toy.new_residual_enabled": False,
+            "toy.functional_update_enabled": False,
+            "toy.split_enabled": False,
+            "toy.opacity_decay_enabled": False,
+            "toy.new_gs_shared_decoder_enabled": False,
+            "toy.old_opacity_gradient_enabled": False,
+            "toy.new_opacity_gradient_enabled": False,
+            "toy.mean_gradient_enabled": False,
+            "toy.new_mean_gradient_enabled": False,
+            "model.encoder.gir_old_residual_enabled": False,
+            "model.encoder.gir_new_residual_enabled": False,
+            "model.encoder.gir_functional_update_enabled": False,
+            "model.encoder.gir_split_enabled": False,
+            "model.encoder.gir_old_decay_enabled": False,
+            "model.encoder.gir_old_delete_enabled": False,
+            "model.encoder.gir_new_gs_shared_decoder_enabled": False,
+            "model.encoder.gir_old_opacity_gradient_enabled": False,
+            "model.encoder.gir_new_opacity_gradient_enabled": False,
+            "model.encoder.gir_mean_gradient_enabled": False,
+            "model.encoder.gir_new_mean_gradient_enabled": False,
+        }
+        disabled = []
+        for path, value in incompatible_paths.items():
+            if bool(OmegaConf.select(cfg_dict, path, default=False)):
+                disabled.append(path)
+            OmegaConf.update(cfg_dict, path, value, merge=False)
+        if disabled:
+            print(
+                "Symmetric multiview mode disabled incompatible legacy paths: "
+                + ", ".join(disabled)
+            )
+        toy_cfg = cfg_dict.toy
     output_dir = Path(HydraConfig.get()["runtime"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(cfg_dict, output_dir / "resolved_config.yaml", resolve=True)
@@ -3789,6 +5129,7 @@ def main(cfg_dict: DictConfig) -> None:
         toy_cfg.get("new_opacity_gradient_enabled", False)
     )
     mean_gradient_enabled = bool(toy_cfg.get("mean_gradient_enabled", False))
+    split_enabled = bool(toy_cfg.get("split_enabled", False))
     if (
         old_opacity_gradient_enabled
         and residual_enabled
@@ -3803,6 +5144,17 @@ def main(cfg_dict: DictConfig) -> None:
     ):
         raise ValueError(
             "Old-GS mean-gradient conditioning requires residuals and "
+            "toy.residual_mode=projected_shared."
+        )
+    if split_enabled and not mean_gradient_enabled:
+        raise ValueError(
+            "Old-GS splitting requires toy.mean_gradient_enabled=true."
+        )
+    if split_enabled and (
+        not residual_enabled or residual_mode != "projected_shared"
+    ):
+        raise ValueError(
+            "Old-GS splitting requires residuals and "
             "toy.residual_mode=projected_shared."
         )
     residual_topk = max(1, int(toy_cfg.get("residual_topk", 1)))
@@ -3823,6 +5175,9 @@ def main(cfg_dict: DictConfig) -> None:
     new_residual_enabled = bool(
         toy_cfg.get("new_residual_enabled", False)
     )
+    symmetric_update_enabled = bool(
+        toy_cfg.get("symmetric_multiview_update_enabled", False)
+    )
     if new_opacity_gradient_enabled and not new_residual_enabled:
         raise ValueError(
             "New-GS opacity-gradient conditioning requires "
@@ -3841,6 +5196,42 @@ def main(cfg_dict: DictConfig) -> None:
             "projected_shared includes front-surface opacity decay; set "
             "toy.opacity_decay_enabled=false."
         )
+    if split_enabled and opacity_decay_enabled:
+        raise ValueError(
+            "The first old-GS splitting implementation cannot be combined "
+            "with toy.opacity_decay_enabled=true."
+        )
+    if symmetric_update_enabled and any(
+        (
+            residual_enabled,
+            new_residual_enabled,
+            bool(toy_cfg.get("functional_update_enabled", False)),
+            split_enabled,
+            opacity_decay_enabled,
+            bool(toy_cfg.get("new_gs_shared_decoder_enabled", False)),
+        )
+    ):
+        raise ValueError(
+            "toy.symmetric_multiview_update_enabled requires the original "
+            "dense gs_head and replaces old/new residuals, functional updates, "
+            "splitting, and opacity decay. Disable those paths to avoid "
+            "applying multiple map updates."
+        )
+    anchor_child_enabled = bool(
+        toy_cfg.get("anchor_child_enabled", False)
+    )
+    if anchor_child_enabled and not symmetric_update_enabled:
+        raise ValueError(
+            "toy.anchor_child_enabled requires "
+            "toy.symmetric_multiview_update_enabled=true."
+        )
+    if anchor_child_enabled and str(
+        toy_cfg.get("append_mode", "point_map")
+    ).lower() != "point_map":
+        raise ValueError(
+            "The first anchor-child implementation requires "
+            "toy.append_mode=point_map."
+        )
     raw_scale_residual = bool(toy_cfg.get("raw_scale_residual", False))
     raw_opacity_residual = bool(toy_cfg.get("raw_opacity_residual", False))
     raw_rotation_residual = bool(toy_cfg.get("raw_rotation_residual", False))
@@ -3857,6 +5248,66 @@ def main(cfg_dict: DictConfig) -> None:
         )
     root_cfg = load_typed_root_config(cfg_dict)
     model = get_model(root_cfg.model.encoder, root_cfg.model.decoder)
+    if bool(toy_cfg.get("symmetric_multiview_update_enabled", False)) and getattr(
+        model, "gir_symmetric_update_head", None
+    ) is None:
+        model.gir_symmetric_update_head = SymmetricGSResidualHead(
+            harmonic_dim=model.encoder.nums_sh * 3,
+            hidden_dim=int(
+                toy_cfg.get(
+                    "symmetric_multiview_hidden_dim",
+                    getattr(
+                        model.encoder.cfg,
+                        "gir_symmetric_multiview_hidden_dim",
+                        128,
+                    ),
+                )
+            ),
+            chunk_size=int(
+                toy_cfg.get(
+                    "symmetric_multiview_chunk_size",
+                    getattr(
+                        model.encoder.cfg,
+                        "gir_symmetric_multiview_chunk_size",
+                        65536,
+                    ),
+                )
+            ),
+            visual_enabled=bool(
+                toy_cfg.get(
+                    "symmetric_multiview_visual_enabled",
+                    getattr(
+                        model.encoder.cfg,
+                        "gir_symmetric_multiview_visual_enabled",
+                        False,
+                    ),
+                )
+            ),
+            visual_feature_dim=int(
+                toy_cfg.get(
+                    "symmetric_multiview_visual_feature_dim",
+                    getattr(
+                        model.encoder.cfg,
+                        "gir_symmetric_multiview_visual_feature_dim",
+                        24,
+                    ),
+                )
+            ),
+            visual_hidden_dim=int(
+                toy_cfg.get(
+                    "symmetric_multiview_visual_hidden_dim",
+                    getattr(
+                        model.encoder.cfg,
+                        "gir_symmetric_multiview_visual_hidden_dim",
+                        32,
+                    ),
+                )
+            ),
+        )
+        print(
+            "Constructed missing gir_symmetric_update_head from the resolved "
+            "overfit configuration."
+        )
     model_residual_mode = str(
         getattr(model.encoder.cfg, "gir_old_update_mode", "pixel_topk")
     ).lower()
@@ -3866,6 +5317,25 @@ def main(cfg_dict: DictConfig) -> None:
             "mode: toy.residual_mode="
             f"{residual_mode!r}, model.encoder.gir_old_update_mode="
             f"{model_residual_mode!r}."
+        )
+    shared_new_decoder_enabled = bool(
+        toy_cfg.get("new_gs_shared_decoder_enabled", False)
+    )
+    model_shared_new_decoder_enabled = bool(
+        getattr(model.encoder.cfg, "gir_new_gs_shared_decoder_enabled", False)
+    )
+    if shared_new_decoder_enabled != model_shared_new_decoder_enabled:
+        raise ValueError(
+            "The overfit rollout and encoder must agree on shared new-GS "
+            "decoding: toy.new_gs_shared_decoder_enabled="
+            f"{shared_new_decoder_enabled}, "
+            "model.encoder.gir_new_gs_shared_decoder_enabled="
+            f"{model_shared_new_decoder_enabled}."
+        )
+    if shared_new_decoder_enabled and not new_residual_enabled:
+        raise ValueError(
+            "toy.new_gs_shared_decoder_enabled=true requires "
+            "toy.new_residual_enabled=true."
         )
     if (
         residual_mode == "pixel_topk"
@@ -3880,7 +5350,9 @@ def main(cfg_dict: DictConfig) -> None:
     train_gaussian_param_head = bool(
         toy_cfg.get("train_gaussian_param_head", True)
     )
-    train_gs_head = bool(toy_cfg.get("train_gs_head", True))
+    train_gs_head = bool(toy_cfg.get("train_gs_head", True)) and not (
+        shared_new_decoder_enabled
+    )
     train_depth_head = bool(toy_cfg.train_depth_head)
     depth_loss_enabled = bool(toy_cfg.depth_loss_enabled)
     depth_loss_target = str(toy_cfg.get("depth_loss_target", "dav3")).lower()
@@ -3900,6 +5372,26 @@ def main(cfg_dict: DictConfig) -> None:
             "toy.dav3_align_to_gt_camera_scale=true."
         )
     train_camera_head = bool(toy_cfg.train_camera_head)
+    reconstruction_backbone = str(
+        model.encoder.cfg.reconstruction_backbone
+    ).lower()
+    if reconstruction_backbone == "abot":
+        if train_camera_head:
+            print(
+                "ABot camera poses are frozen; ignoring "
+                "toy.train_camera_head=true."
+            )
+        train_camera_head = False
+        if (
+            train_depth_head
+            and str(model.encoder.cfg.depth_head_source).lower() == "native"
+        ):
+            print(
+                "ABot native point-map depth is frozen; ignoring "
+                "toy.train_depth_head=true and disabling its constant depth loss."
+            )
+            train_depth_head = False
+            depth_loss_enabled = False
     heldout_loss_enabled = bool(toy_cfg.heldout_loss_enabled)
     print(f"Old-GS residual enabled: {residual_enabled}")
     print(f"Old-GS residual mode: {residual_mode}")
@@ -3968,6 +5460,15 @@ def main(cfg_dict: DictConfig) -> None:
         f"enabled={new_residual_enabled}, "
         "parameterization=shared_with_old_gs"
     )
+    if shared_new_decoder_enabled:
+        print(
+            "Shared new-GS decoder: analytic anchors for the first frame and "
+            "point-map-selected later pixels; dense gs_head frozen; "
+            "base_opacity="
+            f"{float(model.encoder.cfg.gir_new_gs_shared_decoder_base_opacity):g}, "
+            "scale_multiplier="
+            f"{float(model.encoder.cfg.gir_new_gs_shared_decoder_scale_multiplier):g}"
+        )
     print(
         "Opacity-gradient evidence: "
         f"old_enabled={old_opacity_gradient_enabled}, "
@@ -3994,6 +5495,48 @@ def main(cfg_dict: DictConfig) -> None:
         f"{float(toy_cfg.get('old_mean_gradient_current_weight', 1.0)):g}, "
         "replay_weight="
         f"{float(toy_cfg.get('old_mean_gradient_replay_weight', 0.5)):g}"
+    )
+    print(
+        "Old-GS deterministic splitting: "
+        f"enabled={split_enabled}, "
+        "radius_threshold="
+        f"{float(toy_cfg.get('split_projected_radius_threshold', 4.0)):g}px, "
+        "gradient_threshold="
+        f"{float(toy_cfg.get('split_mean_gradient_threshold', 1e-6)):g}, "
+        f"max_ratio={float(toy_cfg.get('split_max_ratio', 0.005)):g}, "
+        f"max_generation={int(toy_cfg.get('split_max_generation', 1))}, "
+        f"warmup_steps={int(toy_cfg.get('split_warmup_steps', 1000))}"
+    )
+    print(
+        "Old-GS functional RGB update: "
+        f"enabled={bool(toy_cfg.get('functional_update_enabled', False))}, "
+        f"replay_views={int(toy_cfg.get('functional_update_replay_views', 2))}, "
+        f"top_ratio={float(toy_cfg.get('functional_update_top_ratio', 0.05)):g}, "
+        "parameters="
+        f"mean:{bool(toy_cfg.get('functional_update_mean_enabled', True))},"
+        f"opacity:{bool(toy_cfg.get('functional_update_opacity_enabled', True))},"
+        f"harmonics:{bool(toy_cfg.get('functional_update_harmonics_enabled', True))}"
+    )
+    print(
+        "Symmetric all-view learned GS update: "
+        f"enabled={bool(toy_cfg.get('symmetric_multiview_update_enabled', False))}, "
+        "gradient_view_weighting=equal, temporal_roles=none, "
+        "visual_context="
+        f"{bool(toy_cfg.get('symmetric_multiview_visual_enabled', False))}, "
+        "visual_aggregation=alpha/depth/opacity, "
+        "parameters=mean/rotation/scale/opacity/harmonics"
+    )
+    print(
+        "Point-map anchor children: "
+        f"enabled={bool(toy_cfg.get('anchor_child_enabled', False))}, "
+        f"max_count={int(toy_cfg.get('anchor_child_max_count', 8))}, "
+        f"add_count={int(toy_cfg.get('anchor_child_add_count', 1))}, "
+        f"max_ratio={float(toy_cfg.get('anchor_child_max_ratio', 0.05)):g}, "
+        "gradient/coherence/conflict="
+        f"{float(toy_cfg.get('anchor_child_gradient_threshold', 0.05)):g}/"
+        f"{float(toy_cfg.get('anchor_child_coherence_threshold', 0.5)):g}/"
+        f"{float(toy_cfg.get('anchor_child_max_conflict_ratio', 0.25)):g}, "
+        f"max_gaussians={int(toy_cfg.get('anchor_child_max_gaussians', 500000))}"
     )
     print(
         "New-GS camera-space mean-gradient evidence: "
@@ -4027,6 +5570,12 @@ def main(cfg_dict: DictConfig) -> None:
         )
     print(f"Train camera head: {train_camera_head}")
     print(
+        "Camera supervision: pose_mode="
+        f"{str(toy_cfg.get('camera_pose_loss_mode', 'first_relative')).lower()}, "
+        "translation_direction_weight="
+        f"{float(toy_cfg.get('camera_translation_direction_weight', 0.1)):g}"
+    )
+    print(
         f"Reconstruction backbone: {model.encoder.cfg.reconstruction_backbone}; "
         "share first-frame predicted intrinsics: "
         f"{model.encoder.cfg.share_first_frame_intrinsics}"
@@ -4044,17 +5593,49 @@ def main(cfg_dict: DictConfig) -> None:
         "Historical state detach mode before each new view: "
         f"{_historical_detach_mode(toy_cfg)}"
     )
+    append_mode = str(toy_cfg.get("append_mode", "point_map")).lower()
+    tracker_backend = str(
+        getattr(model.encoder.cfg, "gir_tracker_backend", "spot")
+    ).lower()
     print(
         "Append mode: "
-        f"{str(toy_cfg.get('append_mode', 'point_map')).lower()} "
-        "(point_map=uncovered historical point projection, "
+        f"{append_mode} "
+        f"(tracker=rolling previous-frame {tracker_backend} coverage only, "
+        "tracker_point_map=tracker/global depth-consistent union, "
+        "point_map=uncovered historical point projection, "
         "all=every valid current pixel)"
     )
-    print(
-        "Point-map append depth check: "
-        f"{bool(toy_cfg.get('point_append_depth_check_enabled', True))} "
-        "(False=projection coverage only; True=depth-consistent coverage)"
-    )
+    if append_mode in {"tracker", "tracker_point_map"}:
+        print(
+            f"{tracker_backend} tracker append: visibility_threshold="
+            f"{float(toy_cfg.get('tracker_visibility_threshold', 0.8)):g}, "
+            "coverage_threshold="
+            f"{float(toy_cfg.get('tracker_coverage_threshold', 0.05)):g}, "
+            "dilation_radius="
+            f"{int(toy_cfg.get('tracker_dilation_radius', 1))}, "
+            "forward_backward="
+            f"{bool(toy_cfg.get('tracker_forward_backward_enabled', True))}, "
+            "cycle_threshold="
+            f"{float(toy_cfg.get('tracker_cycle_absolute_threshold', 1.5)):g}"
+            "+"
+            f"{float(toy_cfg.get('tracker_cycle_relative_threshold', 0.05)):g}"
+            "*motion"
+        )
+    if append_mode in {"point_map", "tracker_point_map"}:
+        print(
+            "Point-map append depth check: "
+            f"{bool(toy_cfg.get('point_append_depth_check_enabled', True))} "
+            "(False=projection coverage only; True=depth-consistent coverage)"
+        )
+        print(
+            "Point-map append depth-scale alignment: "
+            f"{bool(toy_cfg.get('point_append_align_depth_scale_enabled', False))} "
+            "(aligns new GS means/scales to the historical map)"
+        )
+        print(
+            "Point-map follows residual-updated means: "
+            f"{bool(toy_cfg.get('point_map_follow_mean_updates_enabled', False))}"
+        )
     if depth_loss_enabled and not train_depth_head:
         raise ValueError(
             "toy.depth_loss_enabled=true requires toy.train_depth_head=true."
@@ -4153,6 +5734,7 @@ def main(cfg_dict: DictConfig) -> None:
         "gs_head": float(toy_cfg.gs_head_lr),
         "old_residual_head": float(toy_cfg.residual_head_lr),
         "projected_residual_head": float(toy_cfg.residual_head_lr),
+        "symmetric_residual_head": float(toy_cfg.residual_head_lr),
         "camera_head": float(toy_cfg.camera_head_lr),
     }
     optimizer_groups = [
@@ -4206,6 +5788,10 @@ def main(cfg_dict: DictConfig) -> None:
         model.gir_projected_update_head.train(
             (residual_enabled and residual_mode == "projected_shared")
             or new_residual_enabled
+        )
+    if model.gir_symmetric_update_head is not None:
+        model.gir_symmetric_update_head.train(
+            bool(toy_cfg.get("symmetric_multiview_update_enabled", False))
         )
 
     _inherit_resume_logs(resume_state, output_dir)
@@ -4323,7 +5909,10 @@ def main(cfg_dict: DictConfig) -> None:
             else:
                 loss_heldout = loss_base_first.new_zeros(())
             summary = _summarize_step_stats(result["steps"])
-            loss_regularization = summary["residual_regularization"]
+            loss_regularization = (
+                summary["residual_regularization"]
+                + result["base_residual_regularization"]
+            )
             decay_warmup_steps = max(
                 0, int(toy_cfg.get("opacity_decay_warmup_steps", 0))
             )
@@ -4422,6 +6011,15 @@ def main(cfg_dict: DictConfig) -> None:
                 "loss_camera_translation": float(
                     camera_losses["translation"].item()
                 ),
+                "loss_camera_translation_shape": float(
+                    camera_losses["translation_shape"].item()
+                ),
+                "loss_camera_translation_direction": float(
+                    camera_losses["translation_direction"].item()
+                ),
+                "camera_translation_alignment_scale": float(
+                    camera_losses["translation_alignment_scale"].item()
+                ),
                 "loss_camera_rotation": float(camera_losses["rotation"].item()),
                 "loss_camera_focal": float(camera_losses["focal"].item()),
                 "loss_heldout": float(loss_heldout.item()),
@@ -4445,6 +6043,29 @@ def main(cfg_dict: DictConfig) -> None:
                 ),
                 "bad_ratio": float(summary["bad_ratio"].item()),
                 "append_ratio": float(summary["append_ratio"].item()),
+                "point_coverage_ratio": float(
+                    summary["point_coverage_ratio"].item()
+                ),
+                "tracker_coverage_ratio": float(
+                    summary["tracker_coverage_ratio"].item()
+                ),
+                "tracker_point_union_coverage_ratio": float(
+                    summary["tracker_point_union_coverage_ratio"].item()
+                ),
+                "confirmed_append_current_in_front_ratio": float(
+                    summary[
+                        "confirmed_append_current_in_front_ratio"
+                    ].item()
+                ),
+                "tracker_visibility_ratio": float(
+                    summary["tracker_visibility_ratio"].item()
+                ),
+                "tracker_fb_consistency_ratio": float(
+                    summary["tracker_fb_consistency_ratio"].item()
+                ),
+                "tracker_cycle_error_mean": float(
+                    summary["tracker_cycle_error_mean"].item()
+                ),
                 "appended_gs": int(summary["appended_gs"]),
                 "unique_updated_gs": int(summary["unique_gs"]),
                 "opacity_decay_candidate_probability": float(
@@ -4464,6 +6085,15 @@ def main(cfg_dict: DictConfig) -> None:
                 ),
                 "point_front_decay_mass_ratio": float(
                     summary["point_front_decay_mass_ratio"].item()
+                ),
+                "point_append_depth_scale": float(
+                    summary["point_append_depth_scale"].item()
+                ),
+                "point_append_depth_scale_min": float(
+                    summary["point_append_depth_scale_min"].item()
+                ),
+                "point_append_depth_scale_max": float(
+                    summary["point_append_depth_scale_max"].item()
                 ),
             }
             train_row.update(_flatten_residual_update_stats(summary))
@@ -4487,6 +6117,10 @@ def main(cfg_dict: DictConfig) -> None:
                     f"replay_mean={loss_replay_history.item():.6f} "
                     f"depth={loss_depth.item():.6f} "
                     f"depth_s={depth_alignment_scale.median().item():.4f} "
+                    "append_s="
+                    f"{summary['point_append_depth_scale'].item():.4f}"
+                    f"[{summary['point_append_depth_scale_min'].item():.4f},"
+                    f"{summary['point_append_depth_scale_max'].item():.4f}] "
                     f"camera={loss_camera.item():.6f} "
                     f"heldout={loss_heldout.item():.6f} "
                     f"decay_p={summary['opacity_decay_candidate_probability'].item():.3f} "
@@ -4494,6 +6128,20 @@ def main(cfg_dict: DictConfig) -> None:
                     f"front_conflict={summary['point_front_conflict_ratio'].item():.3%} "
                     f"front_grad_gate={summary['point_front_gradient_decay_gate_ratio'].item():.3%} "
                     f"fixed_decay={summary['point_front_decay_mass_ratio'].item():.3%} "
+                    "tracker_coverage="
+                    f"{summary['tracker_coverage_ratio'].item():.2%} "
+                    "point_coverage="
+                    f"{summary['point_coverage_ratio'].item():.2%} "
+                    "union_coverage="
+                    f"{summary['tracker_point_union_coverage_ratio'].item():.2%} "
+                    "append_front="
+                    f"{summary['confirmed_append_current_in_front_ratio'].item():.2%} "
+                    "tracker_visibility="
+                    f"{summary['tracker_visibility_ratio'].item():.2%} "
+                    "tracker_fb="
+                    f"{summary['tracker_fb_consistency_ratio'].item():.2%} "
+                    "cycle_error="
+                    f"{summary['tracker_cycle_error_mean'].item():.3f}px "
                     f"coverage={summary['old_coverage_ratio'].item():.2%} "
                     f"consistent={summary['depth_consistent_ratio'].item():.2%} "
                     f"new_front={summary['current_in_front_ratio'].item():.2%} "
@@ -4501,6 +6149,34 @@ def main(cfg_dict: DictConfig) -> None:
                     f"bad={summary['bad_ratio'].item():.2%} "
                     f"updated_gs={int(summary['unique_gs'])} "
                     f"appended_gs={int(summary['appended_gs'])} "
+                    "inner="
+                    f"{summary['functional_update_selected_ratio'].item():.2%} "
+                    "inner_mean="
+                    f"{summary['functional_update_mean_step_norm'].item():.2e} "
+                    "inner_opacity="
+                    f"{summary['functional_update_opacity_logit_step_abs'].item():.2e} "
+                    "inner_sh="
+                    f"{summary['functional_update_harmonics_step_norm'].item():.2e} "
+                    "symmetric_active="
+                    f"{summary['symmetric_multiview_active_ratio'].item():.2%} "
+                    "symmetric_views="
+                    f"{summary['symmetric_multiview_visible_views_mean'].item():.2f} "
+                    "symmetric_coherence="
+                    f"{summary['symmetric_multiview_mean_coherence'].item():.3f} "
+                    "symmetric_conflict="
+                    f"{summary['symmetric_multiview_mean_conflict_ratio'].item():.2%} "
+                    "symmetric_mean="
+                    f"{summary['symmetric_multiview_mean_shift_mean'].item():.2e} "
+                    "symmetric_opacity="
+                    f"{summary['symmetric_multiview_opacity_shift_mean'].item():.2e} "
+                    "symmetric_sh="
+                    f"{summary['symmetric_multiview_harmonics_shift_mean'].item():.2e} "
+                    "visual_views="
+                    f"{summary['symmetric_multiview_visual_visible_views_mean'].item():.2f} "
+                    "visual_weight="
+                    f"{summary['symmetric_multiview_visual_weight_mean'].item():.3f} "
+                    "visual_norm="
+                    f"{summary['symmetric_multiview_visual_feature_norm'].item():.3f} "
                     f"rank_mean_eff=[{rank_effective_mean}] "
                     f"rank_mult=[{rank_multiplier}] "
                     f"map_mean={summary['map_mean_shift_mean'].item():.2e} "

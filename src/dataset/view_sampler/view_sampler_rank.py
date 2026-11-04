@@ -22,6 +22,7 @@ class ViewSamplerRankCfg:
     initial_min_distance_between_context_views: int
     initial_max_distance_between_context_views: int
     max_img_per_gpu: int
+    min_context_views: int = 4
 
 
 def rotation_angle(R1, R2):

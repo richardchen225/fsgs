@@ -320,10 +320,27 @@ class MixedBatchSampler(BatchSampler):
             if hasattr(ds, "set_epoch"):
                 ds.set_epoch(0)
             # AnySplat splits the sampled sequence into source/held-out halves.
-            # Old-only refinement needs at least two source views, hence at
-            # least four total sampled views during training.
-            max_context_views = ds.cfg.view_sampler.num_context_views
-            min_context_views = min(4, max_context_views)
+            # Let experiments raise the lower bound when downstream geometry
+            # needs more source cameras, such as three-camera Sim(3).
+            max_context_views = int(ds.cfg.view_sampler.num_context_views)
+            min_context_views = int(
+                getattr(ds.cfg.view_sampler, "min_context_views", 4)
+            )
+            if min_context_views < 2:
+                raise ValueError(
+                    "view_sampler.min_context_views must be at least 2, got "
+                    f"{min_context_views}."
+                )
+            if max_context_views < min_context_views:
+                raise ValueError(
+                    "view_sampler.num_context_views must be no smaller than "
+                    "view_sampler.min_context_views, got "
+                    f"max={max_context_views}, min={min_context_views}."
+                )
+            print(
+                "Dynamic context view range for "
+                f"{type(ds).__name__}: {min_context_views}..{max_context_views}"
+            )
             batch_sampler = DynamicBatchSampler(
                 sampler, 
                 [min_context_views, max_context_views],
