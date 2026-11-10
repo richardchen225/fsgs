@@ -5,7 +5,6 @@ from functools import cached_property
 from pathlib import Path
 from typing import Literal, Optional
 import os
-import traceback
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -25,6 +24,85 @@ from .view_sampler import ViewSampler
 from ..misc.cam_utils import camera_normalization
 from ..evaluation.benchmark_io import discover_scenes, image_8_path
 from .shims.load_shim import imread_cv2
+
+
+def _validate_camera_parameters(
+    extrinsics: Tensor,
+    intrinsics: Tensor,
+    *,
+    label: str,
+    frame_indices: Tensor | None = None,
+) -> None:
+    """Reject malformed cameras before they reach the GPU renderer."""
+    if extrinsics.ndim != 3 or extrinsics.shape[-2:] != (4, 4):
+        raise ValueError(
+            f"{label}: expected camera poses [V,4,4], got {tuple(extrinsics.shape)}."
+        )
+    if intrinsics.shape != (extrinsics.shape[0], 3, 3):
+        raise ValueError(
+            f"{label}: expected intrinsics {(extrinsics.shape[0], 3, 3)}, "
+            f"got {tuple(intrinsics.shape)}."
+        )
+
+    poses = extrinsics.detach().float()
+    cameras = intrinsics.detach().float()
+    rotation = poses[:, :3, :3]
+    identity = torch.eye(3, device=rotation.device, dtype=rotation.dtype)
+    expected_bottom = poses.new_tensor([0.0, 0.0, 0.0, 1.0])
+
+    pose_finite = torch.isfinite(poses).all(dim=(-2, -1))
+    determinant = torch.linalg.det(rotation)
+    orthogonality_error = (
+        rotation.transpose(-1, -2) @ rotation - identity
+    ).abs().amax(dim=(-2, -1))
+    bottom_error = (poses[:, 3] - expected_bottom).abs().amax(dim=-1)
+    pose_valid = (
+        pose_finite
+        & torch.isfinite(determinant)
+        & torch.isfinite(orthogonality_error)
+        & ((determinant - 1.0).abs() <= 5.0e-2)
+        & (orthogonality_error <= 5.0e-2)
+        & (bottom_error <= 1.0e-4)
+    )
+
+    intrinsic_finite = torch.isfinite(cameras).all(dim=(-2, -1))
+    focal_valid = (cameras[:, 0, 0] > 1.0e-8) & (
+        cameras[:, 1, 1] > 1.0e-8
+    )
+    intrinsic_bottom = cameras.new_tensor([0.0, 0.0, 1.0])
+    intrinsic_bottom_error = (
+        cameras[:, 2] - intrinsic_bottom
+    ).abs().amax(dim=-1)
+    intrinsic_valid = (
+        intrinsic_finite
+        & focal_valid
+        & (intrinsic_bottom_error <= 1.0e-4)
+    )
+
+    valid = pose_valid & intrinsic_valid
+    if bool(valid.all()):
+        return
+
+    bad_local_indices = torch.nonzero(~valid, as_tuple=False).flatten()
+    if frame_indices is None:
+        bad_frame_indices = bad_local_indices
+    else:
+        bad_frame_indices = frame_indices.detach().cpu()[bad_local_indices.cpu()]
+    preview = []
+    for local_idx, frame_idx in zip(
+        bad_local_indices[:8].tolist(), bad_frame_indices[:8].tolist()
+    ):
+        preview.append(
+            f"frame={frame_idx}, det={determinant[local_idx].item():.6g}, "
+            f"orth_err={orthogonality_error[local_idx].item():.6g}, "
+            f"bottom_err={bottom_error[local_idx].item():.6g}, "
+            f"fx={cameras[local_idx, 0, 0].item():.6g}, "
+            f"fy={cameras[local_idx, 1, 1].item():.6g}"
+        )
+    raise ValueError(
+        f"{label}: invalid GT camera parameters at "
+        + "; ".join(preview)
+    )
 
 
 @dataclass
@@ -376,6 +454,16 @@ class DatasetDL3DV(Dataset):
         else:
             context_indices = torch.as_tensor(self.cfg.ctx_list, dtype=torch.long)
             target_indices = torch.as_tensor(self.cfg.tgt_list, dtype=torch.long)
+
+        selected_indices = torch.unique(
+            torch.cat([context_indices, target_indices]), sorted=True
+        )
+        _validate_camera_parameters(
+            extrinsics[selected_indices],
+            intrinsics[selected_indices],
+            label=f"DL3DV scene {scene} raw cameras",
+            frame_indices=selected_indices,
+        )
         
         if (get_fov(intrinsics).rad2deg() > self.cfg.max_fov).any():
             raise Exception("Field of view too wide")
@@ -442,6 +530,13 @@ class DatasetDL3DV(Dataset):
             rescale_factor = 1 * scene_scale
             extrinsics[:, :3, 3] /= rescale_factor
 
+        _validate_camera_parameters(
+            extrinsics[selected_indices],
+            intrinsics[selected_indices],
+            label=f"DL3DV scene {scene} normalized cameras",
+            frame_indices=selected_indices,
+        )
+
         # Depth is expressed in the same camera/world unit as the camera
         # translations.  Apply the exact scene normalization used above.
         if context_depth is not None:
@@ -489,20 +584,41 @@ class DatasetDL3DV(Dataset):
     def __getitem__(self, index_tuple: tuple) -> dict:
         index, num_context_views, patchsize_h = index_tuple
         patchsize_w = self.cfg.input_image_shape[1] // 14
-        # patchsize_w = 37
-        # patchsize_h = 18
-        try:
-            return self.getitem(index, num_context_views, (patchsize_h, patchsize_w))
-        except Exception as e:
-            if self.stage == "test":
-                raise RuntimeError(
-                    f"DL3DV test scene {self.scene_ids[index]} failed; "
-                    "test scenes must not be replaced with random samples."
-                ) from e
-            print(f"Error: {e}")
-            traceback.print_exc()
-            index = np.random.randint(len(self))
-            return self.__getitem__((index, num_context_views, patchsize_h))
+        max_attempts = min(max(len(self), 1), 64)
+        attempted_scenes = []
+        last_error = None
+        current_index = int(index)
+
+        for attempt in range(max_attempts):
+            scene_id = self.scene_ids[current_index]
+            try:
+                return self.getitem(
+                    current_index,
+                    num_context_views,
+                    (patchsize_h, patchsize_w),
+                )
+            except Exception as error:
+                if self.stage == "test":
+                    raise RuntimeError(
+                        f"DL3DV test scene {scene_id} failed; test scenes must "
+                        "not be replaced with random samples."
+                    ) from error
+                last_error = error
+                attempted_scenes.append(str(scene_id))
+                if attempt < 3:
+                    print(
+                        "[DL3DV retry] "
+                        f"attempt={attempt + 1}/{max_attempts}, "
+                        f"scene={scene_id}, "
+                        f"error={type(error).__name__}: {error}"
+                    )
+                current_index = int(np.random.randint(len(self)))
+
+        preview = ", ".join(attempted_scenes[:8])
+        raise RuntimeError(
+            f"DL3DV failed to produce a valid {self.stage} sample after "
+            f"{max_attempts} attempts. Attempted scenes: {preview}."
+        ) from last_error
 
     def get_bound(
         self,

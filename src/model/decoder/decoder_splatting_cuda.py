@@ -73,6 +73,24 @@ def _invert_rigid_camera_poses(camera_to_world: Tensor) -> Tensor:
         )
     rotation_c2w = camera_to_world[..., :3, :3]
     translation_c2w = camera_to_world[..., :3, 3:4]
+    with torch.no_grad():
+        finite = torch.isfinite(camera_to_world).all(dim=(-2, -1))
+        determinant = torch.linalg.det(rotation_c2w.detach().float())
+        invertible = finite & torch.isfinite(determinant) & (
+            determinant.abs() > 1.0e-6
+        )
+        if not bool(invertible.all()):
+            bad = torch.nonzero(~invertible, as_tuple=False)
+            preview = []
+            for index in bad[:8]:
+                index_tuple = tuple(int(value) for value in index.tolist())
+                preview.append(
+                    f"index={index_tuple}, det={determinant[index_tuple].item():.6g}"
+                )
+            raise ValueError(
+                "Cannot render non-finite or singular camera_to_world poses: "
+                + "; ".join(preview)
+            )
     rotation_w2c = rotation_c2w.transpose(-1, -2)
     translation_w2c = -(rotation_w2c @ translation_c2w)
     top = torch.cat([rotation_w2c, translation_w2c], dim=-1)
@@ -299,7 +317,9 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             scales = gaussians.scales[batch_idx].float()
             rotations = gaussians.rotations[batch_idx].float()
             opacities = gaussians.opacities[batch_idx].float()
-            world_to_camera = extrinsics[batch_idx : batch_idx + 1].float().inverse()
+            world_to_camera = _invert_rigid_camera_poses(
+                extrinsics[batch_idx : batch_idx + 1].float()
+            )
             intrinsics_px = intrinsics[batch_idx : batch_idx + 1].float().clone()
             intrinsics_px[:, 0] *= w
             intrinsics_px[:, 1] *= h
@@ -569,7 +589,9 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             scales = gaussians.scales[batch_idx].float()
             rotations = gaussians.rotations[batch_idx].float()
             opacities = gaussians.opacities[batch_idx].float()
-            world_to_camera = extrinsics[batch_idx : batch_idx + 1].float().inverse()
+            world_to_camera = _invert_rigid_camera_poses(
+                extrinsics[batch_idx : batch_idx + 1].float()
+            )
             intrinsics_px = intrinsics[batch_idx : batch_idx + 1].float().clone()
             intrinsics_px[:, 0] = intrinsics_px[:, 0] * w
             intrinsics_px[:, 1] = intrinsics_px[:, 1] * h
@@ -823,7 +845,7 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             scale_i = scales[i].float()
             rotation_i = rotations[i].float()
             opacity_i = opacitys[i].float()
-            test_w2c_i = extrinsics[i].float().inverse()
+            test_w2c_i = _invert_rigid_camera_poses(extrinsics[i].float())
             test_intr_i = intrinsics[i].float().clone()
             test_intr_i[:, 0] = test_intr_i[:, 0] * W
             test_intr_i[:, 1] = test_intr_i[:, 1] * H
