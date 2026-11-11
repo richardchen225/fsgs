@@ -359,12 +359,84 @@ def _camera_supervision_losses(
             f"gt={tuple(target_intrinsics.shape)}."
         )
 
+    target_intrinsics = target_intrinsics.to(
+        device=predicted_pose_encoding.device,
+        dtype=predicted_pose_encoding.dtype,
+    )
+    connected_zero = torch.nan_to_num(
+        predicted_pose_encoding,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).sum() * 0.0
+    raw_quaternion = predicted_pose_encoding[..., 3:7]
+    quaternion_finite = torch.isfinite(raw_quaternion).all(dim=-1)
+    quaternion_norm = torch.nan_to_num(
+        raw_quaternion,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).norm(dim=-1, keepdim=True)
+    predicted_valid = (
+        torch.isfinite(predicted_pose_encoding).all(dim=-1)
+        & quaternion_finite
+        & (quaternion_norm[..., 0] > 1e-6)
+    )
+    target_pose_valid = torch.isfinite(target_c2w).all(dim=(-2, -1))
+    target_intrinsic_valid = (
+        torch.isfinite(target_intrinsics).all(dim=(-2, -1))
+        & (target_intrinsics[..., 0, 0] > 1e-6)
+        & (target_intrinsics[..., 1, 1] > 1e-6)
+    )
+    view_valid = predicted_valid & target_pose_valid & target_intrinsic_valid
+    safe_prediction = torch.nan_to_num(
+        predicted_pose_encoding,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    identity_pose = torch.eye(
+        4,
+        device=target_c2w.device,
+        dtype=target_c2w.dtype,
+    ).view(1, 1, 4, 4).expand_as(target_c2w)
+    safe_target_c2w = torch.where(
+        target_pose_valid[..., None, None],
+        torch.nan_to_num(target_c2w, nan=0.0, posinf=0.0, neginf=0.0),
+        identity_pose,
+    )
+    safe_target_intrinsics = torch.nan_to_num(
+        target_intrinsics,
+        nan=1.0,
+        posinf=1.0,
+        neginf=1.0,
+    )
+
+    def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        weight = mask.to(values.dtype)
+        while weight.ndim < values.ndim:
+            weight = weight.unsqueeze(-1)
+        weight = weight.expand_as(values)
+        return (
+            (values * weight).sum() / weight.sum().clamp_min(1.0)
+            + connected_zero
+        )
+
+    def masked_smooth_l1(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        return masked_mean(
+            F.smooth_l1_loss(prediction, target, reduction="none"),
+            mask,
+        )
+
     # ZipMap encodes world-to-camera translation and rotation. Convert only
     # these compact predictions to c2w components; this avoids any 4x4 matrix
     # inverse or dependency on the render-camera construction.
-    raw_quaternion = predicted_pose_encoding[..., 3:7]
-    quaternion_norm = raw_quaternion.norm(dim=-1, keepdim=True)
-    quaternion = raw_quaternion / quaternion_norm.clamp_min(1e-6)
+    safe_quaternion = safe_prediction[..., 3:7]
+    quaternion = safe_quaternion / quaternion_norm.clamp_min(1e-6)
     identity_quaternion = torch.zeros_like(quaternion)
     identity_quaternion[..., 3] = 1.0
     quaternion = torch.where(
@@ -372,7 +444,7 @@ def _camera_supervision_losses(
     )
     rotation_w2c = quat_to_mat(quaternion)
     rotation_c2w = rotation_w2c.transpose(-1, -2)
-    translation_w2c = predicted_pose_encoding[..., :3]
+    translation_w2c = safe_prediction[..., :3]
     translation_c2w = -torch.matmul(
         rotation_c2w, translation_w2c.unsqueeze(-1)
     ).squeeze(-1)
@@ -394,8 +466,9 @@ def _camera_supervision_losses(
         rotation_c2w, translation_c2w
     )
     target_relative_rotation, target_relative_translation = relative_c2w(
-        target_c2w[..., :3, :3], target_c2w[..., :3, 3]
+        safe_target_c2w[..., :3, :3], safe_target_c2w[..., :3, 3]
     )
+    relative_valid = view_valid[:, :1] & view_valid
     if (
         not math.isfinite(float(global_trajectory_weight))
         or float(global_trajectory_weight) < 0.0
@@ -429,11 +502,13 @@ def _camera_supervision_losses(
         target_for_rotation, target_for_translation = adjacent_c2w(
             target_relative_rotation, target_relative_translation
         )
+        loss_valid = view_valid[:, :-1] & view_valid[:, 1:]
     elif pose_loss_mode == "first_relative":
         predicted_for_rotation = predicted_relative_rotation
         predicted_for_translation = predicted_relative_translation
         target_for_rotation = target_relative_rotation
         target_for_translation = target_relative_translation
+        loss_valid = relative_valid
     else:
         raise ValueError(
             "camera_pose_loss_mode must be first_relative or adjacent_pair, "
@@ -458,15 +533,18 @@ def _camera_supervision_losses(
                 "finite and non-negative, got "
                 f"{translation_direction_min_baseline_ratio}."
             )
-        predicted_flat = predicted_for_translation.reshape(
-            predicted_for_translation.shape[0], -1
+        translation_mask = loss_valid[..., None].to(
+            predicted_for_translation.dtype
         )
-        target_flat = target_for_translation.reshape(
-            target_for_translation.shape[0], -1
-        )
-        denominator = predicted_flat.square().sum(dim=-1)
+        denominator = (
+            predicted_for_translation.square() * translation_mask
+        ).sum(dim=(1, 2))
         alignment_scale = (
-            (predicted_flat * target_flat).sum(dim=-1)
+            (
+                predicted_for_translation
+                * target_for_translation
+                * translation_mask
+            ).sum(dim=(1, 2))
             / denominator.clamp_min(1e-8)
         )
         alignment_scale = torch.where(
@@ -474,13 +552,18 @@ def _camera_supervision_losses(
             alignment_scale.clamp(1e-3, 1e3),
             torch.ones_like(alignment_scale),
         ).detach()
-        translation_shape = F.smooth_l1_loss(
+        translation_shape = masked_smooth_l1(
             predicted_for_translation * alignment_scale[:, None, None],
             target_for_translation,
+            loss_valid,
         )
         predicted_norm = predicted_for_translation.norm(dim=-1)
         target_norm = target_for_translation.norm(dim=-1)
-        reference_baseline = target_norm.mean(dim=-1).clamp_min(1e-6)
+        valid_pair_count = loss_valid.sum(dim=-1).clamp_min(1).to(target_norm.dtype)
+        reference_baseline = (
+            (target_norm * loss_valid.to(target_norm.dtype)).sum(dim=-1)
+            / valid_pair_count
+        ).clamp_min(1e-6)
         minimum_baseline = (
             float(translation_direction_min_baseline_ratio)
             * reference_baseline
@@ -489,7 +572,8 @@ def _camera_supervision_losses(
             predicted_norm * alignment_scale.abs()[:, None]
         )
         valid_direction = (
-            (predicted_norm > 1e-6)
+            loss_valid
+            & (predicted_norm > 1e-6)
             & (target_norm > 1e-6)
             & (target_norm >= minimum_baseline[:, None])
             & (aligned_predicted_norm >= minimum_baseline[:, None])
@@ -510,48 +594,57 @@ def _camera_supervision_losses(
             direction_pair_weight * valid_direction.to(direction_pair_weight.dtype)
         )
         valid_weight_sum = valid_weight.sum()
-        if valid_direction.any():
-            translation_direction = (
-                direction_error * valid_weight
-            ).sum() / valid_weight_sum.clamp_min(1e-8)
-        else:
-            translation_direction = predicted_for_translation.sum() * 0.0
+        translation_direction = (
+            (direction_error * valid_weight).sum()
+            / valid_weight_sum.clamp_min(1e-8)
+            + connected_zero
+        )
         translation = (
             translation_shape
             + float(translation_direction_weight) * translation_direction
         )
     else:
-        translation_shape = F.smooth_l1_loss(
-            predicted_for_translation, target_for_translation
+        translation_shape = masked_smooth_l1(
+            predicted_for_translation,
+            target_for_translation,
+            loss_valid,
         )
-        translation_direction = predicted_for_translation.sum() * 0.0
+        translation_direction = connected_zero
         alignment_scale = torch.ones(
             predicted_for_translation.shape[0],
             device=predicted_for_translation.device,
             dtype=predicted_for_translation.dtype,
         )
-        valid_direction = torch.ones_like(
-            predicted_for_translation[..., 0], dtype=torch.bool
-        )
+        valid_direction = loss_valid
         direction_pair_weight = torch.ones_like(
             predicted_for_translation[..., 0]
         )
-        reference_baseline = target_for_translation.norm(dim=-1).mean(dim=-1)
+        target_norm = target_for_translation.norm(dim=-1)
+        valid_pair_count = loss_valid.sum(dim=-1).clamp_min(1).to(target_norm.dtype)
+        reference_baseline = (
+            target_norm * loss_valid.to(target_norm.dtype)
+        ).sum(dim=-1) / valid_pair_count
         translation = translation_shape
-    rotation = F.mse_loss(predicted_for_rotation, target_for_rotation)
+    rotation = masked_mean(
+        (predicted_for_rotation - target_for_rotation).square(),
+        loss_valid,
+    )
 
     # Adjacent supervision is locally accurate but can accumulate a coherent
     # bias over a long sequence. This weak first-relative term constrains the
     # complete trajectory while retaining the camera head's native scale.
-    global_predicted_flat = predicted_relative_translation.reshape(
-        predicted_relative_translation.shape[0], -1
+    global_mask = relative_valid[..., None].to(
+        predicted_relative_translation.dtype
     )
-    global_target_flat = target_relative_translation.reshape(
-        target_relative_translation.shape[0], -1
-    )
-    global_denominator = global_predicted_flat.square().sum(dim=-1)
+    global_denominator = (
+        predicted_relative_translation.square() * global_mask
+    ).sum(dim=(1, 2))
     global_alignment_scale = (
-        (global_predicted_flat * global_target_flat).sum(dim=-1)
+        (
+            predicted_relative_translation
+            * target_relative_translation
+            * global_mask
+        ).sum(dim=(1, 2))
         / global_denominator.clamp_min(1e-8)
     )
     global_alignment_scale = torch.where(
@@ -559,34 +652,33 @@ def _camera_supervision_losses(
         global_alignment_scale.clamp(1e-3, 1e3),
         torch.ones_like(global_alignment_scale),
     ).detach()
-    global_translation_shape = F.smooth_l1_loss(
+    global_translation_shape = masked_smooth_l1(
         predicted_relative_translation
         * global_alignment_scale[:, None, None],
         target_relative_translation,
+        relative_valid,
     )
-    global_rotation = F.mse_loss(
-        predicted_relative_rotation, target_relative_rotation
+    global_rotation = masked_mean(
+        (predicted_relative_rotation - target_relative_rotation).square(),
+        relative_valid,
     )
     global_trajectory = (
         translation_weight * global_translation_shape
         + rotation_weight * global_rotation
     )
-    target_intrinsics = target_intrinsics.to(
-        device=predicted_pose_encoding.device,
-        dtype=predicted_pose_encoding.dtype,
-    )
     gt_fov_h = 2.0 * torch.atan(
-        0.5 / target_intrinsics[..., 1, 1].clamp_min(1e-6)
+        0.5 / safe_target_intrinsics[..., 1, 1].clamp_min(1e-6)
     )
     gt_fov_w = 2.0 * torch.atan(
-        0.5 / target_intrinsics[..., 0, 0].clamp_min(1e-6)
+        0.5 / safe_target_intrinsics[..., 0, 0].clamp_min(1e-6)
     )
     gt_fov = torch.stack([gt_fov_h, gt_fov_w], dim=-1)
     # Match offline_gs_mlp_overfit: supervise the raw FOV encoding. The
     # bounded copy is only for rendering and must not saturate this loss.
-    focal = F.smooth_l1_loss(
-        predicted_pose_encoding[..., 7:9],
+    focal = masked_smooth_l1(
+        safe_prediction[..., 7:9],
         gt_fov.float(),
+        view_valid,
     )
     total = (
         translation_weight * translation
@@ -599,16 +691,28 @@ def _camera_supervision_losses(
         "translation": translation,
         "translation_shape": translation_shape,
         "translation_direction": translation_direction,
-        "translation_alignment_scale": alignment_scale.mean(),
-        "translation_direction_valid_ratio": valid_direction.float().mean(),
-        "translation_direction_pair_weight_mean": direction_pair_weight.mean(),
+        "translation_alignment_scale": alignment_scale.mean() + connected_zero,
+        "translation_direction_valid_ratio": (
+            valid_direction.float().sum()
+            / loss_valid.float().sum().clamp_min(1.0)
+            + connected_zero
+        ),
+        "translation_direction_pair_weight_mean": masked_mean(
+            direction_pair_weight,
+            loss_valid,
+        ),
         "translation_reference_baseline": reference_baseline.mean(),
         "rotation": rotation,
         "focal": focal,
         "global_trajectory": global_trajectory,
         "global_translation_shape": global_translation_shape,
         "global_rotation": global_rotation,
-        "global_translation_alignment_scale": global_alignment_scale.mean(),
+        "global_translation_alignment_scale": (
+            global_alignment_scale.mean() + connected_zero
+        ),
+        "invalid_ratio": (~view_valid).float().mean(),
+        "valid_ratio": view_valid.float().mean(),
+        "valid_view_count": view_valid.float().sum(),
     }
 
 
@@ -1275,6 +1379,7 @@ class ModelWrapper(LightningModule):
                 f"loss={record.get('loss_total')} "
                 f"psnr={record.get('train_psnr')} "
                 f"camera_loss={record.get('loss_camera')} "
+                f"camera_invalid={record.get('camera_invalid_ratio')} "
                 f"camera_grad={record.get('grad_camera_norm')} "
                 f"sim3={record.get('sim3_scale')} "
                 f"gs={record.get('gaussian_count')} "
@@ -1424,6 +1529,13 @@ class ModelWrapper(LightningModule):
             self.log(
                 "train/sim3_scale",
                 encoder_output.infos["sim3_scale"].float().mean(),
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
+            )
+            self.log(
+                "train/sim3_fallback_ratio",
+                encoder_output.infos["sim3_fallback_ratio"].float(),
                 on_step=True,
                 on_epoch=False,
                 sync_dist=True,
@@ -1787,6 +1899,20 @@ class ModelWrapper(LightningModule):
                     camera_losses[
                         "global_translation_alignment_scale"
                     ].item(),
+                )
+                self.log(
+                    "camera/invalid_ratio",
+                    camera_losses["invalid_ratio"],
+                    on_step=True,
+                    on_epoch=False,
+                    sync_dist=True,
+                )
+                self.log(
+                    "camera/valid_view_count",
+                    camera_losses["valid_view_count"],
+                    on_step=True,
+                    on_epoch=False,
+                    sync_dist=True,
                 )
                 total_loss = total_loss + self.train_cfg.weight_pose * loss_camera
 

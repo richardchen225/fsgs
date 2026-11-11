@@ -29,7 +29,11 @@ from src.model.encoder.vggt.utils.pose_enc import (
     pose_encoding_to_extri_intri,
 )
 from src.model.encoder.vggt.utils.rotation import mat_to_quat, quat_to_mat
-from src.geometry.sim3 import apply_camera_sim3, estimate_camera_sim3
+from src.geometry.sim3 import (
+    apply_camera_sim3,
+    estimate_camera_sim3_with_fallback,
+)
+from src.geometry.camera_safety import sanitize_pose_encoding_for_geometry
 from torch import nn, Tensor
 from torch_scatter import scatter_add, scatter_max
 from ..types import Gaussians
@@ -1175,24 +1179,8 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                     )
                 pred_pose_enc_list = shared_pose_encodings
             last_pred_pose_enc = pred_pose_enc_list[-1]
-            raw_quaternion = last_pred_pose_enc[..., 3:7]
-            quaternion_norm = raw_quaternion.norm(dim=-1, keepdim=True)
-            identity_quaternion = torch.zeros_like(raw_quaternion)
-            # Camera quaternions use XYZW ordering (scalar last).
-            identity_quaternion[..., 3] = 1.0
-            safe_quaternion = raw_quaternion / quaternion_norm.clamp_min(1e-6)
-            safe_quaternion = torch.where(
-                quaternion_norm > 1e-6, safe_quaternion, identity_quaternion
-            )
-            safe_pose_enc = torch.cat(
-                [
-                    last_pred_pose_enc[..., :3],
-                    safe_quaternion,
-                    last_pred_pose_enc[..., 7:9].clamp(
-                        1e-3, math.pi - 1e-3
-                    ),
-                ],
-                dim=-1,
+            safe_pose_enc = sanitize_pose_encoding_for_geometry(
+                last_pred_pose_enc
             )
             pred_all_w2c, pred_all_intrinsic_px = (
                 pose_encoding_to_extri_intri(
@@ -1266,14 +1254,17 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                         f"cameras={tuple(gt_context_c2w.shape)}, "
                         f"images={tuple(image.shape)}."
                     )
-                sim3_rotation, sim3_translation, sim3_scale = (
-                    estimate_camera_sim3(
-                        raw_pred_all_extrinsic[:, :ctx_img_num],
-                        gt_context_c2w[:, :ctx_img_num].to(
-                            device=raw_pred_all_extrinsic.device,
-                            dtype=raw_pred_all_extrinsic.dtype,
-                        ),
-                    )
+                (
+                    sim3_rotation,
+                    sim3_translation,
+                    sim3_scale,
+                    sim3_valid,
+                ) = estimate_camera_sim3_with_fallback(
+                    raw_pred_all_extrinsic[:, :ctx_img_num],
+                    gt_context_c2w[:, :ctx_img_num].to(
+                        device=raw_pred_all_extrinsic.device,
+                        dtype=raw_pred_all_extrinsic.dtype,
+                    ),
                 )
                 pred_all_extrinsic = apply_camera_sim3(
                     raw_pred_all_extrinsic,
@@ -1281,6 +1272,16 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                     sim3_translation,
                     sim3_scale,
                 )
+                if not bool(sim3_valid.all()):
+                    gt_all_c2w = gt_context_c2w.to(
+                        device=pred_all_extrinsic.device,
+                        dtype=pred_all_extrinsic.dtype,
+                    )
+                    pred_all_extrinsic = torch.where(
+                        sim3_valid[:, None, None, None],
+                        pred_all_extrinsic,
+                        gt_all_c2w,
+                    )
             else:
                 sim3_rotation = torch.eye(
                     3,
@@ -1298,10 +1299,16 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                     device=pred_all_extrinsic.device,
                     dtype=pred_all_extrinsic.dtype,
                 )
+                sim3_valid = torch.ones(
+                    b,
+                    device=pred_all_extrinsic.device,
+                    dtype=torch.bool,
+                )
             infos["pred_context_c2w"] = raw_pred_all_extrinsic
             infos["sim3_rotation"] = sim3_rotation
             infos["sim3_translation"] = sim3_translation
             infos["sim3_scale"] = sim3_scale
+            infos["sim3_fallback_ratio"] = (~sim3_valid).float().mean()
             infos["sim3_alignment_enabled"] = torch.tensor(
                 float(sim3_enabled), device=pred_all_extrinsic.device
             )

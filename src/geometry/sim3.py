@@ -73,6 +73,103 @@ def estimate_camera_sim3(
     return rotation.to(dtype), translation.to(dtype), scale.to(dtype)
 
 
+def estimate_camera_sim3_with_fallback(
+    source_c2w: torch.Tensor,
+    target_c2w: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+    orientation_weight: float = 0.05,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Estimate Sim(3) per sample and keep degenerate trajectories finite.
+
+    A collapsed camera trajectory has no observable translation scale. For
+    those samples, align the first camera orientation and center with unit
+    scale. The returned validity mask lets the caller replace the unobservable
+    geometry-camera trajectory while retaining the finite scale/rotation used
+    by the remaining geometry branches.
+    """
+    if source_c2w.shape != target_c2w.shape or source_c2w.ndim != 4:
+        raise ValueError(
+            "Sim(3) camera tensors must have matching [B,V,4,4] shapes, got "
+            f"{tuple(source_c2w.shape)} and {tuple(target_c2w.shape)}."
+        )
+    if source_c2w.shape[1] < 3:
+        raise ValueError("Sim(3) alignment requires at least three source cameras.")
+
+    rotations = []
+    translations = []
+    scales = []
+    valid = []
+    for batch_index in range(source_c2w.shape[0]):
+        source = source_c2w[batch_index : batch_index + 1]
+        target = target_c2w[batch_index : batch_index + 1]
+        source_centers = source[..., :3, 3].double()
+        target_centers = target[..., :3, 3].double()
+        source_radius = (
+            source_centers - source_centers.mean(dim=1, keepdim=True)
+        ).square().sum(dim=-1).mean().sqrt()
+        target_radius = (
+            target_centers - target_centers.mean(dim=1, keepdim=True)
+        ).square().sum(dim=-1).mean().sqrt()
+        inputs_finite = bool(
+            torch.isfinite(source).all() and torch.isfinite(target).all()
+        )
+        trajectory_valid = (
+            inputs_finite
+            and bool(source_radius > eps)
+            and bool(target_radius > eps)
+        )
+
+        if trajectory_valid:
+            try:
+                rotation, translation, scale = estimate_camera_sim3(
+                    source,
+                    target,
+                    eps=eps,
+                    orientation_weight=orientation_weight,
+                )
+            except (RuntimeError, ValueError):
+                trajectory_valid = False
+
+        if not trajectory_valid:
+            dtype = source.dtype
+            device = source.device
+            source_rotation = source[0, 0, :3, :3]
+            target_rotation = target[0, 0, :3, :3]
+            rotations_finite = bool(
+                torch.isfinite(source_rotation).all()
+                and torch.isfinite(target_rotation).all()
+            )
+            if rotations_finite:
+                rotation = (
+                    target_rotation.float() @ source_rotation.float().transpose(-1, -2)
+                ).to(dtype).unsqueeze(0)
+            else:
+                rotation = torch.eye(3, device=device, dtype=dtype).unsqueeze(0)
+            scale = torch.ones(1, device=device, dtype=dtype)
+            source_center = torch.nan_to_num(
+                source[0, 0, :3, 3], nan=0.0, posinf=0.0, neginf=0.0
+            )
+            target_center = torch.nan_to_num(
+                target[0, 0, :3, 3], nan=0.0, posinf=0.0, neginf=0.0
+            )
+            translation = (
+                target_center - torch.einsum("ij,j->i", rotation[0], source_center)
+            ).unsqueeze(0)
+
+        rotations.append(rotation)
+        translations.append(translation)
+        scales.append(scale)
+        valid.append(trajectory_valid)
+
+    return (
+        torch.cat(rotations, dim=0),
+        torch.cat(translations, dim=0),
+        torch.cat(scales, dim=0),
+        torch.tensor(valid, device=source_c2w.device, dtype=torch.bool),
+    )
+
+
 def apply_camera_sim3(
     camera_to_world: torch.Tensor,
     rotation: torch.Tensor,
