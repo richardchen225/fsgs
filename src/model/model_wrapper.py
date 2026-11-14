@@ -45,6 +45,7 @@ from ..misc.utils import (
     confidence_map,
     get_overlap_tag,
 )
+from .camera_phase import resolve_camera_phase_settings
 from ..visualization.annotation import add_label
 from ..visualization.camera_trajectory.interpolation import (
     interpolate_extrinsics,
@@ -63,10 +64,30 @@ from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 from .encoder.vggt.utils.rotation import quat_to_mat
 from .ply_export import export_ply
 from lightning.pytorch.loggers.wandb import WandbLogger
-def _gir_training_metric_names(cfg) -> tuple[str, ...]:
+def _gir_training_metric_names(
+    cfg,
+    compact: bool = False,
+) -> tuple[str, ...]:
     """Select compact, non-redundant diagnostics for active GIR paths."""
     if not bool(getattr(cfg, "gir_enabled", False)):
         return ()
+    if compact:
+        if not bool(
+            getattr(cfg, "gir_symmetric_multiview_update_enabled", False)
+        ):
+            return ()
+        return tuple(
+            f"gir_symmetric_multiview_{key}"
+            for key in (
+                "active_ratio",
+                "visible_views_mean",
+                "mean_conflict_ratio",
+                "mean_shift_mean",
+                "opacity_shift_mean",
+                "harmonics_shift_mean",
+            )
+        )
+
     names = ["gir_map_gaussians"]
     if bool(getattr(cfg, "gir_add_gate_enabled", False)):
         names.append("gir_add_gate")
@@ -119,7 +140,6 @@ def _gir_training_metric_names(cfg) -> tuple[str, ...]:
         names.extend(
             f"gir_symmetric_multiview_{key}"
             for key in (
-                "active_count",
                 "active_ratio",
                 "visible_views_mean",
                 "mean_coherence",
@@ -240,6 +260,44 @@ def _gir_training_metric_names(cfg) -> tuple[str, ...]:
         )
     return tuple(names)
 
+
+def _expected_render_depth_for_visualization(
+    accumulated_depth: torch.Tensor,
+    alpha: torch.Tensor,
+    min_alpha: float = 0.01,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert gsplat RGB+D output to displayable expected depth."""
+    if accumulated_depth.shape != alpha.shape:
+        raise ValueError(
+            "Rendered depth and alpha must have matching shapes, got "
+            f"depth={tuple(accumulated_depth.shape)}, "
+            f"alpha={tuple(alpha.shape)}."
+        )
+    min_alpha = float(min_alpha)
+    if not math.isfinite(min_alpha) or not 0.0 <= min_alpha < 1.0:
+        raise ValueError(
+            f"Rendered-depth min_alpha must be in [0,1), got {min_alpha}."
+        )
+
+    depth = accumulated_depth.detach().float()
+    opacity = alpha.detach().float()
+    valid = (
+        torch.isfinite(depth)
+        & torch.isfinite(opacity)
+        & (opacity >= min_alpha)
+    )
+    expected_depth = depth / opacity.clamp_min(1e-6)
+    valid &= torch.isfinite(expected_depth) & (expected_depth > 0.0)
+
+    valid_values = expected_depth[valid]
+    if valid_values.numel() == 0:
+        fill_depth = expected_depth.new_tensor(1.0)
+    else:
+        # Invalid pixels must not push vis_depth_map's percentiles toward zero.
+        fill_depth = valid_values.quantile(0.99).clamp_min(1e-6)
+    display_depth = torch.where(valid, expected_depth, fill_depth)
+    return display_depth, valid
+
 @dataclass
 class OptimizerCfg:
     lr: float
@@ -313,6 +371,7 @@ class TrainCfg:
     debug_metrics_every_n_steps: int = 10
     debug_metrics_filename: str = "train_debug_metrics.jsonl"
     debug_metrics_print: bool = True
+    compact_logging: bool = False
     cxt_depth_weight: float = 0.01
     weight_pose: float = 1.0
     weight_depth: float = 1.0
@@ -334,7 +393,7 @@ def _camera_supervision_losses(
     translation_direction_baseline_weighting: bool = False,
     global_trajectory_weight: float = 0.0,
 ) -> dict[str, torch.Tensor]:
-    """Supervise the camera encoding in the first-view coordinate frame.
+    """Supervise the camera encoding directly or in a relative frame.
 
     Keep this path independent from the differentiable rendering camera. The
     overfit experiment supervises the predicted camera parameters directly;
@@ -412,8 +471,20 @@ def _camera_supervision_losses(
         neginf=1.0,
     )
 
-    def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def masked_mean(
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         weight = mask.to(values.dtype)
+        if sample_weight is not None:
+            sample_weight = sample_weight.to(
+                device=values.device,
+                dtype=values.dtype,
+            )
+            while sample_weight.ndim < weight.ndim:
+                sample_weight = sample_weight.unsqueeze(-1)
+            weight = weight * sample_weight
         while weight.ndim < values.ndim:
             weight = weight.unsqueeze(-1)
         weight = weight.expand_as(values)
@@ -426,10 +497,12 @@ def _camera_supervision_losses(
         prediction: torch.Tensor,
         target: torch.Tensor,
         mask: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return masked_mean(
             F.smooth_l1_loss(prediction, target, reduction="none"),
             mask,
+            sample_weight,
         )
 
     # ZipMap encodes world-to-camera translation and rotation. Convert only
@@ -478,31 +551,67 @@ def _camera_supervision_losses(
             f"got {global_trajectory_weight}."
         )
     pose_loss_mode = str(pose_loss_mode).lower()
-    if pose_loss_mode == "adjacent_pair":
+    pair_weight = torch.ones_like(view_valid, dtype=predicted_pose_encoding.dtype)
+    if pose_loss_mode == "absolute":
+        target_rotation_w2c = safe_target_c2w[..., :3, :3].transpose(-1, -2)
+        target_translation_w2c = -torch.matmul(
+            target_rotation_w2c,
+            safe_target_c2w[..., :3, 3].unsqueeze(-1),
+        ).squeeze(-1)
+        predicted_for_rotation = rotation_w2c
+        predicted_for_translation = translation_w2c
+        target_for_rotation = target_rotation_w2c
+        target_for_translation = target_translation_w2c
+        loss_valid = view_valid
+    elif pose_loss_mode in {"adjacent_pair", "all_pairs"}:
         if predicted_relative_rotation.shape[1] < 2:
             raise ValueError(
-                "camera_pose_loss_mode=adjacent_pair requires at least two "
+                f"camera_pose_loss_mode={pose_loss_mode} requires at least two "
                 "camera views."
             )
 
-        def adjacent_c2w(
-            rotation: torch.Tensor, translation: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            previous_rotation_t = rotation[:, :-1].transpose(-1, -2)
-            adjacent_rotation = previous_rotation_t @ rotation[:, 1:]
-            adjacent_translation = (
-                previous_rotation_t
-                @ (translation[:, 1:] - translation[:, :-1]).unsqueeze(-1)
-            ).squeeze(-1)
-            return adjacent_rotation, adjacent_translation
+        if pose_loss_mode == "adjacent_pair":
+            left_indices = torch.arange(
+                predicted_relative_rotation.shape[1] - 1,
+                device=predicted_relative_rotation.device,
+            )
+            right_indices = left_indices + 1
+        else:
+            left_indices, right_indices = torch.triu_indices(
+                predicted_relative_rotation.shape[1],
+                predicted_relative_rotation.shape[1],
+                offset=1,
+                device=predicted_relative_rotation.device,
+            )
 
-        predicted_for_rotation, predicted_for_translation = adjacent_c2w(
+        def indexed_pair_c2w(
+            rotation: torch.Tensor,
+            translation: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            left_rotation_t = rotation[:, left_indices].transpose(-1, -2)
+            pair_rotation = left_rotation_t @ rotation[:, right_indices]
+            pair_translation = (
+                left_rotation_t
+                @ (
+                    translation[:, right_indices]
+                    - translation[:, left_indices]
+                ).unsqueeze(-1)
+            ).squeeze(-1)
+            return pair_rotation, pair_translation
+
+        predicted_for_rotation, predicted_for_translation = indexed_pair_c2w(
             predicted_relative_rotation, predicted_relative_translation
         )
-        target_for_rotation, target_for_translation = adjacent_c2w(
+        target_for_rotation, target_for_translation = indexed_pair_c2w(
             target_relative_rotation, target_relative_translation
         )
-        loss_valid = view_valid[:, :-1] & view_valid[:, 1:]
+        loss_valid = (
+            view_valid[:, left_indices] & view_valid[:, right_indices]
+        )
+        temporal_gap = (right_indices - left_indices).to(
+            predicted_for_translation.dtype
+        )
+        pair_weight = temporal_gap.unsqueeze(0).expand_as(loss_valid)
     elif pose_loss_mode == "first_relative":
         predicted_for_rotation = predicted_relative_rotation
         predicted_for_translation = predicted_relative_translation
@@ -511,11 +620,12 @@ def _camera_supervision_losses(
         loss_valid = relative_valid
     else:
         raise ValueError(
-            "camera_pose_loss_mode must be first_relative or adjacent_pair, "
+            "camera_pose_loss_mode must be absolute, first_relative, "
+            "adjacent_pair, or all_pairs, "
             f"got {pose_loss_mode!r}."
         )
 
-    if pose_loss_mode == "adjacent_pair":
+    if pose_loss_mode in {"adjacent_pair", "all_pairs"}:
         if (
             not math.isfinite(float(translation_direction_weight))
             or float(translation_direction_weight) < 0.0
@@ -533,9 +643,10 @@ def _camera_supervision_losses(
                 "finite and non-negative, got "
                 f"{translation_direction_min_baseline_ratio}."
             )
-        translation_mask = loss_valid[..., None].to(
-            predicted_for_translation.dtype
-        )
+        translation_mask = (
+            loss_valid.to(predicted_for_translation.dtype)
+            * pair_weight.to(predicted_for_translation.dtype)
+        )[..., None]
         denominator = (
             predicted_for_translation.square() * translation_mask
         ).sum(dim=(1, 2))
@@ -556,12 +667,16 @@ def _camera_supervision_losses(
             predicted_for_translation * alignment_scale[:, None, None],
             target_for_translation,
             loss_valid,
+            pair_weight,
         )
         predicted_norm = predicted_for_translation.norm(dim=-1)
         target_norm = target_for_translation.norm(dim=-1)
-        valid_pair_count = loss_valid.sum(dim=-1).clamp_min(1).to(target_norm.dtype)
+        valid_pair_weight = (
+            pair_weight.to(target_norm.dtype) * loss_valid.to(target_norm.dtype)
+        )
+        valid_pair_count = valid_pair_weight.sum(dim=-1).clamp_min(1e-8)
         reference_baseline = (
-            (target_norm * loss_valid.to(target_norm.dtype)).sum(dim=-1)
+            (target_norm * valid_pair_weight).sum(dim=-1)
             / valid_pair_count
         ).clamp_min(1e-6)
         minimum_baseline = (
@@ -591,7 +706,9 @@ def _camera_supervision_losses(
         else:
             direction_pair_weight = torch.ones_like(target_norm)
         valid_weight = (
-            direction_pair_weight * valid_direction.to(direction_pair_weight.dtype)
+            pair_weight.to(direction_pair_weight.dtype)
+            * direction_pair_weight
+            * valid_direction.to(direction_pair_weight.dtype)
         )
         valid_weight_sum = valid_weight.sum()
         translation_direction = (
@@ -628,44 +745,58 @@ def _camera_supervision_losses(
     rotation = masked_mean(
         (predicted_for_rotation - target_for_rotation).square(),
         loss_valid,
+        pair_weight,
     )
 
-    # Adjacent supervision is locally accurate but can accumulate a coherent
-    # bias over a long sequence. This weak first-relative term constrains the
-    # complete trajectory while retaining the camera head's native scale.
-    global_mask = relative_valid[..., None].to(
-        predicted_relative_translation.dtype
-    )
-    global_denominator = (
-        predicted_relative_translation.square() * global_mask
-    ).sum(dim=(1, 2))
-    global_alignment_scale = (
-        (
-            predicted_relative_translation
-            * target_relative_translation
-            * global_mask
+    if pose_loss_mode == "absolute":
+        # Absolute W2C supervision already fixes the complete world gauge.
+        # Adding a separately scale-aligned relative term would weaken the
+        # interpretation of this ablation and duplicate the same trajectory.
+        global_alignment_scale = torch.ones(
+            predicted_for_translation.shape[0],
+            device=predicted_for_translation.device,
+            dtype=predicted_for_translation.dtype,
+        )
+        global_translation_shape = connected_zero
+        global_rotation = connected_zero
+        global_trajectory = connected_zero
+    else:
+        # Optional first-relative trajectory supervision. This is useful with
+        # local pair modes and can be disabled when all-pairs already supplies
+        # the same long-range constraints.
+        global_mask = relative_valid[..., None].to(
+            predicted_relative_translation.dtype
+        )
+        global_denominator = (
+            predicted_relative_translation.square() * global_mask
         ).sum(dim=(1, 2))
-        / global_denominator.clamp_min(1e-8)
-    )
-    global_alignment_scale = torch.where(
-        global_denominator > 1e-8,
-        global_alignment_scale.clamp(1e-3, 1e3),
-        torch.ones_like(global_alignment_scale),
-    ).detach()
-    global_translation_shape = masked_smooth_l1(
-        predicted_relative_translation
-        * global_alignment_scale[:, None, None],
-        target_relative_translation,
-        relative_valid,
-    )
-    global_rotation = masked_mean(
-        (predicted_relative_rotation - target_relative_rotation).square(),
-        relative_valid,
-    )
-    global_trajectory = (
-        translation_weight * global_translation_shape
-        + rotation_weight * global_rotation
-    )
+        global_alignment_scale = (
+            (
+                predicted_relative_translation
+                * target_relative_translation
+                * global_mask
+            ).sum(dim=(1, 2))
+            / global_denominator.clamp_min(1e-8)
+        )
+        global_alignment_scale = torch.where(
+            global_denominator > 1e-8,
+            global_alignment_scale.clamp(1e-3, 1e3),
+            torch.ones_like(global_alignment_scale),
+        ).detach()
+        global_translation_shape = masked_smooth_l1(
+            predicted_relative_translation
+            * global_alignment_scale[:, None, None],
+            target_relative_translation,
+            relative_valid,
+        )
+        global_rotation = masked_mean(
+            (predicted_relative_rotation - target_relative_rotation).square(),
+            relative_valid,
+        )
+        global_trajectory = (
+            translation_weight * global_translation_shape
+            + rotation_weight * global_rotation
+        )
     gt_fov_h = 2.0 * torch.atan(
         0.5 / safe_target_intrinsics[..., 1, 1].clamp_min(1e-6)
     )
@@ -701,6 +832,8 @@ def _camera_supervision_losses(
             direction_pair_weight,
             loss_valid,
         ),
+        "temporal_gap_weight_mean": masked_mean(pair_weight, loss_valid),
+        "relative_pair_count": loss_valid.float().sum() + connected_zero,
         "translation_reference_baseline": reference_baseline.mean(),
         "rotation": rotation,
         "focal": focal,
@@ -1250,12 +1383,25 @@ class ModelWrapper(LightningModule):
             f"train_depth_head={train_depth_head and (depth_head_source == 'world_mirror' or reconstruction_backbone != 'abot')}, "
             f"train_gir={train_gir}"
         )
+        training_cameras = resolve_camera_phase_settings(
+            self.model.encoder.cfg, True
+        )
+        evaluation_cameras = resolve_camera_phase_settings(
+            self.model.encoder.cfg, False
+        )
         print(
             "Final-map geometry/rendering: "
-            f"mode={getattr(self.model.encoder.cfg, 'gir_training_mode', 'streaming_aux')}, "
-            f"sim3={getattr(self.model.encoder.cfg, 'sim3_alignment_mode', 'never')}, "
-            f"source_camera={getattr(self.model.encoder.cfg, 'source_render_camera', 'predicted')}, "
-            f"heldout_camera={getattr(self.model.encoder.cfg, 'heldout_test_camera', 'predicted')}"
+            f"mode={getattr(self.model.encoder.cfg, 'gir_training_mode', 'streaming_aux')}; "
+            "training="
+            f"sim3:{training_cameras.sim3_alignment_mode},"
+            f"geometry:{training_cameras.geometry_camera_source},"
+            f"source:{training_cameras.source_render_camera},"
+            f"heldout:{training_cameras.heldout_test_camera}; "
+            "evaluation="
+            f"sim3:{evaluation_cameras.sim3_alignment_mode},"
+            f"geometry:{evaluation_cameras.geometry_camera_source},"
+            f"source:{evaluation_cameras.source_render_camera},"
+            f"heldout:{evaluation_cameras.heldout_test_camera}"
         )
         if train_camera_head:
             print(
@@ -1431,6 +1577,7 @@ class ModelWrapper(LightningModule):
 
         batch: BatchedExample = self.data_shim(batch)
         b, v, c, h, w = batch["context"]["image"].shape
+        compact_logging = bool(self.train_cfg.compact_logging)
         self._pending_train_debug_record = None
         debug_due = (
             self.global_rank == 0
@@ -1475,6 +1622,29 @@ class ModelWrapper(LightningModule):
                 f"scene = {batch['scene']}; "
                 f"context = {batch['context']['index'].tolist()}"
             )
+
+        depth_loss_idx = list(get_cfg()["loss"].keys()).index("depth")
+        depth_loss_module = self.losses[depth_loss_idx]
+        depth_loss_weight = (
+            self.train_cfg.cxt_depth_weight * self.train_cfg.weight_depth
+        )
+        # Training uses the first half of a multi-view batch as source views.
+        # Run the frozen DAV3 teacher before AnySplat builds its large GIR graph,
+        # otherwise the two activation peaks overlap on high-view-count batches.
+        source_view_count = 1 if v == 1 else v // 2
+        with torch.amp.autocast("cuda", enabled=False):
+            prepared_context_depth_target = (
+                depth_loss_module.prepare_context_depth_target(
+                    batch,
+                    source_view_count,
+                    cxt_depth_weight=depth_loss_weight,
+                )
+            )
+        log_cuda_memory(
+            "after_depth_target",
+            step=int(self.global_step),
+            source_views=source_view_count,
+        )
 
         # Run the model
 #         if self.global_step < 50:
@@ -1541,13 +1711,19 @@ class ModelWrapper(LightningModule):
                 sync_dist=True,
             )
         if encoder_output.infos is not None and "gir_add_gate" in encoder_output.infos:
-            for metric_name in _gir_training_metric_names(self.model.encoder.cfg):
+            for metric_name in _gir_training_metric_names(
+                self.model.encoder.cfg,
+                compact=compact_logging,
+            ):
                 if metric_name in encoder_output.infos:
                     self.log(
                         f"train/{metric_name}",
                         encoder_output.infos[metric_name].float(),
                     )
-            if "gir_history_before_error" in encoder_output.infos:
+            if (
+                not compact_logging
+                and "gir_history_before_error" in encoder_output.infos
+            ):
                 history_before = encoder_output.infos[
                     "gir_history_before_error"
                 ].float()
@@ -1560,7 +1736,10 @@ class ModelWrapper(LightningModule):
                     "train/gir_history_improvement",
                     history_before - history_after,
                 )
-            if "gir_history_past_before_error" in encoder_output.infos:
+            if (
+                not compact_logging
+                and "gir_history_past_before_error" in encoder_output.infos
+            ):
                 self.log(
                     "train/gir_history_past_before_error",
                     encoder_output.infos["gir_history_past_before_error"].float(),
@@ -1596,7 +1775,7 @@ class ModelWrapper(LightningModule):
         if encoder_output.infos is not None and "gir_aux_loss" in encoder_output.infos:
             gir_aux_loss = encoder_output.infos["gir_aux_loss"]
             gir_aux_weight = float(self.model.encoder.cfg.gir_aux_loss_weight)
-            if gir_aux_weight != 0.0:
+            if gir_aux_weight != 0.0 and not compact_logging:
                 self.log("loss/gir_aux", gir_aux_loss.item())
             gir_rgb_loss_weights = {
                 "gir_base_rgb_loss": float(
@@ -1617,6 +1796,7 @@ class ModelWrapper(LightningModule):
                     gir_aux_weight != 0.0
                     and component_weight != 0.0
                     and metric_name in encoder_output.infos
+                    and not compact_logging
                 ):
                     self.log(
                         f"loss/{metric_name}",
@@ -1635,7 +1815,11 @@ class ModelWrapper(LightningModule):
                 self.model.encoder.cfg.gir_old_delete_budget_weight
             )
             if old_delete_budget_weight != 0.0:
-                self.log("loss/gir_old_delete_budget", old_delete_budget_loss.item())
+                if not compact_logging:
+                    self.log(
+                        "loss/gir_old_delete_budget",
+                        old_delete_budget_loss.item(),
+                    )
                 total_loss = (
                     total_loss
                     + old_delete_budget_weight * old_delete_budget_loss
@@ -1651,7 +1835,11 @@ class ModelWrapper(LightningModule):
                 self.model.encoder.cfg.gir_old_delete_budget_weight
             )
             if old_decay_budget_weight != 0.0:
-                self.log("loss/gir_old_decay_budget", old_decay_budget_loss.item())
+                if not compact_logging:
+                    self.log(
+                        "loss/gir_old_decay_budget",
+                        old_decay_budget_loss.item(),
+                    )
                 total_loss = total_loss + (
                     old_decay_budget_weight * old_decay_budget_loss
                 )
@@ -1664,7 +1852,11 @@ class ModelWrapper(LightningModule):
                 self.model.encoder.cfg.gir_history_adapt_weight
             )
             if adapt_weight != 0.0:
-                self.log("loss/gir_history_adapt", gir_history_adapt.item())
+                if not compact_logging:
+                    self.log(
+                        "loss/gir_history_adapt",
+                        gir_history_adapt.item(),
+                    )
                 total_loss = total_loss + adapt_weight * gir_history_adapt
         if (
             encoder_output.infos is not None
@@ -1677,7 +1869,11 @@ class ModelWrapper(LightningModule):
                 self.model.encoder.cfg.gir_history_preserve_weight
             )
             if preserve_weight != 0.0:
-                self.log("loss/gir_history_preserve", gir_history_preserve.item())
+                if not compact_logging:
+                    self.log(
+                        "loss/gir_history_preserve",
+                        gir_history_preserve.item(),
+                    )
                 total_loss = total_loss + preserve_weight * gir_history_preserve
         if (
             encoder_output.infos is not None
@@ -1688,7 +1884,8 @@ class ModelWrapper(LightningModule):
                 self.model.encoder.cfg.gir_add_rate_loss_weight
             )
             if gir_add_rate_weight != 0.0:
-                self.log("loss/gir_add_rate", gir_add_rate_loss.item())
+                if not compact_logging:
+                    self.log("loss/gir_add_rate", gir_add_rate_loss.item())
                 total_loss = (
                     total_loss + gir_add_rate_weight * gir_add_rate_loss
                 )
@@ -1701,19 +1898,19 @@ class ModelWrapper(LightningModule):
                 self.model.encoder.cfg.gir_regularization_weight
             )
             if regularization_weight != 0.0:
-                self.log("loss/gir_regularization", gir_regularization.item())
+                if not compact_logging:
+                    self.log(
+                        "loss/gir_regularization",
+                        gir_regularization.item(),
+                    )
                 total_loss = total_loss + regularization_weight * gir_regularization
 
         with torch.amp.autocast("cuda", enabled=False):
-            depth_loss_idx = list(get_cfg()["loss"].keys()).index("depth")
-            depth_loss_module = self.losses[depth_loss_idx]
             loss_depth_ctx = depth_loss_module.ctx_depth_loss(
                 depth_dict["depth"],
                 batch,
-                cxt_depth_weight=(
-                    self.train_cfg.cxt_depth_weight
-                    * self.train_cfg.weight_depth
-                ),
+                cxt_depth_weight=depth_loss_weight,
+                prepared_target=prepared_context_depth_target,
             )
             log_cuda_memory("after_depth_loss", step=int(self.global_step))
 
@@ -1724,39 +1921,41 @@ class ModelWrapper(LightningModule):
                 debug_record["loss_depth"] = float(
                     loss_depth_ctx.detach().item()
                 )
-            for component_name, component_value in getattr(
-                depth_loss_module, "last_depth_components", {}
-            ).items():
-                if component_name == "depth_absolute_log_scale_weighted":
-                    continue
-                namespace = (
-                    "diagnostics"
-                    if component_name.startswith("depth_camera_scale_alignment_")
-                    else "loss"
-                )
-                self.log(
-                    f"{namespace}/{component_name}",
-                    component_value,
-                    on_step=True,
-                    on_epoch=False,
-                    sync_dist=True,
-                )
-                if debug_record is not None:
-                    scalar = self._debug_scalar(component_value)
-                    if scalar is not None:
-                        debug_record[f"depth_{component_name}"] = scalar
-            # DAV3-vs-GT diagnostics are detached and are not part of the loss.
-            # Lightning/W&B records these scalars as step curves automatically.
-            for metric_name, metric_value in getattr(
-                depth_loss_module, "last_teacher_gt_metrics", {}
-            ).items():
-                self.log(
-                    f"diagnostics/{metric_name}",
-                    metric_value,
-                    on_step=True,
-                    on_epoch=False,
-                    sync_dist=True,
-                )
+            if not compact_logging:
+                for component_name, component_value in getattr(
+                    depth_loss_module, "last_depth_components", {}
+                ).items():
+                    if component_name == "depth_absolute_log_scale_weighted":
+                        continue
+                    namespace = (
+                        "diagnostics"
+                        if component_name.startswith(
+                            "depth_camera_scale_alignment_"
+                        )
+                        else "loss"
+                    )
+                    self.log(
+                        f"{namespace}/{component_name}",
+                        component_value,
+                        on_step=True,
+                        on_epoch=False,
+                        sync_dist=True,
+                    )
+                    if debug_record is not None:
+                        scalar = self._debug_scalar(component_value)
+                        if scalar is not None:
+                            debug_record[f"depth_{component_name}"] = scalar
+                # Teacher diagnostics are detached and not part of the loss.
+                for metric_name, metric_value in getattr(
+                    depth_loss_module, "last_teacher_gt_metrics", {}
+                ).items():
+                    self.log(
+                        f"diagnostics/{metric_name}",
+                        metric_value,
+                        on_step=True,
+                        on_epoch=False,
+                        sync_dist=True,
+                    )
             total_loss = total_loss + loss_depth_ctx
             
             # depth_loss_idx = list(get_cfg()["loss"].keys()).index("depth")
@@ -1856,50 +2055,57 @@ class ModelWrapper(LightningModule):
                     camera_losses["rotation"].item(),
                 )
                 self.log(
-                    "loss/camera_translation_shape",
-                    camera_losses["translation_shape"].item(),
-                )
-                self.log(
-                    "loss/camera_translation_direction",
-                    camera_losses["translation_direction"].item(),
-                )
-                self.log(
                     "camera/translation_alignment_scale",
                     camera_losses["translation_alignment_scale"].item(),
                 )
-                self.log(
-                    "camera/translation_direction_valid_ratio",
-                    camera_losses["translation_direction_valid_ratio"].item(),
-                )
-                self.log(
-                    "camera/translation_direction_pair_weight_mean",
-                    camera_losses[
-                        "translation_direction_pair_weight_mean"
-                    ].item(),
-                )
-                self.log(
-                    "camera/translation_reference_baseline",
-                    camera_losses["translation_reference_baseline"].item(),
-                )
                 self.log("loss/camera_focal", camera_losses["focal"].item())
-                self.log(
-                    "loss/camera_global_trajectory",
-                    camera_losses["global_trajectory"].item(),
-                )
-                self.log(
-                    "loss/camera_global_translation_shape",
-                    camera_losses["global_translation_shape"].item(),
-                )
-                self.log(
-                    "loss/camera_global_rotation",
-                    camera_losses["global_rotation"].item(),
-                )
-                self.log(
-                    "camera/global_translation_alignment_scale",
-                    camera_losses[
-                        "global_translation_alignment_scale"
-                    ].item(),
-                )
+                if not compact_logging:
+                    self.log(
+                        "loss/camera_translation_shape",
+                        camera_losses["translation_shape"].item(),
+                    )
+                    self.log(
+                        "loss/camera_translation_direction",
+                        camera_losses["translation_direction"].item(),
+                    )
+                    self.log(
+                        "camera/translation_direction_valid_ratio",
+                        camera_losses[
+                            "translation_direction_valid_ratio"
+                        ].item(),
+                    )
+                    self.log(
+                        "camera/translation_direction_pair_weight_mean",
+                        camera_losses[
+                            "translation_direction_pair_weight_mean"
+                        ].item(),
+                    )
+                    self.log(
+                        "camera/translation_reference_baseline",
+                        camera_losses[
+                            "translation_reference_baseline"
+                        ].item(),
+                    )
+                    self.log(
+                        "loss/camera_global_trajectory",
+                        camera_losses["global_trajectory"].item(),
+                    )
+                    self.log(
+                        "loss/camera_global_translation_shape",
+                        camera_losses[
+                            "global_translation_shape"
+                        ].item(),
+                    )
+                    self.log(
+                        "loss/camera_global_rotation",
+                        camera_losses["global_rotation"].item(),
+                    )
+                    self.log(
+                        "camera/global_translation_alignment_scale",
+                        camera_losses[
+                            "global_translation_alignment_scale"
+                        ].item(),
+                    )
                 self.log(
                     "camera/invalid_ratio",
                     camera_losses["invalid_ratio"],
@@ -1907,13 +2113,14 @@ class ModelWrapper(LightningModule):
                     on_epoch=False,
                     sync_dist=True,
                 )
-                self.log(
-                    "camera/valid_view_count",
-                    camera_losses["valid_view_count"],
-                    on_step=True,
-                    on_epoch=False,
-                    sync_dist=True,
-                )
+                if not compact_logging:
+                    self.log(
+                        "camera/valid_view_count",
+                        camera_losses["valid_view_count"],
+                        on_step=True,
+                        on_epoch=False,
+                        sync_dist=True,
+                    )
                 total_loss = total_loss + self.train_cfg.weight_pose * loss_camera
 
             # int loss
@@ -1973,7 +2180,13 @@ class ModelWrapper(LightningModule):
         self.log("loss/total", total_loss.item())
         if debug_record is not None:
             debug_record["loss_total"] = float(total_loss.detach().item())
-        self.log("info/global_step", self.global_step)
+        # ModelCheckpoint monitors this metric. Keep it in Lightning's callback
+        # metrics even when compact mode suppresses it from the external logger.
+        self.log(
+            "info/global_step",
+            self.global_step,
+            logger=not compact_logging,
+        )
         # print(f"total_loss: {total_loss}")
         # print(f"scene = {[x[:20] for x in batch['scene']]}; " )
         
@@ -2251,7 +2464,20 @@ class ModelWrapper(LightningModule):
             model_depth_pred = depth_dict["depth"].squeeze(-1)[i]
             model_depth_pred = vis_depth_map(model_depth_pred)
 
-            depth_pred = vis_depth_map(output.depth[i])
+            accumulated_rendered_depth = output.depth[i]
+            rendered_alpha = output.alpha[
+                i, : accumulated_rendered_depth.shape[0]
+            ]
+            if accumulated_rendered_depth.ndim == 2:
+                accumulated_rendered_depth = accumulated_rendered_depth.unsqueeze(0)
+                rendered_alpha = rendered_alpha.unsqueeze(0)
+            rendered_depth, rendered_depth_valid = (
+                _expected_render_depth_for_visualization(
+                    accumulated_rendered_depth, rendered_alpha
+                )
+            )
+            depth_pred = vis_depth_map(rendered_depth)
+            depth_pred = depth_pred * rendered_depth_valid.unsqueeze(-3)
             rgb_gt_i = (batch["context"]["image"][i].float() + 1) / 2
             rgb_pred_i = output.color[i].float()
 
@@ -2496,6 +2722,9 @@ class ModelWrapper(LightningModule):
         
         target_image = batch["target"]["image"]
         target_view_count = target_image.shape[1]
+        evaluation_cameras = resolve_camera_phase_settings(
+            self.model.encoder.cfg, False
+        )
         context_indices = batch["context"]["index"]
         target_indices = batch["target"]["index"]
         if context_indices.shape[1] <= target_view_count:
@@ -2531,6 +2760,7 @@ class ModelWrapper(LightningModule):
                     target_view_count=target_view_count,
                     return_gir_data=True,
                     gt_context_c2w=batch["context"]["extrinsics"],
+                    gt_context_intrinsics=batch["context"]["intrinsics"],
                     # global_rank = self.global_rank
                 )
                 gaussians = self.model._refine_gaussians(
@@ -2556,12 +2786,12 @@ class ModelWrapper(LightningModule):
                     return_append_masks=bool(self.test_cfg.save_compare),
                     residual_camera_to_world=(
                         batch["context"]["extrinsics"][:, :ctx_img_num]
-                        if self.model.encoder.cfg.source_render_camera == "gt"
+                        if evaluation_cameras.source_render_camera == "gt"
                         else pred_all_extrinsic[:, :ctx_img_num]
                     ),
                     residual_intrinsics=(
                         batch["context"]["intrinsics"][:, :ctx_img_num]
-                        if self.model.encoder.cfg.source_render_camera == "gt"
+                        if evaluation_cameras.source_render_camera == "gt"
                         else intrinsic[:, :ctx_img_num]
                     ),
                 )
@@ -2872,7 +3102,7 @@ class ModelWrapper(LightningModule):
         num_context_view = ctx_img_num
         pred_all_target_extrinsic = pred_all_extrinsic[:, ctx_img_num:]
         pred_all_target_intrinsic = intrinsic[:, ctx_img_num:]
-        if self.model.encoder.cfg.heldout_test_camera == "gt":
+        if evaluation_cameras.heldout_test_camera == "gt":
             pred_all_target_extrinsic = batch["target"]["extrinsics"]
             pred_all_target_intrinsic = batch["target"]["intrinsics"]
         render_view_count = pred_all_target_extrinsic.shape[1]
@@ -2937,7 +3167,18 @@ class ModelWrapper(LightningModule):
                 batch["context"]["image"][0, :ctx_img_num]
             )
             model_depth_pred = vis_depth_map(depth_map.squeeze(-1)[0])
-            depth_pred = vis_depth_map(output.depth[0])
+            accumulated_rendered_depth = output.depth[0]
+            rendered_alpha = output.alpha[0]
+            if accumulated_rendered_depth.ndim == 2:
+                accumulated_rendered_depth = accumulated_rendered_depth.unsqueeze(0)
+                rendered_alpha = rendered_alpha.unsqueeze(0)
+            rendered_depth, rendered_depth_valid = (
+                _expected_render_depth_for_visualization(
+                    accumulated_rendered_depth, rendered_alpha
+                )
+            )
+            depth_pred = vis_depth_map(rendered_depth)
+            depth_pred = depth_pred * rendered_depth_valid.unsqueeze(-3)
             comparison_columns = [
                 add_label(vcat(*context_img), "Context"),
             ]

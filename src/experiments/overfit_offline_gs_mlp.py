@@ -98,6 +98,8 @@ def _requires_sim3_alignment(
     heldout_test_camera: str,
     heldout_loss_enabled: bool,
     alignment_mode: str = "auto",
+    geometry_camera_source: str = "predicted",
+    heldout_loss_camera: str = "gt",
 ) -> bool:
     """Select whether the predicted reconstruction is moved into the GT gauge."""
     alignment_mode = str(alignment_mode).lower()
@@ -111,9 +113,10 @@ def _requires_sim3_alignment(
             f"{alignment_mode!r}."
         )
     return (
-        source_render_camera == "gt"
+        geometry_camera_source == "gt"
+        or source_render_camera == "gt"
         or heldout_test_camera == "gt"
-        or heldout_loss_enabled
+        or (heldout_loss_enabled and heldout_loss_camera == "gt")
     )
 
 
@@ -182,6 +185,7 @@ def _concatenate_gaussian_anchors(
     sim3_translation: torch.Tensor,
     sim3_scale: torch.Tensor,
     cfg: DictConfig,
+    gaussian_scale_factor: torch.Tensor | None = None,
 ) -> Gaussians:
     batch, views, _, height, width = images.shape
     flattened_batch = batch * views
@@ -229,7 +233,9 @@ def _concatenate_gaussian_anchors(
         means, sim3_rotation, sim3_translation, sim3_scale
     )
     scales = anchors.scales.reshape(batch, views, height * width, 3)
-    scales = scales * sim3_scale[:, None, None, None]
+    if gaussian_scale_factor is None:
+        gaussian_scale_factor = sim3_scale
+    scales = scales * gaussian_scale_factor[:, None, None, None]
     rotation_matrices = quat_to_mat(
         anchors.rotations.reshape(batch, views, height * width, 4).float()
     )
@@ -371,6 +377,7 @@ def _build_source_anchor_views(
         anchor_inputs["sim3_translation"],
         anchor_inputs["sim3_scale"],
         cfg,
+        gaussian_scale_factor=anchor_inputs.get("gaussian_scale_factor"),
     )
     height, width = images.shape[-2:]
     anchors_per_view = height * width
@@ -1082,10 +1089,36 @@ def _evaluate(
         "unbounded_residual_updates": bool(
             cfg.get("unbounded_residual_updates", False)
         ),
-        "source_render_camera": str(cfg.source_render_camera).lower(),
-        "heldout_test_camera": str(cfg.heldout_test_camera).lower(),
+        "training_geometry_camera_source": str(
+            cfg.training_geometry_camera_source
+        ).lower(),
+        "training_sim3_alignment_mode": str(
+            cfg.training_sim3_alignment_mode
+        ).lower(),
+        "training_source_render_camera": str(
+            cfg.training_source_render_camera
+        ).lower(),
+        "training_heldout_loss_camera": str(
+            cfg.training_heldout_loss_camera
+        ).lower(),
+        "geometry_camera_source": str(
+            cfg.evaluation_geometry_camera_source
+        ).lower(),
+        "source_render_camera": str(
+            cfg.evaluation_source_render_camera
+        ).lower(),
+        "heldout_loss_camera": str(
+            cfg.evaluation_heldout_loss_camera
+        ).lower(),
+        "heldout_test_camera": str(
+            cfg.evaluation_heldout_test_camera
+        ).lower(),
+        "heldout_loss_camera_conditioned": (
+            str(cfg.evaluation_heldout_loss_camera).lower()
+            == "predicted"
+        ),
         "heldout_camera_conditioned": (
-            str(cfg.heldout_test_camera).lower() == "predicted"
+            str(cfg.evaluation_heldout_test_camera).lower() == "predicted"
         ),
         "gaussian_count": int(base_state.num_gaussians),
         "map_opacity_mean": float(valid_opacity.mean().item()),
@@ -1275,10 +1308,36 @@ def _evaluate_incremental(
         "unbounded_residual_updates": bool(
             cfg.get("unbounded_residual_updates", False)
         ),
-        "source_render_camera": str(cfg.source_render_camera).lower(),
-        "heldout_test_camera": str(cfg.heldout_test_camera).lower(),
+        "training_geometry_camera_source": str(
+            cfg.training_geometry_camera_source
+        ).lower(),
+        "training_sim3_alignment_mode": str(
+            cfg.training_sim3_alignment_mode
+        ).lower(),
+        "training_source_render_camera": str(
+            cfg.training_source_render_camera
+        ).lower(),
+        "training_heldout_loss_camera": str(
+            cfg.training_heldout_loss_camera
+        ).lower(),
+        "geometry_camera_source": str(
+            cfg.evaluation_geometry_camera_source
+        ).lower(),
+        "source_render_camera": str(
+            cfg.evaluation_source_render_camera
+        ).lower(),
+        "heldout_loss_camera": str(
+            cfg.evaluation_heldout_loss_camera
+        ).lower(),
+        "heldout_test_camera": str(
+            cfg.evaluation_heldout_test_camera
+        ).lower(),
+        "heldout_loss_camera_conditioned": (
+            str(cfg.evaluation_heldout_loss_camera).lower()
+            == "predicted"
+        ),
         "heldout_camera_conditioned": (
-            str(cfg.heldout_test_camera).lower() == "predicted"
+            str(cfg.evaluation_heldout_test_camera).lower() == "predicted"
         ),
         "initial_gs_count": int(anchors[0].means.shape[1]),
         "gaussian_count": int(corrected_state.num_gaussians),
@@ -1774,37 +1833,70 @@ def main(cfg_dict: DictConfig) -> None:
             )
     if int(cfg.max_steps) <= 0:
         raise ValueError("offline.max_steps must be positive.")
-    source_render_camera = str(cfg.source_render_camera).lower()
-    heldout_test_camera = str(cfg.heldout_test_camera).lower()
+    training_geometry_camera_source = str(
+        cfg.training_geometry_camera_source
+    ).lower()
+    training_source_render_camera = str(
+        cfg.training_source_render_camera
+    ).lower()
+    training_heldout_loss_camera = str(
+        cfg.training_heldout_loss_camera
+    ).lower()
+    evaluation_geometry_camera_source = str(
+        cfg.evaluation_geometry_camera_source
+    ).lower()
+    evaluation_source_render_camera = str(
+        cfg.evaluation_source_render_camera
+    ).lower()
+    evaluation_heldout_loss_camera = str(
+        cfg.evaluation_heldout_loss_camera
+    ).lower()
+    evaluation_heldout_test_camera = str(
+        cfg.evaluation_heldout_test_camera
+    ).lower()
     valid_render_cameras = {"gt", "predicted"}
-    if source_render_camera not in valid_render_cameras:
-        raise ValueError("offline.source_render_camera must be gt or predicted.")
-    if heldout_test_camera not in valid_render_cameras:
-        raise ValueError("offline.heldout_test_camera must be gt or predicted.")
-    sim3_alignment_mode = str(cfg.get("sim3_alignment_mode", "auto")).lower()
-    sim3_alignment_enabled = _requires_sim3_alignment(
-        source_render_camera,
-        heldout_test_camera,
+    camera_modes = {
+        "training_geometry_camera_source": training_geometry_camera_source,
+        "training_source_render_camera": training_source_render_camera,
+        "training_heldout_loss_camera": training_heldout_loss_camera,
+        "evaluation_geometry_camera_source": evaluation_geometry_camera_source,
+        "evaluation_source_render_camera": evaluation_source_render_camera,
+        "evaluation_heldout_loss_camera": evaluation_heldout_loss_camera,
+        "evaluation_heldout_test_camera": evaluation_heldout_test_camera,
+    }
+    for name, value in camera_modes.items():
+        if value not in valid_render_cameras:
+            raise ValueError(f"offline.{name} must be gt or predicted.")
+    training_sim3_alignment_mode = str(
+        cfg.training_sim3_alignment_mode
+    ).lower()
+    training_sim3_alignment_enabled = _requires_sim3_alignment(
+        training_source_render_camera,
+        "predicted",
         heldout_loss_enabled,
-        sim3_alignment_mode,
+        training_sim3_alignment_mode,
+        geometry_camera_source=training_geometry_camera_source,
+        heldout_loss_camera=training_heldout_loss_camera,
     )
-    gt_gauge_required = (
-        source_render_camera == "gt"
-        or heldout_test_camera == "gt"
-        or heldout_loss_enabled
+    evaluation_sim3_alignment_mode = str(
+        cfg.evaluation_sim3_alignment_mode
+    ).lower()
+    evaluation_sim3_alignment_enabled = _requires_sim3_alignment(
+        evaluation_source_render_camera,
+        evaluation_heldout_test_camera,
+        heldout_loss_enabled,
+        evaluation_sim3_alignment_mode,
+        geometry_camera_source=evaluation_geometry_camera_source,
+        heldout_loss_camera=evaluation_heldout_loss_camera,
     )
-    if sim3_alignment_mode == "never" and gt_gauge_required:
+    if (
+        training_sim3_alignment_enabled or evaluation_sim3_alignment_enabled
+    ) and source_frame_count < 3:
         raise ValueError(
-            "offline.sim3_alignment_mode=never requires predicted source/test "
-            "cameras and heldout_loss_enabled=false; GT renders require Sim(3) "
-            "gauge alignment."
+            "At least 3 offline.train_frames are required when source-camera "
+            "Sim(3) alignment is enabled."
         )
-    if sim3_alignment_enabled and source_frame_count < 3:
-        raise ValueError(
-            "At least 3 offline.train_frames are required when a GT render "
-            "camera enables source-camera Sim(3) alignment."
-        )
-    if not sim3_alignment_enabled and source_frame_count < 1:
+    if source_frame_count < 1:
         raise ValueError("offline.train_frames must contain at least one source view.")
     gaussian_parameter_source = str(cfg.gaussian_parameter_source).lower()
     if gaussian_parameter_source not in {"analytic", "gs_head"}:
@@ -1940,40 +2032,69 @@ def main(cfg_dict: DictConfig) -> None:
 
     data = _load_toy_data(cfg, device)
     source_count = data["images"].shape[1]
-    predict_test_camera = heldout_test_camera == "predicted"
+    predict_evaluation_loss_camera = (
+        heldout_loss_enabled
+        and evaluation_heldout_loss_camera == "predicted"
+    )
+    predict_evaluation_test_camera = (
+        evaluation_heldout_test_camera == "predicted"
+    )
     reconstruction_backbone = str(
         model.encoder.cfg.reconstruction_backbone
     ).lower()
-    if predict_test_camera and reconstruction_backbone not in {
-        "zipmap",
-        "streamvggt",
-    }:
+    if (
+        predict_evaluation_loss_camera or predict_evaluation_test_camera
+    ) and reconstruction_backbone not in {"zipmap", "streamvggt"}:
         raise ValueError(
             "Predicted heldout cameras require ZipMap or StreamVGGT, got "
             f"{reconstruction_backbone!r}."
         )
-    if predict_test_camera:
-        camera_images = torch.cat(
-            [data["images"], data["heldout_test"]["rgb"]], dim=1
+    camera_image_parts = [data["images"]]
+    camera_gt_c2w_parts = [data["c2w"]]
+    camera_cursor = source_count
+    heldout_loss_camera_slice = slice(camera_cursor, camera_cursor)
+    if predict_evaluation_loss_camera:
+        predicted_loss_view_count = data["heldout_loss"]["rgb"].shape[1]
+        heldout_loss_camera_slice = slice(
+            camera_cursor, camera_cursor + predicted_loss_view_count
         )
-        camera_gt_c2w = torch.cat(
-            [data["c2w"], data["heldout_test"]["c2w"]], dim=1
+        camera_cursor += predicted_loss_view_count
+        camera_image_parts.append(data["heldout_loss"]["rgb"])
+        camera_gt_c2w_parts.append(data["heldout_loss"]["c2w"])
+    heldout_test_camera_slice = slice(camera_cursor, camera_cursor)
+    if predict_evaluation_test_camera:
+        predicted_test_view_count = data["heldout_test"]["rgb"].shape[1]
+        heldout_test_camera_slice = slice(
+            camera_cursor, camera_cursor + predicted_test_view_count
         )
-    else:
-        camera_images = data["images"]
-        camera_gt_c2w = data["c2w"]
+        camera_image_parts.append(data["heldout_test"]["rgb"])
+        camera_gt_c2w_parts.append(data["heldout_test"]["c2w"])
+    camera_images = torch.cat(camera_image_parts, dim=1)
+    camera_gt_c2w = torch.cat(camera_gt_c2w_parts, dim=1)
     with torch.no_grad():
-        all_tokens, patch_start_idx = _cache_backbone_tokens(
-            model, camera_images, bool(cfg.mixed_precision)
+        source_tokens, patch_start_idx = _cache_backbone_tokens(
+            model, data["images"], bool(cfg.mixed_precision)
+        )
+        evaluation_camera_tokens = (
+            source_tokens
+            if camera_images.shape[1] == source_count
+            else _cache_backbone_tokens(
+                model,
+                camera_images,
+                bool(cfg.mixed_precision),
+            )[0]
         )
         camera_view_count = camera_images.shape[1]
-        if any(token.shape[1] < camera_view_count for token in all_tokens):
+        if any(
+            token.shape[1] < camera_view_count
+            for token in evaluation_camera_tokens
+        ):
             raise RuntimeError(
                 "Backbone tokens do not contain every requested camera view: "
                 f"requested={camera_view_count}, "
-                f"token_views={[token.shape[1] for token in all_tokens]}."
+                "token_views="
+                f"{[token.shape[1] for token in evaluation_camera_tokens]}."
             )
-        source_tokens = [token[:, :source_count] for token in all_tokens]
         cached_features, cached_depth, _ = _extract_features(
             model,
             source_tokens,
@@ -1982,14 +2103,23 @@ def main(cfg_dict: DictConfig) -> None:
             data["image_shape"],
             bool(cfg.mixed_precision),
         )
-        cached_camera = _predict_camera_geometry(
-            model, all_tokens, data["image_shape"], camera_gt_c2w
+        cached_training_camera = _predict_camera_geometry(
+            model,
+            source_tokens,
+            data["image_shape"],
+            data["c2w"],
         )
-    if cached_camera["c2w"].shape[1] != camera_view_count:
+        cached_evaluation_camera = _predict_camera_geometry(
+            model,
+            evaluation_camera_tokens,
+            data["image_shape"],
+            camera_gt_c2w,
+        )
+    if cached_evaluation_camera["c2w"].shape[1] != camera_view_count:
         raise RuntimeError(
             "Camera head returned an unexpected view count: "
             f"expected={camera_view_count}, "
-            f"actual={cached_camera['c2w'].shape[1]}."
+            f"actual={cached_evaluation_camera['c2w'].shape[1]}."
         )
     if depth_loss_enabled:
         data["dav3_depth"] = _cache_dav3_depth_targets(
@@ -2008,10 +2138,37 @@ def main(cfg_dict: DictConfig) -> None:
 
     def build_scene_components(
         *,
+        phase: str,
         track_gradients: bool,
         anchor_start: int = 0,
         anchor_end: int | None = None,
     ) -> dict:
+        if phase == "training":
+            geometry_camera_source = training_geometry_camera_source
+            source_render_camera = training_source_render_camera
+            heldout_loss_camera = training_heldout_loss_camera
+            heldout_test_camera = "gt"
+            sim3_alignment_mode = training_sim3_alignment_mode
+            sim3_alignment_enabled = training_sim3_alignment_enabled
+            predict_loss_camera = False
+            predict_test_camera = False
+            camera_tokens = source_tokens
+            camera_supervision_c2w = data["c2w"]
+            cached_camera = cached_training_camera
+        elif phase == "evaluation":
+            geometry_camera_source = evaluation_geometry_camera_source
+            source_render_camera = evaluation_source_render_camera
+            heldout_loss_camera = evaluation_heldout_loss_camera
+            heldout_test_camera = evaluation_heldout_test_camera
+            sim3_alignment_mode = evaluation_sim3_alignment_mode
+            sim3_alignment_enabled = evaluation_sim3_alignment_enabled
+            predict_loss_camera = predict_evaluation_loss_camera
+            predict_test_camera = predict_evaluation_test_camera
+            camera_tokens = evaluation_camera_tokens
+            camera_supervision_c2w = camera_gt_c2w
+            cached_camera = cached_evaluation_camera
+        else:
+            raise ValueError(f"Unknown offline component phase {phase!r}.")
         with torch.set_grad_enabled(track_gradients):
             if train_depth_head:
                 features, predicted_depth_raw, _ = _extract_features(
@@ -2027,7 +2184,10 @@ def main(cfg_dict: DictConfig) -> None:
                 predicted_depth_raw = cached_depth
             camera = (
                 _predict_camera_geometry(
-                    model, all_tokens, data["image_shape"], camera_gt_c2w
+                    model,
+                    camera_tokens,
+                    data["image_shape"],
+                    camera_supervision_c2w,
                 )
                 if train_camera_head
                 else cached_camera
@@ -2087,47 +2247,94 @@ def main(cfg_dict: DictConfig) -> None:
                 posinf=100.0,
                 neginf=1e-4,
             ).clamp(1e-4, 100.0)
-            geometry_c2w = camera["c2w"]
-            geometry_intrinsic_px = camera["intrinsic_px"]
+            # Use the camera head's own first-source-relative gauge. The
+            # camera["c2w"] convenience value is anchored to the first GT pose
+            # and must not enter a fully predicted-camera experiment.
+            predicted_geometry_c2w = camera["relative_c2w"]
+            predicted_geometry_intrinsic_px = camera["intrinsic_px"]
             geometry_depth = predicted_depth
             if bool(cfg.get("detach_predicted_camera", False)):
-                geometry_c2w = geometry_c2w.detach()
-                geometry_intrinsic_px = geometry_intrinsic_px.detach()
+                predicted_geometry_c2w = predicted_geometry_c2w.detach()
+                predicted_geometry_intrinsic_px = (
+                    predicted_geometry_intrinsic_px.detach()
+                )
             if bool(cfg.get("detach_predicted_depth", False)):
                 geometry_depth = geometry_depth.detach()
 
             if sim3_alignment_enabled:
                 rotation, translation, scale = estimate_camera_sim3(
-                    geometry_c2w[:, :source_count], data["c2w"]
+                    predicted_geometry_c2w[:, :source_count], data["c2w"]
                 )
                 aligned_all_c2w = apply_camera_sim3(
-                    geometry_c2w, rotation, translation, scale
+                    predicted_geometry_c2w, rotation, translation, scale
                 )
             else:
-                batch = geometry_c2w.shape[0]
+                batch = predicted_geometry_c2w.shape[0]
                 rotation = torch.eye(
-                    3, device=geometry_c2w.device, dtype=geometry_c2w.dtype
+                    3,
+                    device=predicted_geometry_c2w.device,
+                    dtype=predicted_geometry_c2w.dtype,
                 ).unsqueeze(0).expand(batch, -1, -1)
                 translation = torch.zeros(
-                    batch, 3, device=geometry_c2w.device, dtype=geometry_c2w.dtype
+                    batch,
+                    3,
+                    device=predicted_geometry_c2w.device,
+                    dtype=predicted_geometry_c2w.dtype,
                 )
                 scale = torch.ones(
-                    batch, device=geometry_c2w.device, dtype=geometry_c2w.dtype
+                    batch,
+                    device=predicted_geometry_c2w.device,
+                    dtype=predicted_geometry_c2w.dtype,
                 )
-                aligned_all_c2w = geometry_c2w
+                aligned_all_c2w = predicted_geometry_c2w
             aligned_source_c2w = aligned_all_c2w[:, :source_count]
             predicted_source_intrinsic = _normalized_intrinsic(
-                geometry_intrinsic_px[:, :source_count], *data["image_shape"]
+                predicted_geometry_intrinsic_px[:, :source_count],
+                *data["image_shape"],
             )
+            if geometry_camera_source == "gt":
+                point_rotation = torch.eye(
+                    3,
+                    device=rotation.device,
+                    dtype=rotation.dtype,
+                ).unsqueeze(0).expand_as(rotation)
+                point_translation = torch.zeros_like(translation)
+                point_scale = torch.ones_like(scale)
+                anchor_depth = (
+                    geometry_depth
+                    * scale.detach()[:, None, None, None]
+                )
+                anchor_c2w = data["c2w"]
+                anchor_intrinsic_px = data["intrinsic_px"]
+                gaussian_scale_factor = (
+                    scale.detach()
+                    if str(cfg.gaussian_parameter_source).lower() == "gs_head"
+                    else torch.ones_like(scale)
+                )
+                source_geometry_c2w = data["c2w"]
+                source_geometry_intrinsic = data["intrinsic"]
+            else:
+                point_rotation = rotation
+                point_translation = translation
+                point_scale = scale
+                anchor_depth = geometry_depth
+                anchor_c2w = predicted_geometry_c2w[:, :source_count]
+                anchor_intrinsic_px = predicted_geometry_intrinsic_px[
+                    :, :source_count
+                ]
+                gaussian_scale_factor = scale
+                source_geometry_c2w = aligned_source_c2w
+                source_geometry_intrinsic = predicted_source_intrinsic
             anchor_inputs = {
                 "features": features.detach(),
                 "images": data["images"],
-                "depth": geometry_depth,
-                "predicted_c2w": geometry_c2w[:, :source_count],
-                "predicted_intrinsic_px": geometry_intrinsic_px[:, :source_count],
-                "sim3_rotation": rotation,
-                "sim3_translation": translation,
-                "sim3_scale": scale,
+                "depth": anchor_depth,
+                "predicted_c2w": anchor_c2w,
+                "predicted_intrinsic_px": anchor_intrinsic_px,
+                "sim3_rotation": point_rotation,
+                "sim3_translation": point_translation,
+                "sim3_scale": point_scale,
+                "gaussian_scale_factor": gaussian_scale_factor,
             }
             anchors = _build_source_anchor_views(
                 model,
@@ -2137,15 +2344,33 @@ def main(cfg_dict: DictConfig) -> None:
                 end=anchor_end,
             )
             geometry_data = {
-                "c2w": aligned_source_c2w,
-                "intrinsic": predicted_source_intrinsic,
-                "depth": geometry_depth * scale[:, None, None, None],
+                "c2w": source_geometry_c2w,
+                "intrinsic": source_geometry_intrinsic,
+                "depth": anchor_depth,
             }
 
+            if predict_loss_camera:
+                aligned_loss_c2w = aligned_all_c2w[
+                    :, heldout_loss_camera_slice
+                ]
+                predicted_loss_intrinsic = _normalized_intrinsic(
+                    predicted_geometry_intrinsic_px[
+                        :, heldout_loss_camera_slice
+                    ],
+                    *data["image_shape"],
+                )
+            else:
+                aligned_loss_c2w = data["heldout_loss"]["c2w"]
+                predicted_loss_intrinsic = data["heldout_loss"]["intrinsic"]
             if predict_test_camera:
-                aligned_test_c2w = aligned_all_c2w[:, source_count:]
+                aligned_test_c2w = aligned_all_c2w[
+                    :, heldout_test_camera_slice
+                ]
                 predicted_test_intrinsic = _normalized_intrinsic(
-                    geometry_intrinsic_px[:, source_count:], *data["image_shape"]
+                    predicted_geometry_intrinsic_px[
+                        :, heldout_test_camera_slice
+                    ],
+                    *data["image_shape"],
                 )
             else:
                 aligned_test_c2w = data["heldout_test"]["c2w"]
@@ -2162,6 +2387,19 @@ def main(cfg_dict: DictConfig) -> None:
                     if source_render_camera == "predicted"
                     else data["intrinsic"]
                 ),
+                "heldout_loss": {
+                    **data["heldout_loss"],
+                    "c2w": (
+                        aligned_loss_c2w
+                        if heldout_loss_camera == "predicted"
+                        else data["heldout_loss"]["c2w"]
+                    ),
+                    "intrinsic": (
+                        predicted_loss_intrinsic
+                        if heldout_loss_camera == "predicted"
+                        else data["heldout_loss"]["intrinsic"]
+                    ),
+                },
                 "heldout_test": {
                     **data["heldout_test"],
                     "c2w": (
@@ -2182,8 +2420,15 @@ def main(cfg_dict: DictConfig) -> None:
                     "sim3_alignment_mode": sim3_alignment_mode,
                     "sim3_alignment_enabled": bool(sim3_alignment_enabled),
                     "camera_coordinate_frame": (
-                        "gt_aligned" if sim3_alignment_enabled else "predicted"
+                        "gt_geometry"
+                        if geometry_camera_source == "gt"
+                        else (
+                            "gt_aligned"
+                            if sim3_alignment_enabled
+                            else "predicted"
+                        )
                     ),
+                    "geometry_camera_source": geometry_camera_source,
                     "sim3_scale": float(scale.mean().item()),
                     "depth_supervision_loss": float(depth_loss.item()),
                     "depth_structure_loss": float(depth_structure_loss.item()),
@@ -2268,6 +2513,20 @@ def main(cfg_dict: DictConfig) -> None:
                             ),
                         )
                     )
+                if predict_loss_camera:
+                    sim3_metrics.update(
+                        _camera_error_metrics(
+                            aligned_loss_c2w,
+                            predicted_loss_intrinsic,
+                            data["heldout_loss"]["c2w"],
+                            data["heldout_loss"]["intrinsic"],
+                            (
+                                "sim3_heldout_loss"
+                                if sim3_alignment_enabled
+                                else "predicted_heldout_loss"
+                            ),
+                        )
+                    )
             return {
                 "anchors": anchors,
                 "geometry_data": geometry_data,
@@ -2280,7 +2539,7 @@ def main(cfg_dict: DictConfig) -> None:
                 "camera_losses": camera_losses,
             }
 
-    def build_evaluation_components() -> dict:
+    def build_frozen_scene_components(phase: str) -> dict:
         modules = [model.encoder.gs_head]
         if train_camera_head:
             modules.append(model.encoder.camera_head)
@@ -2290,10 +2549,16 @@ def main(cfg_dict: DictConfig) -> None:
         for module in modules:
             module.eval()
         try:
-            return build_scene_components(track_gradients=False)
+            return build_scene_components(
+                phase=phase,
+                track_gradients=False,
+            )
         finally:
             for module, training in zip(modules, previous_modes):
                 module.train(training)
+
+    def build_evaluation_components() -> dict:
+        return build_frozen_scene_components("evaluation")
 
     initial_components = build_evaluation_components()
     source_anchors = initial_components["anchors"]
@@ -2311,6 +2576,21 @@ def main(cfg_dict: DictConfig) -> None:
         f"per-view opacity={base_state.gaussians.opacities.max().item():.6f}"
     )
     print(f"Training mode: {training_mode}")
+    print(
+        "Offline training cameras: "
+        f"geometry={training_geometry_camera_source}, "
+        f"source={training_source_render_camera}, "
+        f"heldout_loss={training_heldout_loss_camera}; "
+        f"sim3={training_sim3_alignment_mode}; "
+        "camera_head=GT-supervised"
+    )
+    print(
+        "Offline evaluation cameras: "
+        f"geometry={evaluation_geometry_camera_source}, "
+        f"source={evaluation_source_render_camera}, "
+        f"heldout_loss={evaluation_heldout_loss_camera}, "
+        f"heldout_test={evaluation_heldout_test_camera}"
+    )
     if periodic_all_append_enabled:
         print(
             "Periodic point-map densification: every "
@@ -2340,12 +2620,16 @@ def main(cfg_dict: DictConfig) -> None:
             "objective plus heldout keep-gate supervision, backward, and "
             "optimizer.step per complete source-view sweep."
         )
-    if sim3_alignment_enabled:
-        print("Source-camera Sim(3): " + json.dumps(sim3_metrics, sort_keys=True))
+    if evaluation_sim3_alignment_enabled:
+        print(
+            "Evaluation source-camera Sim(3): "
+            + json.dumps(sim3_metrics, sort_keys=True)
+        )
     else:
         print(
-            "Source-camera Sim(3): disabled; predicted cameras, depth, and "
-            "Gaussians remain in the reconstruction backbone's native gauge."
+            "Evaluation source-camera Sim(3): disabled; predicted cameras, "
+            "depth, and Gaussians remain in the reconstruction backbone's "
+            "native gauge."
         )
     trainable_names = []
     if residual_enabled:
@@ -2411,14 +2695,24 @@ def main(cfg_dict: DictConfig) -> None:
     )
     print(
         "Render cameras: "
-        f"source={source_render_camera}, heldout_test={heldout_test_camera}"
+        f"training_source={training_source_render_camera}, "
+        f"training_heldout_loss={training_heldout_loss_camera}; "
+        f"evaluation_source={evaluation_source_render_camera}, "
+        f"evaluation_heldout_loss={evaluation_heldout_loss_camera}, "
+        f"evaluation_heldout_test={evaluation_heldout_test_camera}"
     )
-    if predict_test_camera:
+    if predict_evaluation_loss_camera or predict_evaluation_test_camera:
+        predicted_heldout_roles = []
+        if predict_evaluation_loss_camera:
+            predicted_heldout_roles.append("heldout-loss")
+        if predict_evaluation_test_camera:
+            predicted_heldout_roles.append("heldout-test")
         print(
-            "Heldout test camera prediction appends heldout RGBs after source "
-            f"RGBs and runs the {reconstruction_backbone} camera path; it is "
-            "RGB-conditioned "
-            "(camera-conditioned evaluation, not strict blind NVS)."
+            "Predicted "
+            + "/".join(predicted_heldout_roles)
+            + " cameras append their RGBs after source RGBs and run the "
+            + f"{reconstruction_backbone} camera path; evaluation is "
+            "camera-conditioned, not strict blind NVS."
         )
     head = SymmetricGSResidualHead(
         harmonic_dim=model.encoder.nums_sh * 3,
@@ -2519,7 +2813,9 @@ def main(cfg_dict: DictConfig) -> None:
     checkpoint_depth_head = selected_depth_head if train_depth_head else None
 
     def current_global_components(
-        *, track_anchor_gradients: bool
+        *,
+        phase: str,
+        track_anchor_gradients: bool,
     ) -> tuple[
         StreamingGaussianState,
         object,
@@ -2527,9 +2823,12 @@ def main(cfg_dict: DictConfig) -> None:
         dict,
     ]:
         components = (
-            build_scene_components(track_gradients=True)
+            build_scene_components(
+                phase=phase,
+                track_gradients=True,
+            )
             if track_anchor_gradients
-            else build_evaluation_components()
+            else build_frozen_scene_components(phase)
         )
         anchors = components["anchors"]
         state = _make_state(_concatenate_anchor_views(anchors))
@@ -2565,6 +2864,7 @@ def main(cfg_dict: DictConfig) -> None:
                     break
                 optimizer.zero_grad(set_to_none=True)
                 training_components = build_scene_components(
+                    phase="training",
                     track_gradients=True,
                     anchor_start=view_idx,
                     anchor_end=view_idx + 1,
@@ -2856,7 +3156,8 @@ def main(cfg_dict: DictConfig) -> None:
         for step in range(1, max_steps + 1):
             optimizer.zero_grad(set_to_none=True)
             training_components = build_scene_components(
-                track_gradients=True
+                phase="training",
+                track_gradients=True,
             )
             if training_mode == "incremental_final_map":
                 (
@@ -3208,25 +3509,38 @@ def main(cfg_dict: DictConfig) -> None:
             f"{source_count} source views..."
         )
         (
-            base_state,
-            gradient_evidence,
-            render_cache,
-            global_components,
-        ) = current_global_components(track_anchor_gradients=False)
+            evaluation_base_state,
+            evaluation_gradient_evidence,
+            evaluation_render_cache,
+            evaluation_components,
+        ) = current_global_components(
+            phase="evaluation",
+            track_anchor_gradients=False,
+        )
         corrected_state = _evaluate(
             model,
             head,
             cfg,
-            base_state,
-            gradient_evidence,
-            render_cache,
-            global_components["render_data"],
+            evaluation_base_state,
+            evaluation_gradient_evidence,
+            evaluation_render_cache,
+            evaluation_components["render_data"],
             0,
             output_dir,
-            global_components["sim3_metrics"],
+            evaluation_components["sim3_metrics"],
         )
         head.train()
         train_scene_heads = train_gs_head or train_camera_head or train_depth_head
+        if not train_scene_heads:
+            (
+                frozen_training_base_state,
+                frozen_training_gradient_evidence,
+                frozen_training_render_cache,
+                frozen_training_components,
+            ) = current_global_components(
+                phase="training",
+                track_anchor_gradients=False,
+            )
         for step in range(1, int(cfg.max_steps) + 1):
             optimizer.zero_grad(set_to_none=True)
             if train_scene_heads:
@@ -3235,12 +3549,15 @@ def main(cfg_dict: DictConfig) -> None:
                     training_gradient_evidence,
                     training_render_cache,
                     training_components,
-                ) = current_global_components(track_anchor_gradients=True)
+                ) = current_global_components(
+                    phase="training",
+                    track_anchor_gradients=True,
+                )
             else:
-                training_base_state = base_state
-                training_gradient_evidence = gradient_evidence
-                training_render_cache = render_cache
-                training_components = global_components
+                training_base_state = frozen_training_base_state
+                training_gradient_evidence = frozen_training_gradient_evidence
+                training_render_cache = frozen_training_render_cache
+                training_components = frozen_training_components
             training_render_data = training_components["render_data"]
             if residual_enabled:
                 evidence = _attach_visual_evidence(
@@ -3433,12 +3750,15 @@ def main(cfg_dict: DictConfig) -> None:
                         eval_gradient_evidence,
                         eval_render_cache,
                         eval_components,
-                    ) = current_global_components(track_anchor_gradients=False)
+                    ) = current_global_components(
+                        phase="evaluation",
+                        track_anchor_gradients=False,
+                    )
                 else:
-                    eval_base_state = base_state
-                    eval_gradient_evidence = gradient_evidence
-                    eval_render_cache = render_cache
-                    eval_components = global_components
+                    eval_base_state = evaluation_base_state
+                    eval_gradient_evidence = evaluation_gradient_evidence
+                    eval_render_cache = evaluation_render_cache
+                    eval_components = evaluation_components
                 corrected_state = _evaluate(
                     model,
                     head,

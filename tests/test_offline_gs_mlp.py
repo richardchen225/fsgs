@@ -1,4 +1,7 @@
+from pathlib import Path
+
 import torch
+from omegaconf import OmegaConf
 
 import src.experiments.overfit_offline_gs_mlp as offline_experiment
 from src.experiments.overfit_offline_gs_mlp import (
@@ -15,6 +18,28 @@ from src.experiments.overfit_offline_gs_mlp import (
 )
 from src.experiments.overfit_old_gs_residual import _camera_supervision_losses
 from src.model.types import Gaussians
+
+
+def test_offline_experiment_separates_training_and_evaluation_cameras() -> None:
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "config"
+        / "experiment"
+        / "offline_gs_mlp_overfit.yaml"
+    )
+    offline_cfg = OmegaConf.load(config_path).offline
+
+    assert offline_cfg.training_geometry_camera_source == "predicted"
+    assert offline_cfg.training_source_render_camera == "gt"
+    assert offline_cfg.training_heldout_loss_camera == "gt"
+    assert offline_cfg.training_sim3_alignment_mode == "always"
+    assert offline_cfg.evaluation_geometry_camera_source == "predicted"
+    assert offline_cfg.evaluation_source_render_camera == "predicted"
+    assert offline_cfg.evaluation_heldout_loss_camera == "predicted"
+    assert offline_cfg.evaluation_heldout_test_camera == "predicted"
+    assert offline_cfg.evaluation_sim3_alignment_mode == "never"
+    assert offline_cfg.train_camera_head
+    assert offline_cfg.loss_camera > 0.0
 
 
 def _rotation_z(angle: float) -> torch.Tensor:
@@ -104,6 +129,18 @@ def test_sim3_alignment_is_skipped_only_for_all_predicted_renders() -> None:
     assert _requires_sim3_alignment("gt", "predicted", False)
     assert _requires_sim3_alignment("predicted", "gt", False)
     assert _requires_sim3_alignment("predicted", "predicted", True)
+    assert not _requires_sim3_alignment(
+        "predicted",
+        "predicted",
+        True,
+        heldout_loss_camera="predicted",
+    )
+    assert _requires_sim3_alignment(
+        "predicted",
+        "predicted",
+        False,
+        geometry_camera_source="gt",
+    )
 
 
 def test_sim3_alignment_mode_can_override_predicted_camera_auto_mode() -> None:
@@ -112,6 +149,13 @@ def test_sim3_alignment_mode_can_override_predicted_camera_auto_mode() -> None:
     )
     assert not _requires_sim3_alignment(
         "predicted", "predicted", False, "never"
+    )
+    assert not _requires_sim3_alignment(
+        "gt",
+        "predicted",
+        True,
+        "never",
+        geometry_camera_source="gt",
     )
 
 

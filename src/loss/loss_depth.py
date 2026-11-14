@@ -87,14 +87,29 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
 
         device = torch.device("cuda")
         model = DepthAnything3(checkpoint_path=str(dav3_weights_path))
-        model = model.to(device=device)
+        model = model.to(device=device).eval()
+        model.requires_grad_(False)
         self.depth_anything = model
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # The teacher is inference-only even while the surrounding Lightning
+        # module is in training mode.
+        self.depth_anything.eval()
+        return self
+
     def _context_depth_target(
-        self, depth_map: torch.Tensor, batch
+        self,
+        batch,
+        ctx_num: int,
+        device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, V, _, H, W = batch["context"]["image"].shape
-        ctx_num = depth_map.shape[1]
+        ctx_num = int(ctx_num)
+        if ctx_num <= 0:
+            raise ValueError(
+                f"DAV3 context view count must be positive, got {ctx_num}."
+            )
         if ctx_num > V:
             raise ValueError(
                 f"Requested {ctx_num} DAV3 views, but batch only has {V}."
@@ -179,7 +194,7 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
                     float(scene_scale) if scene_scale is not None else 0.0
                 )
                 scene_depth = torch.from_numpy(prediction.depth).to(
-                    device=depth_map.device,
+                    device=device,
                     dtype=torch.float32,
                 )
                 if scene_depth.shape[0] != ctx_num:
@@ -199,14 +214,35 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
             torch.stack(scene_targets, dim=0),
             torch.tensor(
                 scene_scale_valid,
-                device=depth_map.device,
+                device=device,
                 dtype=torch.bool,
             ),
             torch.tensor(
                 scene_scales,
-                device=depth_map.device,
+                device=device,
                 dtype=torch.float32,
             ),
+        )
+
+    def prepare_context_depth_target(
+        self,
+        batch,
+        ctx_num: int,
+        cxt_depth_weight: float = 0.01,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Run the frozen teacher before the student graph occupies the GPU."""
+        effective_weight = float(self.cfg.weight) * float(cxt_depth_weight)
+        if effective_weight == 0.0:
+            return None
+        if self.cfg.alignment != "sequence_scale_only_log":
+            raise RuntimeError(
+                "Unsupported DAV3 depth alignment: "
+                f"{self.cfg.alignment!r}."
+            )
+        return self._context_depth_target(
+            batch,
+            ctx_num,
+            batch["context"]["image"].device,
         )
 
     def ctx_depth_loss(
@@ -214,6 +250,9 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
         depth_map: torch.Tensor,  # [B, V, H, W, C]
         batch,
         cxt_depth_weight: float = 0.01,
+        prepared_target: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
     ):
         self.last_teacher_gt_metrics = {}
         self.last_depth_components = {}
@@ -237,9 +276,13 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
                 f"{self.cfg.alignment!r}."
             )
 
-        da_output, absolute_scale_valid, camera_scales = (
-            self._context_depth_target(depth_map, batch)
-        )
+        if prepared_target is None:
+            prepared_target = self._context_depth_target(
+                batch,
+                depth_map.shape[1],
+                depth_map.device,
+            )
+        da_output, absolute_scale_valid, camera_scales = prepared_target
         batch_size, view_count, height, width, channels = depth_map.shape
         if channels != 1:
             raise ValueError(
@@ -494,7 +537,9 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
 
         B, R, V, H, W, C = depth_iters.shape
         da_output, absolute_scale_valid, _ = self._context_depth_target(
-            depth_iters[:, -1], batch
+            batch,
+            V,
+            depth_iters.device,
         )
         pred_depth = depth_iters.permute(1, 0, 2, 3, 4, 5).reshape(R, B * V, H, W, C).squeeze(-1)
 

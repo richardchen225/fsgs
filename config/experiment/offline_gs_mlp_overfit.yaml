@@ -56,17 +56,25 @@ offline:
   heldout_loss_frame: [6, 14, 22]
   heldout_loss_enabled: true
   heldout_loss_weight: 1.0
-  # GT test cameras are strict blind NVS. With predicted test cameras, test
-  # RGBs are appended after the sources for the ZipMap or StreamVGGT camera
-  # path; they never produce depth/GS/evidence or enter the RGB loss.
+  # Heldout test RGBs remain outside optimization, but are camera-conditioned:
+  # they are appended to the source sequence to predict their render cameras.
   heldout_test_frame: [10, 18]
-  # always reproduces the original experiment by putting predicted cameras,
-  # depth, and GS into the GT-aligned gauge even for predicted-camera renders.
-  # auto skips alignment only for a fully predicted-camera experiment; never
-  # is allowed only for that same fully predicted setup.
-  sim3_alignment_mode: always  # auto | always | never
-  source_render_camera: gt       # gt | predicted
-  heldout_test_camera: gt        # gt | predicted
+  # Training constructs geometry with predicted cameras/intrinsics, then fits
+  # a source-camera Sim(3) into the GT gauge. GT cameras still drive source and
+  # heldout RGB supervision, and explicitly supervise the camera head below.
+  training_sim3_alignment_mode: always  # auto | always | never
+  training_geometry_camera_source: predicted
+  training_source_render_camera: gt
+  training_heldout_loss_camera: gt
+
+  # Evaluation rebuilds the complete map in the camera head's predicted,
+  # first-source-relative gauge. Source/heldout unprojection and rendering use
+  # predicted poses/intrinsics, with no GT Sim(3) alignment.
+  evaluation_sim3_alignment_mode: never  # auto | always | never
+  evaluation_geometry_camera_source: predicted  # gt | predicted
+  evaluation_source_render_camera: predicted    # gt | predicted
+  evaluation_heldout_loss_camera: predicted     # gt | predicted
+  evaluation_heldout_test_camera: predicted     # gt | predicted
 
   mixed_precision: true
   # gs_head: WorldMirror gaussian_param_head features + gs_head parameters.
@@ -92,9 +100,9 @@ offline:
   depth_absolute_log_scale_weight: 0.1
   loss_depth: 1.0e-2
   loss_camera: 1.0
-  # Supervise motion between consecutive source cameras instead of measuring
-  # every source pose against the first camera.
-  camera_pose_loss_mode: adjacent_pair  # first_relative | adjacent_pair
+  # Camera predictions are explicitly supervised by GT in addition to the
+  # training Sim(3) alignment; evaluation uses predictions without alignment.
+  camera_pose_loss_mode: absolute  # absolute | first_relative | adjacent_pair
   # Match the original training loss: MSE + 0.05 * LPIPS(VGG). In
   # incremental_final_map this is evaluated once on all final source renders.
   lpips_loss_enabled: true
@@ -111,9 +119,8 @@ offline:
   # excluded; remaining direction terms are weighted by relative baseline.
   camera_translation_direction_min_baseline_ratio: 0.05
   camera_translation_direction_baseline_weighting: true
-  # Weak first-frame-relative trajectory supervision prevents coherent local
-  # adjacent-pair errors from accumulating across the complete sequence.
-  camera_global_trajectory_weight: 0.1
+  # Absolute supervision already fixes the complete trajectory gauge.
+  camera_global_trajectory_weight: 0.0
   camera_rotation_weight: 1.0
   camera_focal_weight: 1.0
 
@@ -159,8 +166,8 @@ offline:
   keep_gate_detach_heldout_map: true
 
   # Incremental map construction. "all" gives camera ablations identical GS
-  # topology; "point_map" uses frozen Sim(3)-aligned predicted geometry to
-  # suppress covered anchors. For incremental_per_frame max_steps counts frame
+  # topology; "point_map" uses the configured geometry camera to suppress
+  # covered anchors. For incremental_per_frame max_steps counts frame
   # updates; for incremental_full_graph and incremental_final_map it counts
   # complete source-view sweeps.
   append_mode: all  # point_map | all

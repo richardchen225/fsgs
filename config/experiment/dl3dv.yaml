@@ -19,17 +19,28 @@ model:
     streamvggt_weights_path: weights/pre_svggt.safetensors
     zipmap_weights_path: weights/pre_zipmap.pt
     # Match offline detach_predicted_camera=true: RGB geometry cannot update
-    # the camera head; only the explicit adjacent-pair camera loss can do so.
+    # the camera head; only the explicit all-pairs camera loss can do so.
     detach_predicted_camera_for_geometry: true
     # Use the first source frame's predicted intrinsics for every view.
     share_first_frame_intrinsics: false
-    # Match offline_gs_mlp_overfit: predicted geometry is aligned once to the
-    # source GT gauge, while source/heldout RGB supervision renders with GT.
-    sim3_alignment_mode: always
-    source_render_camera: gt
-    heldout_test_camera: gt
+    # Keep training and evaluation in the native predicted gauge. Explicit
+    # camera supervision trains the detached camera head separately.
+    training_sim3_alignment_mode: never
+    training_geometry_camera_source: predicted
+    training_source_render_camera: predicted
+    training_heldout_test_camera: predicted
+    evaluation_sim3_alignment_mode: never
+    evaluation_geometry_camera_source: predicted
+    evaluation_source_render_camera: predicted
+    evaluation_heldout_test_camera: predicted
     depth_refine_downsample_factor: 4
     depth_refine_enabled: false
+    # Learn each GS standard deviation in projected-pixel units, then convert
+    # it to world units with depth / focal_px. This avoids a fixed scene-scale
+    # cap and bounds the source-view radius to 0.5--2.0 pixels.
+    dense_scale_mode: legacy
+    dense_scale_min_projected_radius: 0.5
+    dense_scale_max_projected_radius: 2.0
     gir_enabled: true
     # Match the successful overfit setup: build GIR evidence and auxiliary
     # renders at full resolution.
@@ -122,7 +133,7 @@ model:
     gir_symmetric_multiview_max_log_scale_step: 0.02
     gir_symmetric_multiview_max_opacity_logit_step: 0.10
     gir_symmetric_multiview_max_harmonics_step: 0.05
-    gir_symmetric_multiview_unbounded_updates: true
+    gir_symmetric_multiview_unbounded_updates: false
     gir_training_mode: incremental_final_map
     # Point-map anchors progressively add persistent, non-recursive children.
     gir_anchor_child_enabled: false
@@ -183,7 +194,7 @@ model:
     gir_history_preserve_margin: 0.002
     gir_history_replay_views: -1
     # Point-map coverage decides which later-view pixels receive new anchors.
-    gir_append_mode: point_map
+    gir_append_mode: all
     gir_tracker_backend: alltracker
     gir_tracker_repo_path: third_party/AllTracker
     gir_tracker_weights_path: third_party/AllTracker/ckpts/alltracker.pth
@@ -306,16 +317,23 @@ test:
   save_unfiltered_ply: true
   
 train:
+  # Keep W&B focused on quality, core losses, camera health, and GIR updates.
+  compact_logging: true
   pose_loss_alpha: 1.0
   pose_loss_delta: 1.0
   camera_focal_weight: 1.0
-  camera_pose_loss_mode: adjacent_pair
+  # Supervise every relative pose pair inside the source window. Longer-range
+  # pairs receive weight proportional to their temporal gap; focal supervision
+  # remains the existing per-view raw-FOV loss.
+  camera_pose_loss_mode: all_pairs
   camera_translation_direction_weight: 0.1
   # Match offline: ignore nearly static pairs in the direction term and
-  # emphasize pairs in proportion to their GT adjacent baseline.
+  # emphasize pairs in proportion to their GT relative baseline.
   camera_translation_direction_min_baseline_ratio: 0.05
   camera_translation_direction_baseline_weighting: true
-  camera_global_trajectory_weight: 0.1
+  # All-pairs already contains frame-0-to-frame-j constraints, so do not add
+  # the separate first-relative trajectory term again.
+  camera_global_trajectory_weight: 0.0
   camera_grad_clip: 1.0
   cxt_depth_weight: 1.0
   weight_pose: 1.0
@@ -332,12 +350,17 @@ loss:
     weight_ctx: 1.0
     weight_novel: 1.0
     conf: false
+    # Exclude final-render pixels with no GS contribution from RGB loss.
+    alpha: true
+    alpha_threshold: 1.0e-4
   lpips:
     weight: 0.05
     apply_after_step: 0
     view_group: source
     chunk_size: 1
     gradient_checkpointing: true
+    alpha: true
+    alpha_threshold: 1.0e-4
   depth:
     teacher: dav3
     alignment: sequence_scale_only_log

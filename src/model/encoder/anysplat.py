@@ -34,6 +34,8 @@ from src.geometry.sim3 import (
     estimate_camera_sim3_with_fallback,
 )
 from src.geometry.camera_safety import sanitize_pose_encoding_for_geometry
+from src.model.camera_phase import resolve_camera_phase_settings
+from src.model.gaussian_scales import pixel_footprint_scales
 from torch import nn, Tensor
 from torch_scatter import scatter_add, scatter_max
 from ..types import Gaussians
@@ -92,6 +94,9 @@ class EncoderAnySplatCfg:
     num_surfaces: int
     input_mean: tuple[float, float, float] = (0.5, 0.5, 0.5)
     input_std: tuple[float, float, float] = (0.5, 0.5, 0.5)
+    dense_scale_mode: Literal["legacy", "pixel_footprint"] = "legacy"
+    dense_scale_min_projected_radius: float = 0.5
+    dense_scale_max_projected_radius: float = 2.0
     gt_pose_to_pts: bool = False
     opacity_threshold: float = 0.001
     gs_keep_ratio: float = 1.0
@@ -124,8 +129,33 @@ class EncoderAnySplatCfg:
     detach_predicted_camera_for_geometry: bool = False
     share_first_frame_intrinsics: bool = False
     sim3_alignment_mode: Literal["auto", "always", "never"] = "never"
+    geometry_camera_source: Literal["gt", "predicted"] = "predicted"
     source_render_camera: Literal["gt", "predicted"] = "predicted"
     heldout_test_camera: Literal["gt", "predicted"] = "predicted"
+    training_sim3_alignment_mode: Optional[
+        Literal["auto", "always", "never"]
+    ] = None
+    training_geometry_camera_source: Optional[
+        Literal["gt", "predicted"]
+    ] = None
+    training_source_render_camera: Optional[
+        Literal["gt", "predicted"]
+    ] = None
+    training_heldout_test_camera: Optional[
+        Literal["gt", "predicted"]
+    ] = None
+    evaluation_sim3_alignment_mode: Optional[
+        Literal["auto", "always", "never"]
+    ] = None
+    evaluation_geometry_camera_source: Optional[
+        Literal["gt", "predicted"]
+    ] = None
+    evaluation_source_render_camera: Optional[
+        Literal["gt", "predicted"]
+    ] = None
+    evaluation_heldout_test_camera: Optional[
+        Literal["gt", "predicted"]
+    ] = None
     gir_enabled: bool = False
     gir_render_scale: float = 0.25
     gir_raster_evidence_enabled: bool = False
@@ -1125,6 +1155,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         target_view_count: Optional[int] = None,
         return_gir_data: bool = False,
         gt_context_c2w: Optional[torch.Tensor] = None,
+        gt_context_intrinsics: Optional[torch.Tensor] = None,
     ) -> Gaussians:
 
         b, v, _, h, w = image.shape
@@ -1142,6 +1173,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
 
         distill_infos = {}
         infos = {}
+        camera_settings = resolve_camera_phase_settings(self.cfg, self.training)
         pred_all_extrinsic = None
         abot_local_points = None
         
@@ -1201,6 +1233,32 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 if detach_camera_geometry
                 else pred_all_intrinsic_px
             )
+            geometry_camera_source = camera_settings.geometry_camera_source
+            gt_intrinsic_px = None
+            if geometry_camera_source == "gt":
+                if gt_context_c2w is None or gt_context_intrinsics is None:
+                    raise RuntimeError(
+                        "geometry_camera_source=gt requires GT camera poses "
+                        "and intrinsics."
+                    )
+                if gt_context_c2w.shape[:2] != (b, image.shape[1]):
+                    raise RuntimeError(
+                        "GT camera sequence does not match the image sequence: "
+                        f"cameras={tuple(gt_context_c2w.shape)}, "
+                        f"images={tuple(image.shape)}."
+                    )
+                if gt_context_intrinsics.shape[:2] != (b, image.shape[1]):
+                    raise RuntimeError(
+                        "GT intrinsic sequence does not match the image sequence: "
+                        f"intrinsics={tuple(gt_context_intrinsics.shape)}, "
+                        f"images={tuple(image.shape)}."
+                    )
+                gt_intrinsic_px = gt_context_intrinsics.to(
+                    device=geometry_intrinsic_px.device,
+                    dtype=geometry_intrinsic_px.dtype,
+                ).clone()
+                gt_intrinsic_px[..., 0, :] *= float(w)
+                gt_intrinsic_px[..., 1, :] *= float(h)
             gt_ex = closed_form_inverse_se3(
                 geometry_w2c[:, :ctx_img_num].flatten(0, 1)
             )
@@ -1223,17 +1281,12 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 4,
             )
             raw_pred_all_extrinsic = pred_all_extrinsic
-            sim3_mode = str(self.cfg.sim3_alignment_mode).lower()
-            if sim3_mode not in {"auto", "always", "never"}:
-                raise ValueError(
-                    "sim3_alignment_mode must be auto, always, or never, got "
-                    f"{sim3_mode!r}."
-                )
+            sim3_mode = camera_settings.sim3_alignment_mode
             sim3_enabled = sim3_mode == "always" or (
                 sim3_mode == "auto"
                 and (
-                    self.cfg.source_render_camera == "gt"
-                    or self.cfg.heldout_test_camera == "gt"
+                    camera_settings.source_render_camera == "gt"
+                    or camera_settings.heldout_test_camera == "gt"
                 )
             )
             if sim3_enabled:
@@ -1315,7 +1368,19 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
             # Geometry is generated directly in the aligned gauge. Scaling
             # depth below and using these aligned source poses is equivalent
             # to applying the same Sim(3) to native predicted points.
-            gt_ex = pred_all_extrinsic[:, :ctx_img_num].flatten(0, 1)
+            if geometry_camera_source == "gt":
+                source_geometry_c2w = gt_context_c2w[:, :ctx_img_num].to(
+                    device=pred_all_extrinsic.device,
+                    dtype=pred_all_extrinsic.dtype,
+                )
+                source_geometry_intrinsic_px = gt_intrinsic_px[:, :ctx_img_num]
+            else:
+                source_geometry_c2w = pred_all_extrinsic[:, :ctx_img_num]
+                source_geometry_intrinsic_px = geometry_intrinsic_px[
+                    :, :ctx_img_num
+                ]
+            gt_ex = source_geometry_c2w.flatten(0, 1)
+            gt_ix = source_geometry_intrinsic_px
             # Keep the raw FOV and pre-normalized quaternion for the explicit
             # camera objective, exactly as offline_gs_mlp_overfit does. The
             # safe encoding above is only used to construct render matrices.
@@ -1406,7 +1471,8 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
 
             if sim3_enabled:
                 depth_for_geometry = (
-                    depth_for_geometry * sim3_scale[:, None, None, None, None]
+                    depth_for_geometry
+                    * sim3_scale.detach()[:, None, None, None, None]
                 )
 
         del aggregated_tokens_list, patch_start_idx
@@ -1498,8 +1564,28 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         splats["means"] = means
         splats["quats"] = act_gs.reg_dense_rotation(quats)
         
-        # 依然保留你的 Scale 截断保护
-        splats["scales"] = act_gs.reg_dense_scales(scales).clamp_max(0.1)
+        dense_scale_mode = str(self.cfg.dense_scale_mode).lower()
+        if use_shared_new_decoder:
+            # Analytic anchors are already depth/focal aware.
+            splats["scales"] = act_gs.reg_dense_scales(scales)
+            scales_include_geometry_scale = True
+        elif dense_scale_mode == "pixel_footprint":
+            splats["scales"] = pixel_footprint_scales(
+                scales_raw,
+                depth_for_geometry,
+                gt_ix,
+                self.cfg.dense_scale_min_projected_radius,
+                self.cfg.dense_scale_max_projected_radius,
+            ).reshape(b, v * h * w, 3)
+            scales_include_geometry_scale = True
+        elif dense_scale_mode == "legacy":
+            splats["scales"] = act_gs.reg_dense_scales(scales).clamp_max(0.1)
+            scales_include_geometry_scale = False
+        else:
+            raise ValueError(
+                "dense_scale_mode must be legacy or pixel_footprint, got "
+                f"{self.cfg.dense_scale_mode!r}."
+            )
         splats["opacities"] = opacities_flat
         # new_sh = torch.zeros_like(res_sh).flatten(0, 1)
         # new_sh[:, :3] = sh_utils.RGB2SH(sampled_rgb).flatten(0, 1)
@@ -1515,15 +1601,39 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
         gaussians = Gaussians(**gaussians)
         if sim3_enabled:
             gaussian_rotations = quat_to_mat(gaussians.rotations.float())
-            aligned_rotations = torch.einsum(
-                "bij,bnjk->bnik", sim3_rotation.float(), gaussian_rotations
-            )
+            if geometry_camera_source == "gt":
+                per_view = h * w
+                gaussian_rotations = gaussian_rotations.reshape(
+                    b, v, per_view, 3, 3
+                )
+                raw_source_rotation = raw_pred_all_extrinsic[
+                    :, :ctx_img_num, :3, :3
+                ].float()
+                gt_source_rotation = source_geometry_c2w[..., :3, :3].float()
+                camera_correction = (
+                    gt_source_rotation
+                    @ raw_source_rotation.transpose(-1, -2)
+                )
+                aligned_rotations = torch.einsum(
+                    "bvij,bvnjk->bvnik",
+                    camera_correction,
+                    gaussian_rotations,
+                ).reshape(b, v * per_view, 3, 3)
+            else:
+                aligned_rotations = torch.einsum(
+                    "bij,bnjk->bnik",
+                    sim3_rotation.float(),
+                    gaussian_rotations,
+                )
             gaussians = Gaussians(
                 means=gaussians.means,
                 harmonics=gaussians.harmonics,
                 opacities=gaussians.opacities,
                 scales=(
-                    gaussians.scales * sim3_scale[:, None, None]
+                    gaussians.scales
+                    if scales_include_geometry_scale
+                    else gaussians.scales
+                    * sim3_scale.detach()[:, None, None]
                 ),
                 rotations=mat_to_quat(aligned_rotations).to(
                     gaussians.rotations.dtype
@@ -1545,6 +1655,7 @@ class EncoderAnySplat(Encoder[EncoderAnySplatCfg]):
                 "image_shape": (h, w),
                 "num_context_views": v,
                 "sh_degree": self.sh_degree,
+                "geometry_camera_source": geometry_camera_source,
             }
         depth_dict = dict(depth=depth_for_loss)
         if depth_uncertainty is not None:

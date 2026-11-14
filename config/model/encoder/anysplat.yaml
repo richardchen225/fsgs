@@ -25,8 +25,19 @@ detach_predicted_camera_for_geometry: false
 share_first_frame_intrinsics: false
 # Optional oracle-camera ablation matching offline_gs_mlp_overfit.
 sim3_alignment_mode: never  # auto | always | never
+# Camera/intrinsics used to unproject source depth and build the streaming map.
+geometry_camera_source: predicted  # gt | predicted
 source_render_camera: predicted  # gt | predicted
 heldout_test_camera: predicted  # gt | predicted
+# Optional phase overrides. Null preserves the legacy fields above.
+training_sim3_alignment_mode: null
+training_geometry_camera_source: null
+training_source_render_camera: null
+training_heldout_test_camera: null
+evaluation_sim3_alignment_mode: null
+evaluation_geometry_camera_source: null
+evaluation_source_render_camera: null
+evaluation_heldout_test_camera: null
 
 opacity_mapping:
   initial: 0.0
@@ -38,6 +49,13 @@ num_surfaces: 1
 predict_opacity: false
 
 gaussians_per_pixel: 1
+
+# legacy uses exp(raw_scale) with a fixed 0.1 world-space cap.
+# pixel_footprint learns a bounded projected radius and converts it to world
+# scale with depth / focal_px, making the parameterization Sim(3)-equivariant.
+dense_scale_mode: legacy  # legacy | pixel_footprint
+dense_scale_min_projected_radius: 0.5
+dense_scale_max_projected_radius: 2.0
 
 gaussian_adapter:
   gaussian_scale_min: 0.5

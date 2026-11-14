@@ -178,8 +178,56 @@ class TrainingMetricTests(unittest.TestCase):
         self.assertNotIn("gir_symmetric_multiview_active_count", names)
         self.assertNotIn("gir_symmetric_multiview_regularization", names)
 
+    def test_compact_mode_keeps_only_dashboard_gir_metrics(self):
+        names = SELECT(
+            experiment(
+                gir_old_residual_enabled=False,
+                gir_new_residual_enabled=False,
+                gir_symmetric_multiview_update_enabled=True,
+            ),
+            compact=True,
+        )
+        self.assertEqual(names, (
+            "gir_symmetric_multiview_active_ratio",
+            "gir_symmetric_multiview_visible_views_mean",
+            "gir_symmetric_multiview_mean_conflict_ratio",
+            "gir_symmetric_multiview_mean_shift_mean",
+            "gir_symmetric_multiview_opacity_shift_mean",
+            "gir_symmetric_multiview_harmonics_shift_mean",
+        ))
+
     def test_disabled_gir_has_no_gir_metrics(self):
         self.assertEqual(SELECT(experiment(gir_enabled=False)), ())
+
+    def test_checkpoint_step_metric_survives_compact_logging(self):
+        wrapper = ast.parse(
+            (ROOT / "src/model/model_wrapper.py").read_text(encoding="utf-8")
+        )
+        training_step = next(
+            node
+            for node in ast.walk(wrapper)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "training_step"
+        )
+        calls = [
+            node
+            for node in ast.walk(training_step)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "log"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "info/global_step"
+        ]
+
+        self.assertEqual(len(calls), 1)
+        logger_keyword = next(
+            keyword for keyword in calls[0].keywords if keyword.arg == "logger"
+        )
+        self.assertIsInstance(logger_keyword.value, ast.UnaryOp)
+        self.assertIsInstance(logger_keyword.value.op, ast.Not)
+        self.assertIsInstance(logger_keyword.value.operand, ast.Name)
+        self.assertEqual(logger_keyword.value.operand.id, "compact_logging")
 
 
 if __name__ == "__main__":

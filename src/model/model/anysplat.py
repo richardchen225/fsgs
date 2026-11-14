@@ -61,6 +61,7 @@ from src.model.encoder.anysplat import (
     EncoderAnySplatCfg,
     OpacityMappingCfg,
 )
+from src.model.camera_phase import resolve_camera_phase_settings
 from src.misc.cuda_memory import log_cuda_memory
 
 
@@ -4377,16 +4378,45 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             ctx_index,
             global_step=global_step,
             gt_context_c2w=gt_context_c2w,
+            gt_context_intrinsics=gt_context_intrinsics,
         )
         gaussians, pred_context_pose = (
             encoder_output.gaussians,
             encoder_output.pred_context_pose,
         )
-        use_gt_source_camera = self.encoder.cfg.source_render_camera == "gt"
+        camera_settings = resolve_camera_phase_settings(
+            self.encoder.cfg, self.training
+        )
+        geometry_camera_source = camera_settings.geometry_camera_source
+        use_gt_source_camera = geometry_camera_source == "gt"
         if use_gt_source_camera:
             if gt_context_c2w is None or gt_context_intrinsics is None:
                 raise RuntimeError(
-                    "source_render_camera=gt requires GT cameras and intrinsics."
+                    "geometry_camera_source=gt requires GT cameras and intrinsics."
+                )
+            streaming_camera_to_world = torch.cat(
+                [
+                    gt_context_c2w[:, :ctx_img_num],
+                    pred_all_extrinsic[:, ctx_img_num:],
+                ],
+                dim=1,
+            )
+            streaming_intrinsics = torch.cat(
+                [
+                    gt_context_intrinsics[:, :ctx_img_num],
+                    encoder_output.pred_context_pose["intrinsic"][
+                        :, ctx_img_num:
+                    ],
+                ],
+                dim=1,
+            )
+        else:
+            streaming_camera_to_world = pred_all_extrinsic
+            streaming_intrinsics = encoder_output.pred_context_pose["intrinsic"]
+        if camera_settings.source_render_camera == "gt":
+            if gt_context_c2w is None or gt_context_intrinsics is None:
+                raise RuntimeError(
+                    "Source rendering requires GT cameras and intrinsics."
                 )
             residual_camera_to_world = gt_context_c2w[:, :ctx_img_num]
             residual_intrinsics = gt_context_intrinsics[:, :ctx_img_num]
@@ -4395,11 +4425,16 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             residual_intrinsics = encoder_output.pred_context_pose["intrinsic"][
                 :, :ctx_img_num
             ]
+        streaming_context_pose = {
+            **encoder_output.pred_context_pose,
+            "extrinsic": streaming_camera_to_world,
+            "intrinsic": streaming_intrinsics,
+        }
         gaussians = self._refine_gaussians(
             encoder_output,
             context_image,
-            pred_all_extrinsic,
-            pred_context_pose,
+            streaming_camera_to_world,
+            streaming_context_pose,
             ctx_img_num,
             near,
             far,
@@ -4436,8 +4471,8 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
 
         render_camera_to_world = pred_all_extrinsic
         render_intrinsics = pred_context_pose["intrinsic"]
-        source_camera_mode = self.encoder.cfg.source_render_camera
-        heldout_camera_mode = self.encoder.cfg.heldout_test_camera
+        source_camera_mode = camera_settings.source_render_camera
+        heldout_camera_mode = camera_settings.heldout_test_camera
         if source_camera_mode == "gt" or heldout_camera_mode == "gt":
             if gt_context_c2w is None or gt_context_intrinsics is None:
                 raise RuntimeError(
@@ -4495,6 +4530,9 @@ class AnySplat(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             map_gs=int(gaussians.means.shape[1]),
             render_views=v,
         )
+        # Depth is used only for source-view visualization. Keep alpha for all
+        # final renders so source and held-out RGB losses can mask uncovered
+        # background pixels.
         output.depth = output.depth[:, :ctx_img_num, ...]
 
         return encoder_output, output

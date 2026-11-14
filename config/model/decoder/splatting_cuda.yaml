@@ -1,3 +1,8 @@
 name: splatting_cuda
 background_color: [1.0, 1.0, 1.0]
 make_scale_invariant: false
+# Disabled by default. Experiments can cap the conservative projected GS
+# support under the camera actually passed to each rasterization call.
+max_gaussian_screen_radius: 0.0
+gaussian_screen_radius_sigma: 3.0
+gaussian_screen_guard_chunk_size: 131072

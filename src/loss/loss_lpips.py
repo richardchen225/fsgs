@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 
 import torch
 from einops import rearrange
@@ -23,6 +24,7 @@ class LossLpipsCfg:
     conf: bool = False
     alpha: bool = False
     mask: bool = False
+    alpha_threshold: float = 1e-4
 
 
 @dataclass
@@ -85,9 +87,34 @@ class LossLpips(Loss[LossLpipsCfg, LossLpipsCfgWrapper]):
             if self.cfg.mask:
                 mask = batch["context"]["valid_mask"][:, view_slice]
             elif self.cfg.alpha:
-                mask = prediction.alpha[:, view_slice]
+                if prediction.alpha is None:
+                    raise ValueError(
+                        "Alpha-masked LPIPS requires rendered alpha."
+                    )
+                threshold = float(self.cfg.alpha_threshold)
+                if not math.isfinite(threshold) or threshold < 0.0:
+                    raise ValueError(
+                        "LPIPS alpha_threshold must be finite and "
+                        f"non-negative, got {threshold}."
+                    )
+                mask = prediction.alpha[:, view_slice] > threshold
             elif self.cfg.conf:
                 mask = depth_dict["conf_valid_mask"][:, view_slice]
+            expected_shape = (
+                prediction_color.shape[0],
+                prediction_color.shape[1],
+                prediction_color.shape[3],
+                prediction_color.shape[4],
+            )
+            if tuple(mask.shape) != expected_shape:
+                raise ValueError(
+                    "LPIPS mask shape does not match selected rendered color: "
+                    f"mask={tuple(mask.shape)}, expected={expected_shape}."
+                )
+            mask = mask.detach().to(
+                device=prediction_color.device,
+                dtype=prediction_color.dtype,
+            )
             b, v, c, h, w = prediction_color.shape
             expanded_mask = mask.unsqueeze(2).expand(-1, -1, c, -1, -1)
             masked_pred = prediction_color * expanded_mask

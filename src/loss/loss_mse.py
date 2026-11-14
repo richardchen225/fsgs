@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 
 from jaxtyping import Float
 from torch import Tensor
@@ -16,6 +17,7 @@ class LossMseCfg:
     conf: bool = False
     mask: bool = False
     alpha: bool = False
+    alpha_threshold: float = 1e-4
 
 
 @dataclass
@@ -24,6 +26,65 @@ class LossMseCfgWrapper:
 
 
 class LossMse(Loss[LossMseCfg, LossMseCfgWrapper]):
+    def _pixel_mask(
+        self,
+        prediction: DecoderOutput,
+        batch: BatchedExample,
+        depth_dict: dict | None,
+    ) -> Tensor | None:
+        if not (self.cfg.mask or self.cfg.alpha or self.cfg.conf):
+            return None
+        if self.cfg.mask:
+            pixel_mask = batch["context"]["valid_mask"]
+        elif self.cfg.alpha:
+            if prediction.alpha is None:
+                raise ValueError("Alpha-masked RGB MSE requires rendered alpha.")
+            threshold = float(self.cfg.alpha_threshold)
+            if not math.isfinite(threshold) or threshold < 0.0:
+                raise ValueError(
+                    "MSE alpha_threshold must be finite and non-negative, "
+                    f"got {threshold}."
+                )
+            pixel_mask = prediction.alpha > threshold
+        else:
+            if depth_dict is None or "conf_valid_mask" not in depth_dict:
+                raise ValueError(
+                    "Confidence-masked RGB MSE requires "
+                    "depth_dict['conf_valid_mask']."
+                )
+            pixel_mask = depth_dict["conf_valid_mask"]
+
+        expected_shape = (
+            prediction.color.shape[0],
+            prediction.color.shape[1],
+            prediction.color.shape[3],
+            prediction.color.shape[4],
+        )
+        if tuple(pixel_mask.shape) != expected_shape:
+            raise ValueError(
+                "RGB MSE mask shape does not match rendered color: "
+                f"mask={tuple(pixel_mask.shape)}, expected={expected_shape}."
+            )
+        return pixel_mask.detach().to(
+            device=prediction.color.device,
+            dtype=prediction.color.dtype,
+        )
+
+    @staticmethod
+    def _masked_mse(
+        prediction: Tensor,
+        target: Tensor,
+        pixel_mask: Tensor | None,
+    ) -> Tensor:
+        squared_error = (prediction - target).square()
+        if pixel_mask is None:
+            return squared_error.mean()
+        channel_mask = pixel_mask.unsqueeze(2).expand_as(squared_error)
+        return (
+            (squared_error * channel_mask).sum()
+            / channel_mask.sum().clamp_min(1.0)
+        )
+
     def forward(
         self,
         prediction: DecoderOutput,
@@ -57,18 +118,33 @@ class LossMse(Loss[LossMseCfg, LossMseCfgWrapper]):
                 "Invalid source/held-out split: "
                 f"source_views={source_views}, total_views={total_views}."
             )
+        pixel_mask = self._pixel_mask(prediction, batch, depth_dict)
 
         if self.cfg.weight_ctx == 0.0:
             source_loss = pred.new_zeros(())
         else:
-            source_loss = (pred[:, :source_views] - gt[:, :source_views]).square().mean()
+            source_loss = self._masked_mse(
+                pred[:, :source_views],
+                gt[:, :source_views],
+                (
+                    pixel_mask[:, :source_views]
+                    if pixel_mask is not None
+                    else None
+                ),
+            )
         if source_views < total_views:
             if self.cfg.weight_novel == 0.0:
                 heldout_loss = pred.new_zeros(())
             else:
-                heldout_loss = (
-                    pred[:, source_views:] - gt[:, source_views:]
-                ).square().mean()
+                heldout_loss = self._masked_mse(
+                    pred[:, source_views:],
+                    gt[:, source_views:],
+                    (
+                        pixel_mask[:, source_views:]
+                        if pixel_mask is not None
+                        else None
+                    ),
+                )
         else:
             heldout_loss = source_loss.new_zeros(())
 

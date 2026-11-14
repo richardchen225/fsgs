@@ -9,6 +9,7 @@ from torch import Tensor
 import torchvision
 
 from ..types import Gaussians
+from ..gaussian_scales import screen_radius_guarded_scales
 # from .cuda_splatting import DepthRenderingMode, render_cuda
 from .decoder import Decoder, DecoderOutput
 from math import isfinite, prod, sqrt
@@ -33,6 +34,9 @@ class DecoderSplattingCUDACfg:
     name: Literal["splatting_cuda"]
     background_color: list[float]
     make_scale_invariant: bool
+    max_gaussian_screen_radius: float = 0.0
+    gaussian_screen_radius_sigma: float = 3.0
+    gaussian_screen_guard_chunk_size: int = 131072
 
 
 @dataclass
@@ -290,10 +294,56 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
     ) -> None:
         super().__init__(cfg)
         self.make_scale_invariant = cfg.make_scale_invariant
+        self.max_gaussian_screen_radius = float(cfg.max_gaussian_screen_radius)
+        self.gaussian_screen_radius_sigma = float(cfg.gaussian_screen_radius_sigma)
+        self.gaussian_screen_guard_chunk_size = int(
+            cfg.gaussian_screen_guard_chunk_size
+        )
+        if (
+            not isfinite(self.max_gaussian_screen_radius)
+            or self.max_gaussian_screen_radius < 0.0
+        ):
+            raise ValueError(
+                "max_gaussian_screen_radius must be finite and non-negative; "
+                f"zero disables the guard, got {self.max_gaussian_screen_radius}."
+            )
+        if self.max_gaussian_screen_radius > 0.0:
+            if (
+                not isfinite(self.gaussian_screen_radius_sigma)
+                or self.gaussian_screen_radius_sigma <= 0.0
+            ):
+                raise ValueError(
+                    "gaussian_screen_radius_sigma must be finite and positive."
+                )
+            if self.gaussian_screen_guard_chunk_size <= 0:
+                raise ValueError(
+                    "gaussian_screen_guard_chunk_size must be positive."
+                )
         self.register_buffer(
             "background_color",
             torch.tensor(cfg.background_color, dtype=torch.float32),
             persistent=False,
+        )
+
+    def _guard_scales_for_cameras(
+        self,
+        scales: Tensor,
+        means: Tensor,
+        world_to_camera: Tensor,
+        intrinsics_px: Tensor,
+        near_plane: float | Tensor,
+    ) -> Tensor:
+        if self.max_gaussian_screen_radius == 0.0:
+            return scales
+        return screen_radius_guarded_scales(
+            scales,
+            means,
+            world_to_camera,
+            intrinsics_px,
+            self.max_gaussian_screen_radius,
+            sigma=self.gaussian_screen_radius_sigma,
+            near_plane=near_plane,
+            chunk_size=self.gaussian_screen_guard_chunk_size,
         )
 
     @torch.no_grad()
@@ -323,6 +373,13 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             intrinsics_px = intrinsics[batch_idx : batch_idx + 1].float().clone()
             intrinsics_px[:, 0] *= w
             intrinsics_px[:, 1] *= h
+            scales = self._guard_scales_for_cameras(
+                scales,
+                xyz,
+                world_to_camera,
+                intrinsics_px,
+                near_plane=1e-10,
+            )
             sh_degree = int(sqrt(features.shape[-2])) - 1
 
             rendering, alpha, _ = rasterization(
@@ -595,6 +652,13 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             intrinsics_px = intrinsics[batch_idx : batch_idx + 1].float().clone()
             intrinsics_px[:, 0] = intrinsics_px[:, 0] * w
             intrinsics_px[:, 1] = intrinsics_px[:, 1] * h
+            scales = self._guard_scales_for_cameras(
+                scales,
+                xyz,
+                world_to_camera,
+                intrinsics_px,
+                near_plane=1e-10,
+            )
             sh_degree = int(sqrt(features.shape[-2])) - 1
 
             rendering, alpha, info = rasterization(
@@ -791,10 +855,17 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
                 near_plane, far_plane = _raster_clip_planes(
                     near_values[i][j], far_values[i][j]
                 )
+                guarded_scale_i = self._guard_scales_for_cameras(
+                    scale_i,
+                    xyz_i,
+                    test_w2c_i[j : j + 1],
+                    test_intr_i[j : j + 1],
+                    near_plane=near_plane,
+                )
                 rendering, alpha, *ignored = rasterization(
                     xyz_i,
                     rotation_i,
-                    scale_i,
+                    guarded_scale_i,
                     opacity_i,
                     feature_i,
                     test_w2c_i[j : j + 1],
@@ -815,9 +886,13 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
                 rendering_list.append(rendering_img.permute(0, 3, 1, 2))
                 rendering_depth_list.append(rendering_depth)
                 rendering_alpha_list.append(alpha)
-            rendered_depths.append(torch.cat(rendering_depth_list, dim=0).squeeze())
+            rendered_depths.append(
+                torch.cat(rendering_depth_list, dim=0).squeeze(-1)
+            )
             rendered_imgs.append(torch.cat(rendering_list, dim=0))
-            rendered_alphas.append(torch.cat(rendering_alpha_list, dim=0).squeeze())
+            rendered_alphas.append(
+                torch.cat(rendering_alpha_list, dim=0).squeeze(-1)
+            )
         return DecoderOutput(torch.stack(rendered_imgs), torch.stack(rendered_depths), torch.stack(rendered_alphas), lod_rendering=None)
 
     def render_gradient_selection_mask(
@@ -854,10 +929,17 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             means2d_per_view = []
             losses = []
             for j in range(V):
+                guarded_scale_i = self._guard_scales_for_cameras(
+                    scale_i,
+                    xyz_i,
+                    test_w2c_i[j : j + 1],
+                    test_intr_i[j : j + 1],
+                    near_plane=1e-10,
+                )
                 rendering, _, info = rasterization(
                     xyz_i,
                     rotation_i,
-                    scale_i,
+                    guarded_scale_i,
                     opacity_i,
                     feature_i,
                     test_w2c_i[j : j + 1],
